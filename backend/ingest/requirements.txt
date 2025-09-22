@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+xmltodict
+python-multipart
+sqlalchemy
+psycopg2-binary
+meilisearch
+minio
+neo4j
+reportlab
+pydantic
+python-dotenv
+requests
+pytest
