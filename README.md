@@ -60,7 +60,7 @@ An AI-powered software solution that:
 
 ## 👥 Team Structure & Responsibilities
 
-### 🔧 **Aayushman** - System Architect & Integration Lead
+### **Aayushman** - System Architect & Integration Lead
 **Sole Responsibilities:**
 - API architecture design and implementation
 - Natural Language Query (NLQ) engine development
@@ -68,7 +68,7 @@ An AI-powered software solution that:
 - Authentication and authorization systems
 - API documentation and testing
 
-### ☁️ **Abdul** - DevOps & Infrastructure Engineer
+### **Abdul** - DevOps & Infrastructure Engineer
 **Sole Responsibilities:**
 - Docker containerization for all services
 - Docker Compose configuration
@@ -76,7 +76,7 @@ An AI-powered software solution that:
 - Production deployment and monitoring
 - Infrastructure security and backup
 
-### 🗄️ **Divyanshi** - Database Engineer
+### **Divyanshi** - Database Engineer
 **Sole Responsibilities:**
 - PostgreSQL schema design and implementation
 - Database migrations and seed data
@@ -84,7 +84,7 @@ An AI-powered software solution that:
 - Database performance monitoring
 - Data validation and integrity
 
-### 🎨 **Ritika** - Frontend Developer
+### **Ritika** - Frontend Developer
 **Sole Responsibilities:**
 - React application setup and architecture
 - User interface components and pages
@@ -92,7 +92,7 @@ An AI-powered software solution that:
 - Search interface and user experience
 - Authentication UI and routing
 
-### 📊 **Arpit** - Visualization Developer
+### **Arpit** - Visualization Developer
 **Sole Responsibilities:**
 - Network graph visualization (Cytoscape.js)
 - Statistical charts and analytics (Chart.js)
@@ -100,7 +100,7 @@ An AI-powered software solution that:
 - Interactive data exploration tools
 - Export and sharing functionality
 
-### ⚙️ **Aditya** - Backend Developer
+### **Aditya** - Backend Developer
 **Sole Responsibilities:**
 - UFDR file parsing and processing
 - Data ingestion pipeline
@@ -110,7 +110,7 @@ An AI-powered software solution that:
 
 ---
 
-## 📋 Detailed Todo Lists
+## Detailed Todo Lists
 
 ## 🔧 **Aayushman** - System Architect & Integration Lead
 
@@ -580,25 +580,6 @@ ufdr-analyzer/
 └── README.md              # This file
 ```
 
-## 🤝 Contributing
-
-1. **Fork the repository**
-2. **Create a feature branch**: `git checkout -b feature/amazing-feature`
-3. **Commit your changes**: `git commit -m 'Add amazing feature'`
-4. **Push to the branch**: `git push origin feature/amazing-feature`
-5. **Open a Pull Request`
-
-### Code Style
-- **Python**: Follow PEP 8, use `black` for formatting
-- **JavaScript/TypeScript**: Use ESLint and Prettier
-- **Commits**: Use conventional commit messages
-
-## 📞 Support
-
-For technical issues or questions:
-- Create an issue in the repository
-- Contact the development team
-- Check the documentation in `/docs`
 
 ## 📄 License
 
