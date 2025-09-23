@@ -23,3 +23,4 @@ coverage.xml
 /backend/ingest/utils/__pycache__
 /backend/ingest/__pycache__
 /backend/ingest/routers/__pycache__
+/backend/__pycache__
