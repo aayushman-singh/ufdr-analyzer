@@ -1,6 +1,6 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException
-from services.parser_service import UFDRParser
-from services.ingest_service import IngestService
+from ingest.services.parser_service import UFDRParser
+from ingest.services.ingest_service import IngestService
 import logging
 import aiofiles
 from pathlib import Path

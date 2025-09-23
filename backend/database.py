@@ -5,10 +5,10 @@ from sqlmodel import create_engine, Session, SQLModel
 # Get database connection details from environment variables
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/postgres"
+    "sqlite:///./database.db"
 )
 
-# Create the SQLAlchemy engine for Postgres
+# Create the SQLAlchemy engine (works with both SQLite and PostgreSQL)
 engine = create_engine(DATABASE_URL, echo=True)
 
 

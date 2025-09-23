@@ -3,7 +3,7 @@ import json
 import csv
 from pathlib import Path
 from typing import Dict, Any, List
-from utils.logger import get_logger
+from ingest.utils.logger import get_logger
 
 logger = get_logger(__name__)
 

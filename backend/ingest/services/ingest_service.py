@@ -4,9 +4,12 @@ import logging
 import uuid
 from datetime import datetime
 from sqlmodel import Session
-from meilisearch_python_sdk import Client as MeiliClient
-from .storage_services import save_media
-from ingest.db_setup import Run, Message, Call, Contact, Media
+from meilisearch import Client as MeiliClient
+from .storage_service import save_media
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+from db_setup import Run, Message, Call, Contact, Media
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
