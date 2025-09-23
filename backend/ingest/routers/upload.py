@@ -17,8 +17,18 @@ ingest_service = IngestService()
 async def upload_ufdr(file: UploadFile = File(...)):
     """
     Upload a UFDR file, parse it, and ingest into DB + indexes.
+    Supports .ufdr, .xml, .json, and .csv files.
     """
     try:
+        # Validate file extension
+        file_extension = Path(file.filename).suffix.lower()
+        supported_extensions = ['.ufdr', '.xml', '.json', '.csv']
+        if file_extension not in supported_extensions:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Unsupported file type: {file_extension}. Supported types: {supported_extensions}"
+            )
+
         # Ensure tmp storage exists
         tmp_dir = Path("storage/tmp")
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -41,6 +51,7 @@ async def upload_ufdr(file: UploadFile = File(...)):
         return {
             "status": "success",
             "filename": file.filename,
+            "file_type": file_extension,
             "ingest_result": ingest_result,
         }
 
