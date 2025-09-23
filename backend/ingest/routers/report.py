@@ -1,7 +1,10 @@
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import FileResponse
-from services.report_service import ReportService
-from ingest.db_setup import Run, User, Result, Rule
+from ingest.services.report_service import ReportService
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+from db_setup import Run, User, Result, Rule
 from sqlmodel import Session, select
 import logging
 from pathlib import Path

@@ -3,13 +3,13 @@ from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from sqlmodel import Session
-from meilisearch_python_sdk import Client as MeiliClient
+from meilisearch import Client as MeiliClient
 import os
 
-from routers import health, upload, report
+from ingest.routers import health, upload, report
 from database import create_db_and_tables, get_session
-from services.ingest_service import IngestService
-from utils.logger import get_logger
+from ingest.services.ingest_service import IngestService
+from ingest.utils.logger import get_logger
 from config import APP_NAME, APP_VERSION
 
 logger = get_logger(__name__)
@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
     # On shutdown
     logger.info("Application shutting down...")
     if meili_client:
-        await meili_client.aclose()
+        # Meilisearch client doesn't need explicit closing
         logger.info("Meilisearch client closed.")
 
 app = FastAPI(

@@ -1,1 +1,5 @@
 /venv
+/backend/ingest/services/__pycache__
+/backend/ingest/utils/__pycache__
+/backend/ingest/__pycache__
+/backend/ingest/routers/__pycache__

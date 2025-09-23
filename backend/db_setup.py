@@ -62,6 +62,10 @@ class Run(SQLModel, table=True):
     # Relationships
     user: User = Relationship(back_populates="runs")
     results: List["Result"] = Relationship(back_populates="run")
+    messages: List["Message"] = Relationship(back_populates="run")
+    calls: List["Call"] = Relationship(back_populates="run")
+    contacts: List["Contact"] = Relationship(back_populates="run")
+    media: List["Media"] = Relationship(back_populates="run")
 
 
 class Result(SQLModel, table=True):
@@ -101,6 +105,59 @@ class Backup(SQLModel, table=True):
 
     # Relationship
     user: User = Relationship(back_populates="backups")
+
+
+class Message(SQLModel, table=True):
+    """Represents a message from UFDR data."""
+    id: Optional[uuid.UUID] = Field(
+        default_factory=uuid.uuid4, primary_key=True)
+    run_id: uuid.UUID = Field(foreign_key="run.id")
+    sender: str
+    receiver: str
+    timestamp: datetime.datetime
+    content: str
+
+    # Relationship
+    run: Run = Relationship(back_populates="messages")
+
+
+class Call(SQLModel, table=True):
+    """Represents a call from UFDR data."""
+    id: Optional[uuid.UUID] = Field(
+        default_factory=uuid.uuid4, primary_key=True)
+    run_id: uuid.UUID = Field(foreign_key="run.id")
+    caller: str
+    receiver: str
+    timestamp: datetime.datetime
+    duration: Optional[int] = None  # Duration in seconds
+
+    # Relationship
+    run: Run = Relationship(back_populates="calls")
+
+
+class Contact(SQLModel, table=True):
+    """Represents a contact from UFDR data."""
+    id: Optional[uuid.UUID] = Field(
+        default_factory=uuid.uuid4, primary_key=True)
+    run_id: uuid.UUID = Field(foreign_key="run.id")
+    name: str
+    number: str
+
+    # Relationship
+    run: Run = Relationship(back_populates="contacts")
+
+
+class Media(SQLModel, table=True):
+    """Represents media files from UFDR data."""
+    id: Optional[uuid.UUID] = Field(
+        default_factory=uuid.uuid4, primary_key=True)
+    run_id: uuid.UUID = Field(foreign_key="run.id")
+    original_path: str
+    storage_path: str
+    media_type: Optional[str] = None
+
+    # Relationship
+    run: Run = Relationship(back_populates="media")
 
 
 # 2. Database Setup and Seeding
