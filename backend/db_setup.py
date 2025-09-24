@@ -5,6 +5,8 @@ import json
 from typing import List, Optional
 
 from sqlmodel import Field, SQLModel, Relationship, create_engine, Session
+from sqlalchemy import Column, TEXT
+from pgvector.sqlalchemy import Vector
 
 
 class User(SQLModel, table=True):
@@ -116,6 +118,11 @@ class Message(SQLModel, table=True):
     receiver: str
     timestamp: datetime.datetime
     content: str
+    # Vector field for semantic search (1536 dimensions for OpenAI embeddings)
+    content_vector: Optional[List[float]] = Field(
+        default=None,
+        sa_column=Column(Vector(1536))
+    )
 
     # Relationship
     run: Run = Relationship(back_populates="messages")

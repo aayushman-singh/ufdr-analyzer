@@ -1,10 +1,14 @@
 # backend/main.py
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from sqlmodel import Session
 from meilisearch import Client as MeiliClient
 import os
+import time
+import json
 
 from ingest.routers import health, upload, report
 from database import create_db_and_tables, get_session
@@ -56,6 +60,9 @@ app = FastAPI(
     description="Backend for AI-based UFDR Analysis Tool"
 )
 
+# Configure for large file uploads
+app.router.mount_lifespan = False
+
 # ------------------------
 # Dependency Injection
 # ------------------------
@@ -82,6 +89,92 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ------------------------
+# Request Logging Middleware
+# ------------------------
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all incoming requests and responses for debugging."""
+    start_time = time.time()
+    
+    # Log request details
+    logger.info(f"Request: {request.method} {request.url}")
+    logger.info(f"Headers: {dict(request.headers)}")
+    logger.info(f"Query params: {dict(request.query_params)}")
+    
+    # Log request body for POST/PUT requests (but be careful with large files)
+    if request.method in ["POST", "PUT", "PATCH"]:
+        try:
+            # Only log body for non-file uploads to avoid memory issues
+            content_type = request.headers.get("content-type", "")
+            if "multipart/form-data" not in content_type:
+                body = await request.body()
+                if body:
+                    try:
+                        body_str = body.decode("utf-8")
+                        logger.info(f"Request body: {body_str[:1000]}...")  # Limit to first 1000 chars
+                    except UnicodeDecodeError:
+                        logger.info(f"Request body: <binary data, {len(body)} bytes>")
+                else:
+                    logger.info("Request body: <empty>")
+        except Exception as e:
+            logger.warning(f"Could not read request body: {e}")
+    
+    # Process request
+    try:
+        response = await call_next(request)
+        process_time = time.time() - start_time
+        
+        # Log response details
+        logger.info(f"Response: {response.status_code} (took {process_time:.3f}s)")
+        logger.info(f"Response headers: {dict(response.headers)}")
+        
+        return response
+    except Exception as e:
+        process_time = time.time() - start_time
+        logger.error(f"Request failed after {process_time:.3f}s: {e}")
+        raise
+
+# ------------------------
+# Exception Handlers
+# ------------------------
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Handle request validation errors with detailed logging."""
+    logger.error(f"Request validation error: {exc}")
+    logger.error(f"Request URL: {request.url}")
+    logger.error(f"Request method: {request.method}")
+    logger.error(f"Request headers: {dict(request.headers)}")
+    
+    # Log the specific validation errors
+    for error in exc.errors():
+        logger.error(f"Validation error: {error}")
+    
+    return JSONResponse(
+        status_code=400,
+        content={
+            "detail": "There was an error parsing the body",
+            "errors": exc.errors(),
+            "request_info": {
+                "url": str(request.url),
+                "method": request.method,
+                "content_type": request.headers.get("content-type", "unknown")
+            }
+        }
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions with logging."""
+    logger.error(f"HTTP exception: {exc.status_code} - {exc.detail}")
+    logger.error(f"Request URL: {request.url}")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail}
+    )
 
 # ------------------------
 # Include Routers
