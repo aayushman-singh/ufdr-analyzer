@@ -78,7 +78,7 @@ export const FileUpload: React.FC<FileUploadProps> = ({
           </p>
           {maxSize && (
             <p className="font-sans font-normal text-neutral-400 dark:text-neutral-400 text-sm mt-2 text-center">
-              Supports UFDR files up to {maxSize}MB
+              Supports UFDR files 
             </p>
           )}
 

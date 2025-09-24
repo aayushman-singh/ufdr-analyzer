@@ -1,6 +1,7 @@
 import Header from "@/components/header"
 import { WobbleCard } from "@/components/ui/wobble-card"
 import { ArrowRight, FileText, Search, BarChart2, GitFork, Shield, Zap, Eye, Database } from "lucide-react"
+import Link from "next/link"
 
 export default function Home() {
   return (
@@ -39,9 +40,11 @@ export default function Home() {
 
         {/* Call to Action Buttons */}
         <div className="flex flex-col sm:flex-row gap-4 mb-16">
-          <button className="bg-slate-900 text-white font-light py-3 px-6 rounded-lg hover:bg-slate-700 transition-colors flex items-center justify-center gap-2 shadow-sm">
-            Start Analyzing <ArrowRight size={18} />
-          </button>
+        <Link href="/upload">
+  <button className="bg-slate-900 text-white font-light py-3 px-6 rounded-lg hover:bg-slate-700 transition-colors flex items-center justify-center gap-2 shadow-sm">
+    Start Analyzing <ArrowRight size={18} />
+  </button>
+</Link>
           <button className="bg-white text-slate-700 font-light py-3 px-6 rounded-lg border border-gray-300 hover:bg-gray-50 transition-colors flex items-center justify-center gap-2 shadow-sm">
             Learn More
           </button>
