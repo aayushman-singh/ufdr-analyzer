@@ -320,19 +320,11 @@ def seed_db_with_sample_data(session: Session):
 
 
 if __name__ == "__main__":
-    # Define the SQLite database file path
-    sqlite_file_name = "database.db"
-    sqlite_url = f"sqlite:///{sqlite_file_name}"
-
-    # Create the SQLAlchemy engine
-    engine = create_engine(sqlite_url, echo=True)
-
-    # Create the database and tables
+    from database import engine
     create_db_and_tables(engine)
 
-    # Seed the database
     with Session(engine) as session:
         seed_db_with_sample_data(session)
 
     print("\nDatabase setup and seeding complete.")
-    print(f"You can now inspect the '{sqlite_file_name}' file.")
+    print("PostgreSQL database with vector support configured successfully.")
