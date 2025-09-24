@@ -15,6 +15,14 @@ export default function Header() {
         </Link>
 
         <nav className="hidden md:flex items-center space-x-8">
+          <Link href="/analysis-dashboard"
+         
+           
+            className="text-slate-600 hover:text-slate-900 transition-colors"
+          >
+          Dashboard
+          
+          </Link>
           <a
             href="#features"
             className="text-slate-600 hover:text-slate-900 transition-colors"

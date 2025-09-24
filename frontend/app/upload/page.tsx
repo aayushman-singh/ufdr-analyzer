@@ -183,7 +183,7 @@ return (
     <div className="min-h-screen w-full relative bg-white">
       {/* Purple Glow Top */}
       <div
-        className="absolute inset-0 z-0"
+        className="fixed inset-0 z-0"
         style={{
           background: "#ffffff",
           backgroundImage: `
