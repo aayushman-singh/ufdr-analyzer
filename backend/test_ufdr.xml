@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<report>
+    <messages>
+        <message>
+            <from>+91-9876543210</from>
+            <to>+91-9123456789</to>
+            <content>Hey, did you transfer the Bitcoin amount?</content>
+            <timestamp>2023-01-15T10:30:00Z</timestamp>
+        </message>
+        <message>
+            <from>+91-9123456789</from>
+            <to>+91-9876543210</to>
+            <content>Yes, sent 0.5 BTC to wallet address 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa</content>
+            <timestamp>2023-01-15T10:32:00Z</timestamp>
+        </message>
+        <message>
+            <from>+1-555-0123</from>
+            <to>+91-9876543210</to>
+            <content>International transfer completed. Check your account.</content>
+            <timestamp>2023-01-15T11:00:00Z</timestamp>
+        </message>
+        <message>
+            <from>+91-9876543210</from>
+            <to>Ghost</to>
+            <content>Payment received. Next delivery tomorrow in Delhi.</content>
+            <timestamp>2023-01-15T14:00:00Z</timestamp>
+        </message>
+    </messages>
+    <contacts>
+        <contact>
+            <name>John Suspect</name>
+            <number>+91-9876543210</number>
+        </contact>
+        <contact>
+            <name>Mr. X</name>
+            <number>+91-9123456789</number>
+        </contact>
+        <contact>
+            <name>Ghost</name>
+            <number>+1-555-9999</number>
+        </contact>
+        <contact>
+            <name>International Contact</name>
+            <number>+1-555-0123</number>
+        </contact>
+    </contacts>
+    <calls>
+        <call>
+            <caller>+91-9876543210</caller>
+            <receiver>+1-555-0123</receiver>
+            <timestamp>2023-01-15T09:45:00Z</timestamp>
+            <duration>180</duration>
+        </call>
+        <call>
+            <caller>+91-9123456789</caller>
+            <receiver>+91-9876543210</receiver>
+            <timestamp>2023-01-15T16:30:00Z</timestamp>
+            <duration>45</duration>
+        </call>
+    </calls>
+</report>

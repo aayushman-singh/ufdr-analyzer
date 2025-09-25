@@ -6,7 +6,9 @@ from typing import List, Optional
 
 from sqlmodel import Field, SQLModel, Relationship, create_engine, Session
 from sqlalchemy import Column, TEXT
-from pgvector.sqlalchemy import Vector
+# Vector extension will be handled at runtime
+VECTOR_AVAILABLE = False
+Vector = None
 
 
 class User(SQLModel, table=True):
@@ -118,11 +120,7 @@ class Message(SQLModel, table=True):
     receiver: str
     timestamp: datetime.datetime
     content: str
-    # Vector field for semantic search (1536 dimensions for OpenAI embeddings)
-    content_vector: Optional[List[float]] = Field(
-        default=None,
-        sa_column=Column(Vector(1536))
-    )
+    # Note: Vector field will be added later when pgvector is available
 
     # Relationship
     run: Run = Relationship(back_populates="messages")
@@ -320,6 +318,67 @@ def seed_db_with_sample_data(session: Session):
 
 
 if __name__ == "__main__":
+    import psycopg2
+    from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+    from config import POSTGRES_CONFIG
+
+    # Check if vector extension is available first
+    vector_extension_available = False
+
+    # First, create the database if it doesn't exist
+    try:
+        # Connect to PostgreSQL server (not to specific database)
+        conn = psycopg2.connect(
+            host=POSTGRES_CONFIG['host'],
+            port=POSTGRES_CONFIG['port'],
+            user=POSTGRES_CONFIG['user'],
+            password=POSTGRES_CONFIG['password'],
+            database='postgres'  # Connect to default postgres database
+        )
+        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+        cursor = conn.cursor()
+
+        # Check if database exists
+        cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", (POSTGRES_CONFIG['database'],))
+        if not cursor.fetchone():
+            cursor.execute(f'CREATE DATABASE "{POSTGRES_CONFIG["database"]}"')
+            print(f"Created database '{POSTGRES_CONFIG['database']}'")
+        else:
+            print(f"Database '{POSTGRES_CONFIG['database']}' already exists")
+
+        cursor.close()
+        conn.close()
+
+        # Connect to the target database to install vector extension
+        conn = psycopg2.connect(
+            host=POSTGRES_CONFIG['host'],
+            port=POSTGRES_CONFIG['port'],
+            user=POSTGRES_CONFIG['user'],
+            password=POSTGRES_CONFIG['password'],
+            database=POSTGRES_CONFIG['database']
+        )
+        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+        cursor = conn.cursor()
+
+        # Install vector extension (optional)
+        try:
+            cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            vector_extension_available = True
+            print("Vector extension installed successfully")
+        except Exception as vec_error:
+            print(f"Warning: Could not install vector extension: {vec_error}")
+            print("Vector search functionality will be limited")
+
+        cursor.close()
+        conn.close()
+
+    except Exception as e:
+        print(f"Error setting up database: {e}")
+        exit(1)
+
+    # Vector extension check complete
+
+    # Now use the engine from database.py
     from database import engine
     create_db_and_tables(engine)
 
@@ -327,4 +386,7 @@ if __name__ == "__main__":
         seed_db_with_sample_data(session)
 
     print("\nDatabase setup and seeding complete.")
-    print("PostgreSQL database with vector support configured successfully.")
+    if vector_extension_available:
+        print("PostgreSQL database with vector support configured successfully.")
+    else:
+        print("PostgreSQL database configured successfully (without vector support).")
