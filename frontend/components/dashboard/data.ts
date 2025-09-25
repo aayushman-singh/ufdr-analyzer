@@ -1,0 +1,60 @@
+import { Bot, Search, Clock, BarChart3, Network, LucideIcon, MapPin, Phone, MessageCircle, Users, Activity } from "lucide-react"
+
+// Type Definitions
+export interface MenuItem {
+  title: string
+  icon: LucideIcon
+  description: string
+  badge?: string
+  content: string
+}
+
+export interface ChatMessage {
+  id: number
+  type: "user" | "assistant"
+  message: string
+  timestamp: string
+}
+
+export interface TimelineEvent {
+    time: string
+    date: string
+    event: string
+    type: string
+    icon: LucideIcon
+}
+
+
+// Data Exports
+export const menuItems: MenuItem[] = [
+  { title: "AI Assistant", icon: Bot, description: "Natural language interface for querying evidence", badge: "New", content: "ai-assistant" },
+  { title: "Evidence Search", icon: Search, description: "AI-powered search across all forensic data", content: "evidence-search" },
+  { title: "Timeline Analysis", icon: Clock, description: "Chronological view of events and activities", content: "timeline-analysis" },
+  { title: "Reports & Analytics", icon: BarChart3, description: "Generate reports, visualizations, and summaries", content: "reports-analytics" },
+  { title: "Data Visualization", icon: Network, description: "Charts, graphs, network diagrams for evidence", content: "data-visualization" },
+];
+
+export const mockChatMessages: ChatMessage[] = [
+  { id: 1, type: "user", message: "Show me all deleted WhatsApp messages from last week", timestamp: "10:30 AM" },
+  { id: 2, type: "assistant", message: "I found 23 deleted WhatsApp messages from March 15-22, 2024. Here's what I discovered:\n\n• 15 messages from contact 'Mike Johnson'\n• 5 messages from 'Sarah Wilson'\n• 3 messages from unknown number +1-555-0123\n\nWould you like me to show the content of these messages or analyze them for specific keywords?", timestamp: "10:31 AM" },
+  { id: 3, type: "user", message: "Find connections between John Doe and suspicious contacts", timestamp: "10:35 AM" },
+  { id: 4, type: "assistant", message: "Analysis complete! I found several connections between John Doe and flagged contacts:\n\n🔗 **Direct Connections:**\n• 47 calls with 'Mike Johnson' (flagged for fraud)\n• 12 WhatsApp conversations with 'Alex Rivera' (money laundering suspect)\n\n📍 **Location Overlaps:**\n• Both visited 123 Oak Street on March 10th\n• Simultaneous presence at Central Bank on March 15th\n\n💰 **Financial Patterns:**\n• $2,500 transfer mentioned in messages\n• Coordinated ATM withdrawals within 30 minutes", timestamp: "10:36 AM" },
+];
+
+export const predefinedQuestions: string[] = [
+  "Show me all deleted messages from this week",
+  "Find suspicious financial transactions",
+  "What locations was the device at during March 15-20?",
+  "Analyze call patterns for unusual activity",
+  "Show me all contacts with criminal records",
+  "Find messages mentioning drugs or weapons",
+];
+
+export const mockTimelineData: TimelineEvent[] = [
+    { time: "09:15 AM", date: "Mar 15", event: "Device location: Home address", type: "location", icon: MapPin },
+    { time: "10:30 AM", date: "Mar 15", event: "WhatsApp message to Mike Johnson", type: "message", icon: MessageCircle },
+    { time: "11:45 AM", date: "Mar 15", event: "Phone call from Sarah Wilson (12 min)", type: "call", icon: Phone },
+    { time: "02:15 PM", date: "Mar 15", event: "Location change: Central Bank", type: "location", icon: MapPin },
+    { time: "02:30 PM", date: "Mar 15", event: "Deleted WhatsApp conversation", type: "deleted", icon: MessageCircle },
+    { time: "03:45 PM", date: "Mar 15", event: "ATM withdrawal: $500", type: "financial", icon: Activity },
+];
