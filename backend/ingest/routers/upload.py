@@ -1,74 +1,64 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 from ingest.services.parser_service import UFDRParser
 from ingest.services.ingest_service import IngestService
 from ingest.utils.logger import get_logger
-import aiofiles
 from pathlib import Path
 import traceback
+from pydantic import BaseModel
 
 logger = get_logger(__name__)
 
-router = APIRouter(prefix="/upload", tags=["Upload"])
+router = APIRouter(prefix="/ingest", tags=["Ingest"])
 
 ingest_service = IngestService()
 
 
+class IngestRequest(BaseModel):
+    file_path: str
+
 @router.post("/")
-async def upload_ufdr(file: UploadFile = File(...)):
+async def ingest_ufdr(request: IngestRequest):
     """
-    Upload a UFDR file, parse it, and ingest into DB + indexes.
+    Ingest a UFDR file by file path: parse and store in DB + search indexes.
     Supports .ufdr, .xml, .json, and .csv files.
     """
-    logger.info(f"Starting upload process for file: {file.filename}")
-    
+    logger.info(f"Starting ingestion process for file: {request.file_path}")
+
     try:
-        # Log file details
-        logger.info(f"File details - Name: {file.filename}, Content-Type: {file.content_type}, Size: {file.size if hasattr(file, 'size') else 'unknown'}")
-        
+        file_path = Path(request.file_path)
+
+        # Validate file exists
+        if not file_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"File not found: {request.file_path}"
+            )
+
         # Validate file extension
-        file_extension = Path(file.filename).suffix.lower()
+        file_extension = file_path.suffix.lower()
         supported_extensions = ['.ufdr', '.xml', '.json', '.csv']
         logger.info(f"File extension: {file_extension}")
-        
+
         if file_extension not in supported_extensions:
             logger.warning(f"Unsupported file type: {file_extension}")
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail=f"Unsupported file type: {file_extension}. Supported types: {supported_extensions}"
             )
 
-        logger.info("File extension validation passed")
-
-        # Ensure tmp storage exists
-        tmp_dir = Path("storage/tmp")
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Temporary directory: {tmp_dir}")
-
-        tmp_path = tmp_dir / file.filename
-        logger.info(f"Saving file to: {tmp_path}")
-
-        # Save file with detailed logging
-        bytes_written = 0
-        async with aiofiles.open(tmp_path, "wb") as f:
-            while chunk := await file.read(8192):  # Read in 8KB chunks
-                await f.write(chunk)
-                bytes_written += len(chunk)
-                if bytes_written % (1024 * 1024) == 0:  # Log every MB
-                    logger.info(f"Written {bytes_written / (1024 * 1024):.1f} MB")
-
-        logger.info(f"File saved successfully to {tmp_path} ({bytes_written} bytes)")
+        logger.info("File validation passed")
 
         # Parse UFDR → dict
         logger.info("Starting file parsing...")
         try:
-            parsed_data = UFDRParser.parse_file(str(tmp_path))
-            parsed_data["filename"] = file.filename
+            parsed_data = UFDRParser.parse_file(str(file_path))
+            parsed_data["filename"] = file_path.name
             logger.info(f"File parsing successful. Parsed {len(parsed_data)} fields")
         except Exception as parse_error:
             logger.error(f"File parsing failed: {parse_error}")
             logger.error(f"Parse error traceback: {traceback.format_exc()}")
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail=f"Failed to parse file: {str(parse_error)}"
             )
 
@@ -85,10 +75,11 @@ async def upload_ufdr(file: UploadFile = File(...)):
                 detail=f"Failed to ingest data: {str(ingest_error)}"
             )
 
-        logger.info("Upload process completed successfully")
+        logger.info("Ingestion process completed successfully")
         return {
             "status": "success",
-            "filename": file.filename,
+            "filename": file_path.name,
+            "file_path": str(file_path),
             "file_type": file_extension,
             "ingest_result": ingest_result,
         }
@@ -99,4 +90,4 @@ async def upload_ufdr(file: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"Unexpected upload failure: {e}")
         logger.error(f"Error traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"UFDR upload failed: {e}")
+        raise HTTPException(status_code=500, detail=f"UFDR ingestion failed: {e}")

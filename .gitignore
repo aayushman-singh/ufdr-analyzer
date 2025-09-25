@@ -29,3 +29,5 @@ coverage.xml
 backend/database.db
 /backend/UFDRConvert
 /backend/files
+*.ufdr
+*.zip

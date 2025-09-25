@@ -52,6 +52,13 @@ def setArgs():
 def getZipReportXML(ufdr, OUTD):
     logging.info("Extracting report.xml...")
     with ZipFile(ufdr, 'r') as zip:
+        # First, extract report.xml to the output directory
+        report_xml_path = Path(OUTD) / "report.xml"
+        with open(report_xml_path, 'wb') as report_file:
+            report_file.write(zip.read("report.xml"))
+        logging.info(f"report.xml extracted to: {report_xml_path}")
+
+        # Now process the report.xml for directory structure extraction
         with io.TextIOWrapper(zip.open("report.xml"), encoding="utf-8") as f:
             logging.info("Creating original directory structure...")
             if PROGRESSLIB: extractProgress(zip, OUTD, f)
