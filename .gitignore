@@ -27,3 +27,5 @@ coverage.xml
 *.pyc
 /backend/storage
 backend/database.db
+/backend/UFDRConvert
+/backend/files
