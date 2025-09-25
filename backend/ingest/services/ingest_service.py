@@ -29,13 +29,30 @@ class IngestService:
         3. Index relevant data in Meilisearch
         4. Save media to MinIO (via storage_services)
         """
+        run_id = None
         try:
             # Create a new Run entry
+            # Convert user_id to UUID if it's an integer
+            user_id = parsed_data.get("user_id", 1)
+            if isinstance(user_id, int):
+                # Get first user from database or create a default UUID
+                from sqlmodel import select
+                # Import User here to avoid circular imports
+                import sys
+                import os
+                sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+                from db_setup import User
+                first_user = session.exec(select(User)).first()
+                if first_user:
+                    user_id = first_user.id
+                else:
+                    user_id = uuid.uuid4()  # Fallback UUID
+
             run = Run(
                 ufdr_file_name=parsed_data.get("filename"),
                 status="ingesting",
                 start_time=datetime.utcnow(),
-                user_id=parsed_data.get("user_id", 1),
+                user_id=user_id,
             )
             session.add(run)
             session.commit()
