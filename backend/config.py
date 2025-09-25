@@ -22,15 +22,18 @@ PORT = 8000
 DEBUG = True
 
 # ------------------------
-# Database placeholders (to be updated after schema is ready)
+# Database Configuration
 # ------------------------
 POSTGRES_CONFIG = {
     "host": "localhost",
     "port": 5432,
-    "user": "username",
+    "user": "postgres",
     "password": "password",
-    "database": "ufdr_db"
+    "database": "ufdr_analyzer"
 }
+
+# PostgreSQL connection string
+POSTGRES_URL = f"postgresql://{POSTGRES_CONFIG['user']}:{POSTGRES_CONFIG['password']}@{POSTGRES_CONFIG['host']}:{POSTGRES_CONFIG['port']}/{POSTGRES_CONFIG['database']}"
 
 MEILI_CONFIG = {
     "host": "http://127.0.0.1:7700",

@@ -26,3 +26,4 @@ coverage.xml
 /backend/__pycache__
 *.pyc
 /backend/storage
+backend/database.db
