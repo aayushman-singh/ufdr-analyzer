@@ -62,8 +62,28 @@ class UFDRParser:
 
     @staticmethod
     def _parse_xml(file_path: Path) -> Dict[str, Any]:
+        logger.info(f"Starting XML parsing of {file_path.name}")
+        file_size_mb = file_path.stat().st_size / (1024 * 1024)
+        logger.info(f"File size: {file_size_mb:.1f} MB")
+
+        # Try to get cached result first to avoid loading 924MB into memory
+        from .cache_service import cache_service
+        cached_result = cache_service.get_cached_xml_parse(str(file_path))
+        if cached_result:
+            return cached_result
+
+        # Fall back to full parsing if not cached
         with open(file_path, "r", encoding="utf-8") as f:
-            return xmltodict.parse(f.read())
+            logger.info("Reading XML content into memory...")
+            content = f.read()
+            logger.info(f"Content loaded ({len(content):,} characters), starting XML parsing...")
+            result = xmltodict.parse(content)
+            logger.info("XML parsing completed successfully")
+
+            # Cache the result for future use
+            cache_service.cache_xml_parse(str(file_path), result)
+
+            return result
 
     @staticmethod
     def _parse_json(file_path: Path) -> Dict[str, Any]:

@@ -62,7 +62,9 @@ class Run(SQLModel, table=True):
     start_time: datetime.datetime = Field(
         default_factory=datetime.datetime.now)
     end_time: Optional[datetime.datetime]
-    metadata: Optional[str] = Field(default=None, sa_column=Column(TEXT))  # JSON string for UFDR extraction metadata
+    extraction_metadata: Optional[str] = Field(default=None, sa_column=Column(TEXT))  # JSON string for UFDR extraction metadata
+    file_content_hash: Optional[str] = Field(default=None, index=True)  # SHA-256 hash for deduplication
+    original_file_path: Optional[str] = Field(default=None)  # Original file path for reference
 
     # Relationships
     user: User = Relationship(back_populates="runs")

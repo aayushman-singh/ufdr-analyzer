@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends
 from ingest.services.parser_service import UFDRParser
 from ingest.services.ingest_service import IngestService
+from ingest.services.cache_service import cache_service
 from ingest.utils.logger import get_logger
 from pathlib import Path
 import traceback
@@ -8,9 +9,11 @@ from pydantic import BaseModel
 from sqlmodel import Session
 from meilisearch import Client as MeiliClient
 from database import get_session
+from db_setup import Run
 import sys
 import os
 import re
+import time
 
 # Avoid circular import by getting meili_client directly
 def get_meili_client():
@@ -103,7 +106,29 @@ async def ingest_ufdr(
 
         logger.info("File validation passed")
 
-        # Check if already processed
+        # OPTIMIZATION: Check for content-based deduplication first
+        start_time = time.time()
+        cached_result = cache_service.check_existing_processing(str(file_path), session)
+
+        if cached_result:
+            processing_time = time.time() - start_time
+            logger.info(f"Found cached result for file, returning in {processing_time:.2f}s")
+
+            return {
+                "status": "success",
+                "cached": True,
+                "filename": file_path.name,
+                "file_path": str(file_path),
+                "file_type": file_extension,
+                "run_id": cached_result.run_id,
+                "processing_time": f"{processing_time:.2f}s",
+                "message": "Using cached results - file already processed",
+                "ingest_result": cached_result.processing_stats,
+                "aleapp_processed": cached_result.processing_stats.get('aleapp_processed', False),
+                "slug": create_slug_from_path(str(file_path))
+            }
+
+        # Check if already processed (legacy cache check)
         if is_already_processed(str(file_path)):
             cache_dir = get_ufdr_cache_dir(str(file_path))
             logger.info(f"File already processed, using cached data from: {cache_dir}")
@@ -111,12 +136,17 @@ async def ingest_ufdr(
             # Parse from cached report.xml
             report_xml_path = cache_dir / "report.xml"
             try:
+                logger.info(f"Reading cached report.xml ({report_xml_path.stat().st_size / (1024*1024):.1f} MB)")
                 parsed_data = UFDRParser._parse_xml(report_xml_path)
+                logger.info("Cached XML parsing completed")
+
                 # Add extraction info from cache
+                logger.info("Getting cached files info...")
                 parsed_data["_extraction_info"] = {
                     "extracted_dir": str(cache_dir),
                     "files_info": UFDRParser._get_files_info_from_cache(str(cache_dir))
                 }
+                logger.info("Normalizing cached data...")
                 parsed_data = UFDRParser._normalize(parsed_data, file_path.name)
 
                 # Check for cached ALEAPP data
@@ -152,14 +182,50 @@ async def ingest_ufdr(
 
         # Ingest to Postgres + others
         logger.info("Starting data ingestion...")
+        logger.info(f"Data summary: {len(parsed_data.get('messages', []))} messages, {len(parsed_data.get('contacts', []))} contacts, {len(parsed_data.get('calls', []))} calls")
+
+        # Get file hash for caching
+        file_hash = cache_service.get_file_hash_with_cache(str(file_path))
+        logger.info(f"File content hash: {file_hash[:12]}...")
+
         try:
             ingest_result = ingest_service.ingest_to_all(parsed_data, session, meili_client)
             logger.info(f"Ingestion successful: {ingest_result}")
+
+            # Update the run record with file hash and original path
+            if ingest_result and 'run_id' in ingest_result:
+                try:
+                    run = session.get(Run, ingest_result['run_id'])
+                    if run:
+                        run.file_content_hash = file_hash
+                        run.original_file_path = str(file_path)
+                        session.add(run)
+                        session.commit()
+                        logger.info(f"Updated run {run.id} with content hash")
+
+                        # Cache the processing results
+                        processing_stats = {
+                            'file_path': str(file_path),
+                            'run_id': str(run.id),
+                            'message_count': len(parsed_data.get('messages', [])),
+                            'contact_count': len(parsed_data.get('contacts', [])),
+                            'call_count': len(parsed_data.get('calls', [])),
+                            'aleapp_processed': "aleapp_data" in parsed_data,
+                            'processing_time': time.time() - start_time,
+                            'status': 'completed'
+                        }
+
+                        cache_service.cache_ingestion_result(file_hash, str(run.id), processing_stats)
+                        logger.info("Cached ingestion results for future lookups")
+
+                except Exception as cache_error:
+                    logger.warning(f"Failed to update run with hash or cache results: {cache_error}")
+
         except Exception as ingest_error:
             logger.error(f"Data ingestion failed: {ingest_error}")
             logger.error(f"Ingest error traceback: {traceback.format_exc()}")
             raise HTTPException(
-                status_code=500, 
+                status_code=500,
                 detail=f"Failed to ingest data: {str(ingest_error)}"
             )
 
@@ -180,12 +246,16 @@ async def ingest_ufdr(
                     slug = create_slug_from_path(str(file_path))
                     aleapp_web_url = f"http://localhost:8080/ALEAPP/output/{slug}/{report_dir.name}/_HTML/index.html"
 
-        logger.info("Ingestion process completed successfully")
+        total_processing_time = time.time() - start_time
+        logger.info(f"Ingestion process completed successfully in {total_processing_time:.2f}s")
+
         return {
             "status": "success",
+            "cached": False,
             "filename": file_path.name,
             "file_path": str(file_path),
             "file_type": file_extension,
+            "processing_time": f"{total_processing_time:.2f}s",
             "ingest_result": ingest_result,
             "aleapp_processed": "aleapp_data" in parsed_data,
             "aleapp_report_path": aleapp_report_path,
