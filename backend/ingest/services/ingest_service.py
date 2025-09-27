@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+import json
 from datetime import datetime
 from sqlmodel import Session
 from meilisearch import Client as MeiliClient
@@ -9,7 +10,7 @@ from .storage_service import save_media
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-from db_setup import Run, Message, Call, Contact, Media
+from db_setup import Run, Message, Call, Contact, Media, AleappArtifact, AleappReport
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -48,11 +49,24 @@ class IngestService:
                 else:
                     user_id = uuid.uuid4()  # Fallback UUID
 
+            # Prepare metadata from UFDR extraction
+            metadata = {}
+            if "_extraction_info" in parsed_data:
+                metadata["extraction_info"] = parsed_data["_extraction_info"]
+            if "aleapp_data" in parsed_data:
+                metadata["aleapp_summary"] = {
+                    "output_directory": parsed_data["aleapp_data"].get("output_directory"),
+                    "artifact_count": len(parsed_data["aleapp_data"].get("artifacts", [])),
+                    "report_count": len(parsed_data["aleapp_data"].get("reports", [])),
+                    "timeline_count": len(parsed_data["aleapp_data"].get("timeline", []))
+                }
+
             run = Run(
                 ufdr_file_name=parsed_data.get("filename"),
                 status="ingesting",
                 start_time=datetime.utcnow(),
                 user_id=user_id,
+                metadata=json.dumps(metadata) if metadata else None
             )
             session.add(run)
             session.commit()
@@ -126,6 +140,44 @@ class IngestService:
             if media_paths:
                 session.add_all(media_paths)
                 session.commit()
+
+            # --- Save ALEAPP data to database ---
+            # 7. Process ALEAPP artifacts and reports
+            aleapp_data = parsed_data.get("aleapp_data")
+            if aleapp_data:
+                # Save ALEAPP artifacts
+                aleapp_artifacts = []
+                for artifact in aleapp_data.get("artifacts", []):
+                    aleapp_artifact = AleappArtifact(
+                        run_id=run_id,
+                        artifact_type=artifact.get("type"),
+                        filename=artifact.get("filename"),
+                        file_path=artifact.get("path"),
+                        category=artifact.get("category"),
+                        row_count=artifact.get("row_count"),
+                        data=json.dumps(artifact.get("sample_data") or artifact.get("data")) if artifact.get("sample_data") or artifact.get("data") else None
+                    )
+                    aleapp_artifacts.append(aleapp_artifact)
+
+                if aleapp_artifacts:
+                    session.add_all(aleapp_artifacts)
+
+                # Save ALEAPP reports
+                aleapp_reports = []
+                for report in aleapp_data.get("reports", []):
+                    aleapp_report = AleappReport(
+                        run_id=run_id,
+                        report_type=report.get("type"),
+                        filename=report.get("filename"),
+                        file_path=report.get("path")
+                    )
+                    aleapp_reports.append(aleapp_report)
+
+                if aleapp_reports:
+                    session.add_all(aleapp_reports)
+
+                session.commit()
+                logger.info(f"Saved {len(aleapp_artifacts)} ALEAPP artifacts and {len(aleapp_reports)} reports to database")
 
             # --- Update Run status ---
             run.status = "complete"

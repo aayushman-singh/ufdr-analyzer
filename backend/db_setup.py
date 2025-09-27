@@ -62,6 +62,7 @@ class Run(SQLModel, table=True):
     start_time: datetime.datetime = Field(
         default_factory=datetime.datetime.now)
     end_time: Optional[datetime.datetime]
+    metadata: Optional[str] = Field(default=None, sa_column=Column(TEXT))  # JSON string for UFDR extraction metadata
 
     # Relationships
     user: User = Relationship(back_populates="runs")
@@ -70,6 +71,8 @@ class Run(SQLModel, table=True):
     calls: List["Call"] = Relationship(back_populates="run")
     contacts: List["Contact"] = Relationship(back_populates="run")
     media: List["Media"] = Relationship(back_populates="run")
+    aleapp_artifacts: List["AleappArtifact"] = Relationship(back_populates="run")
+    aleapp_reports: List["AleappReport"] = Relationship(back_populates="run")
 
 
 class Result(SQLModel, table=True):
@@ -163,6 +166,39 @@ class Media(SQLModel, table=True):
 
     # Relationship
     run: Run = Relationship(back_populates="media")
+
+
+class AleappArtifact(SQLModel, table=True):
+    """Represents ALEAPP analysis artifacts."""
+    id: Optional[uuid.UUID] = Field(
+        default_factory=uuid.uuid4, primary_key=True)
+    run_id: uuid.UUID = Field(foreign_key="run.id")
+    artifact_type: str  # e.g., "csv", "json", "html"
+    filename: str
+    file_path: str
+    category: Optional[str] = None
+    row_count: Optional[int] = None
+    data: Optional[str] = None  # JSON string for structured data
+    created_at: datetime.datetime = Field(
+        default_factory=datetime.datetime.now)
+
+    # Relationship
+    run: Run = Relationship(back_populates="aleapp_artifacts")
+
+
+class AleappReport(SQLModel, table=True):
+    """Represents ALEAPP HTML reports."""
+    id: Optional[uuid.UUID] = Field(
+        default_factory=uuid.uuid4, primary_key=True)
+    run_id: uuid.UUID = Field(foreign_key="run.id")
+    report_type: str  # e.g., "html", "summary"
+    filename: str
+    file_path: str
+    created_at: datetime.datetime = Field(
+        default_factory=datetime.datetime.now)
+
+    # Relationship
+    run: Run = Relationship(back_populates="aleapp_reports")
 
 
 # 2. Database Setup and Seeding

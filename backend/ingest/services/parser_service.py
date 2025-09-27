@@ -1,6 +1,9 @@
 import xmltodict
 import json
 import csv
+import os
+import subprocess
+import platform
 from pathlib import Path
 from typing import Dict, Any, List
 from ingest.utils.logger import get_logger
@@ -11,13 +14,13 @@ logger = get_logger(__name__)
 
 class UFDRParser:
     @staticmethod
-    def parse_file(file_path: str) -> Dict[str, Any]:
+    def parse_file(file_path: str, output_dir: str = None) -> Dict[str, Any]:
         file_path = Path(file_path)
         logger.info(f"Parsing UFDR file: {file_path}")
 
         if file_path.suffix.lower() == ".ufdr":
             # Handle UFDR files by extracting them first
-            extracted_dir = extract_ufdr_to_directory(str(file_path))
+            extracted_dir = extract_ufdr_to_directory(str(file_path), output_dir)
             logger.info(f"UFDR extracted to: {extracted_dir}")
             
             # Look for report.xml in the extracted directory
@@ -44,6 +47,14 @@ class UFDRParser:
             raise ValueError("Unsupported UFDR file type")
 
         normalized_data = UFDRParser._normalize(raw_data, file_path.name)
+
+        # Run ALEAPP if we have android extraction
+        if "_extraction_info" in raw_data:
+            extracted_dir = raw_data["_extraction_info"]["extracted_dir"]
+            aleapp_output = UFDRParser._run_aleapp(extracted_dir)
+            if aleapp_output:
+                normalized_data["aleapp_data"] = aleapp_output
+
         return normalized_data
 
     @staticmethod
@@ -185,3 +196,169 @@ class UFDRParser:
             "calls": calls,
             "media": media
         }
+
+    @staticmethod
+    def _get_files_info_from_cache(cache_dir: str) -> dict:
+        """Get file info from cached extraction directory"""
+        try:
+            from ingest.utils.ufdr2dir import get_extracted_files_info
+            return get_extracted_files_info(cache_dir)
+        except Exception as e:
+            logger.warning(f"Could not get files info from cache: {e}")
+            return {"total_files": 0, "file_types": {}, "directories": [], "files": []}
+
+    @staticmethod
+    def _run_os_specific_utils():
+        """Run OS-specific utility scripts before ALEAPP"""
+        try:
+            current_os = platform.system().lower()
+            root_dir = Path(__file__).parent.parent.parent.parent  # Go to project root
+
+            if current_os == "windows":
+                util_script = root_dir / "fix_repo_permissions.bat"
+                if util_script.exists():
+                    logger.info("Running Windows permission fix script...")
+                    subprocess.run([str(util_script)], shell=True, check=True, cwd=str(root_dir))
+            else:
+                util_script = root_dir / "fix_repo_permissions.sh"
+                if util_script.exists():
+                    logger.info("Running Unix permission fix script...")
+                    subprocess.run(["bash", str(util_script)], check=True, cwd=str(root_dir))
+
+            logger.info("OS-specific utils completed successfully")
+        except Exception as e:
+            logger.warning(f"Failed to run OS-specific utils: {e}")
+
+    @staticmethod
+    def _run_aleapp(android_extraction_path: str) -> Dict[str, Any]:
+        """Run ALEAPP on Android extraction and return parsed output"""
+        try:
+            logger.info(f"Starting ALEAPP analysis on: {android_extraction_path}")
+
+            # Run OS-specific utils first
+            UFDRParser._run_os_specific_utils()
+
+            # Setup paths
+            root_dir = Path(__file__).parent.parent.parent.parent  # Go to project root
+            aleapp_dir = root_dir / "ALEAPP"
+            aleapp_script = aleapp_dir / "aleapp.py"
+
+            # Create output directory for ALEAPP
+            output_dir = Path(android_extraction_path).parent / "aleapp_output"
+            output_dir.mkdir(exist_ok=True)
+
+            if not aleapp_script.exists():
+                logger.error(f"ALEAPP script not found at: {aleapp_script}")
+                return None
+
+            # Run ALEAPP command
+            cmd = [
+                "python",
+                str(aleapp_script),
+                "-t", "fs",
+                "-i", str(android_extraction_path),
+                "-o", str(output_dir)
+            ]
+
+            logger.info(f"Running ALEAPP command: {' '.join(cmd)}")
+
+            # Change to ALEAPP directory before running
+            result = subprocess.run(
+                cmd,
+                cwd=str(aleapp_dir),
+                capture_output=True,
+                text=True,
+                timeout=1800  # 30 minute timeout
+            )
+
+            if result.returncode != 0:
+                logger.error(f"ALEAPP failed with return code {result.returncode}")
+                logger.error(f"ALEAPP stderr: {result.stderr}")
+                return None
+
+            logger.info("ALEAPP completed successfully")
+            logger.info(f"ALEAPP stdout: {result.stdout}")
+
+            # Parse ALEAPP output
+            return UFDRParser._parse_aleapp_output(str(output_dir))
+
+        except subprocess.TimeoutExpired:
+            logger.error("ALEAPP timed out after 30 minutes")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to run ALEAPP: {e}")
+            return None
+
+    @staticmethod
+    def _parse_aleapp_output(aleapp_output_dir: str) -> Dict[str, Any]:
+        """Parse ALEAPP output directory and extract relevant data"""
+        try:
+            output_path = Path(aleapp_output_dir)
+
+            # Look for common ALEAPP output files
+            aleapp_data = {
+                "output_directory": str(output_path),
+                "artifacts": [],
+                "reports": [],
+                "timeline": []
+            }
+
+            # Parse HTML reports if they exist
+            html_reports = list(output_path.glob("*.html"))
+            for html_file in html_reports:
+                aleapp_data["reports"].append({
+                    "type": "html",
+                    "filename": html_file.name,
+                    "path": str(html_file)
+                })
+
+            # Parse CSV artifacts
+            csv_files = list(output_path.rglob("*.csv"))
+            for csv_file in csv_files:
+                try:
+                    with open(csv_file, 'r', encoding='utf-8', errors='ignore') as f:
+                        reader = csv.DictReader(f)
+                        rows = list(reader)
+                        if rows:  # Only include non-empty CSV files
+                            aleapp_data["artifacts"].append({
+                                "type": "csv",
+                                "filename": csv_file.name,
+                                "path": str(csv_file),
+                                "category": csv_file.parent.name,
+                                "row_count": len(rows),
+                                "sample_data": rows[:5]  # First 5 rows as sample
+                            })
+                except Exception as csv_error:
+                    logger.warning(f"Failed to parse CSV {csv_file}: {csv_error}")
+
+            # Parse JSON files if they exist
+            json_files = list(output_path.rglob("*.json"))
+            for json_file in json_files:
+                try:
+                    with open(json_file, 'r', encoding='utf-8') as f:
+                        json_data = json.load(f)
+                        aleapp_data["artifacts"].append({
+                            "type": "json",
+                            "filename": json_file.name,
+                            "path": str(json_file),
+                            "category": json_file.parent.name,
+                            "data": json_data
+                        })
+                except Exception as json_error:
+                    logger.warning(f"Failed to parse JSON {json_file}: {json_error}")
+
+            # Look for timeline data
+            timeline_files = list(output_path.glob("*timeline*"))
+            for timeline_file in timeline_files:
+                aleapp_data["timeline"].append({
+                    "filename": timeline_file.name,
+                    "path": str(timeline_file)
+                })
+
+            logger.info(f"Parsed ALEAPP output: {len(aleapp_data['artifacts'])} artifacts, {len(aleapp_data['reports'])} reports")
+
+            return aleapp_data
+
+        except Exception as e:
+            logger.error(f"Failed to parse ALEAPP output: {e}")
+            return None

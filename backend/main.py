@@ -15,6 +15,8 @@ from database import create_db_and_tables, get_session
 from ingest.services.ingest_service import IngestService
 from ingest.utils.logger import get_logger
 from config import APP_NAME, APP_VERSION
+import subprocess
+import os
 
 logger = get_logger(__name__)
 
@@ -191,3 +193,47 @@ app.include_router(report.router)
 @app.get("/")
 async def root():
     return {"message": f"{APP_NAME} is running!"}
+
+# ------------------------
+# ALEAPP Integration
+# ------------------------
+
+def run_aleapp_analysis(input_path: str, output_path: str) -> dict:
+    """
+    Run ALEAPP analysis with admin privileges
+    
+    Args:
+        input_path: Path to Android extraction directory
+        output_path: Path where ALEAPP report should be saved
+    
+    Returns:
+        dict: Result of the ALEAPP analysis
+    """
+    try:
+        # Get the path to our admin wrapper script
+        script_path = os.path.join(os.path.dirname(__file__), 'run_aleapp_admin.py')
+        
+        # Run the admin wrapper script
+        result = subprocess.run([
+            'python', script_path, input_path, output_path
+        ], capture_output=True, text=True, timeout=3600)  # 1 hour timeout
+        
+        return {
+            "success": result.returncode == 0,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode
+        }
+        
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "error": "ALEAPP analysis timed out after 1 hour",
+            "returncode": -1
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "returncode": -1
+        }
