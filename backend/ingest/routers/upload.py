@@ -43,11 +43,28 @@ def get_ufdr_cache_dir(file_path: str) -> Path:
     slug = create_slug_from_path(file_path)
     return Path("UFDRConvert") / slug
 
+def get_aleapp_report_path(file_path: str) -> Path:
+    """Get the ALEAPP report path for a given file"""
+    slug = create_slug_from_path(file_path)
+    # Check both new location (ALEAPP/output/slug) and old location (UFDRConvert/slug/aleapp_output)
+    # Navigate from backend directory to project root
+    current_dir = Path(__file__).parent.parent.parent  # backend
+    root_dir = current_dir.parent  # project root
+    new_aleapp_path = root_dir / "ALEAPP" / "output" / slug
+    old_aleapp_path = get_ufdr_cache_dir(file_path) / "aleapp_output"
+
+    if new_aleapp_path.exists():
+        return new_aleapp_path
+    elif old_aleapp_path.exists():
+        return old_aleapp_path
+    else:
+        return new_aleapp_path  # Return expected new location
+
 def is_already_processed(file_path: str) -> bool:
     """Check if UFDR file has already been processed"""
     cache_dir = get_ufdr_cache_dir(file_path)
     report_xml = cache_dir / "report.xml"
-    aleapp_output = cache_dir / "aleapp_output"
+    aleapp_output = get_aleapp_report_path(file_path)
     return cache_dir.exists() and report_xml.exists() and aleapp_output.exists()
 
 @router.post("/")
@@ -103,7 +120,7 @@ async def ingest_ufdr(
                 parsed_data = UFDRParser._normalize(parsed_data, file_path.name)
 
                 # Check for cached ALEAPP data
-                aleapp_output_dir = cache_dir / "aleapp_output"
+                aleapp_output_dir = get_aleapp_report_path(str(file_path))
                 if aleapp_output_dir.exists():
                     aleapp_output = UFDRParser._parse_aleapp_output(str(aleapp_output_dir))
                     if aleapp_output:
@@ -146,6 +163,23 @@ async def ingest_ufdr(
                 detail=f"Failed to ingest data: {str(ingest_error)}"
             )
 
+        # Get ALEAPP report path for response
+        aleapp_report_path = None
+        aleapp_web_url = None
+        if "aleapp_data" in parsed_data:
+            aleapp_output_dir = get_aleapp_report_path(str(file_path))
+            if aleapp_output_dir.exists():
+                aleapp_report_path = str(aleapp_output_dir.absolute())
+                # Check for the actual ALEAPP report directory structure
+                aleapp_reports = list(aleapp_output_dir.glob("ALEAPP_Reports_*"))
+                if aleapp_reports:
+                    # Use the first (and usually only) report directory
+                    report_dir = aleapp_reports[0]
+                    aleapp_report_path = str(report_dir.absolute())
+                    # Provide web URL if accessible
+                    slug = create_slug_from_path(str(file_path))
+                    aleapp_web_url = f"http://localhost:8080/ALEAPP/output/{slug}/{report_dir.name}/_HTML/index.html"
+
         logger.info("Ingestion process completed successfully")
         return {
             "status": "success",
@@ -154,6 +188,9 @@ async def ingest_ufdr(
             "file_type": file_extension,
             "ingest_result": ingest_result,
             "aleapp_processed": "aleapp_data" in parsed_data,
+            "aleapp_report_path": aleapp_report_path,
+            "aleapp_web_url": aleapp_web_url,
+            "slug": create_slug_from_path(str(file_path))
         }
 
     except HTTPException:

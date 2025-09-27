@@ -46,12 +46,15 @@ class UFDRParser:
             logger.error(f"Unsupported UFDR file type: {file_path.suffix}")
             raise ValueError("Unsupported UFDR file type")
 
+        # Extract file slug for consistent naming
+        file_slug = Path(output_dir).name if output_dir else file_path.stem.lower().replace(' ', '_')
+
         normalized_data = UFDRParser._normalize(raw_data, file_path.name)
 
         # Run ALEAPP if we have android extraction
         if "_extraction_info" in raw_data:
             extracted_dir = raw_data["_extraction_info"]["extracted_dir"]
-            aleapp_output = UFDRParser._run_aleapp(extracted_dir)
+            aleapp_output = UFDRParser._run_aleapp(extracted_dir, file_slug)
             if aleapp_output:
                 normalized_data["aleapp_data"] = aleapp_output
 
@@ -84,12 +87,14 @@ class UFDRParser:
         calls: List[Dict[str, Any]] = []
         media: List[Dict[str, Any]] = []
 
-        # Handle UFDR-specific data structure
+        # Store extraction info for later use
+        extraction_info = None
         if "_extraction_info" in raw_data:
+            extraction_info = raw_data["_extraction_info"]
             # This is from a UFDR file extraction
-            extracted_dir = raw_data["_extraction_info"]["extracted_dir"]
-            files_info = raw_data["_extraction_info"]["files_info"]
-            
+            extracted_dir = extraction_info["extracted_dir"]
+            files_info = extraction_info["files_info"]
+
             # Add media files from the extraction
             for file_info in files_info["files"]:
                 file_path = Path(extracted_dir) / file_info["path"]
@@ -104,7 +109,7 @@ class UFDRParser:
                         media_type = "audio"
                     elif file_info["extension"] in [".pdf", ".doc", ".docx", ".txt", ".rtf"]:
                         media_type = "document"
-                    
+
                     media.append({
                         "file_path": str(file_path),
                         "original_path": file_info["path"],
@@ -112,7 +117,7 @@ class UFDRParser:
                         "size": file_info["size"],
                         "extension": file_info["extension"]
                     })
-            
+
             # Remove extraction info from raw_data for XML parsing
             raw_data = {k: v for k, v in raw_data.items() if k != "_extraction_info"}
 
@@ -188,7 +193,8 @@ class UFDRParser:
                         "timestamp": row.get("timestamp"),
                     })
 
-        return {
+        # Build final normalized data
+        normalized_data = {
             "ufdr_id": "placeholder-uuid",  # or extract from raw data
             "filename": filename,
             "messages": messages,
@@ -196,6 +202,12 @@ class UFDRParser:
             "calls": calls,
             "media": media
         }
+
+        # Re-add extraction info to normalized data for later use
+        if extraction_info:
+            normalized_data["_extraction_info"] = extraction_info
+
+        return normalized_data
 
     @staticmethod
     def _get_files_info_from_cache(cache_dir: str) -> dict:
@@ -212,7 +224,10 @@ class UFDRParser:
         """Run OS-specific utility scripts before ALEAPP"""
         try:
             current_os = platform.system().lower()
-            root_dir = Path(__file__).parent.parent.parent.parent  # Go to project root
+            # Navigate to project root from backend/ingest/services/parser_service.py
+            current_file = Path(__file__)  # backend/ingest/services/parser_service.py
+            backend_dir = current_file.parent.parent.parent  # backend/
+            root_dir = backend_dir.parent  # project root
 
             if current_os == "windows":
                 util_script = root_dir / "fix_repo_permissions.bat"
@@ -230,7 +245,7 @@ class UFDRParser:
             logger.warning(f"Failed to run OS-specific utils: {e}")
 
     @staticmethod
-    def _run_aleapp(android_extraction_path: str) -> Dict[str, Any]:
+    def _run_aleapp(android_extraction_path: str, file_slug: str = None) -> Dict[str, Any]:
         """Run ALEAPP on Android extraction and return parsed output"""
         try:
             logger.info(f"Starting ALEAPP analysis on: {android_extraction_path}")
@@ -238,14 +253,23 @@ class UFDRParser:
             # Run OS-specific utils first
             UFDRParser._run_os_specific_utils()
 
-            # Setup paths
-            root_dir = Path(__file__).parent.parent.parent.parent  # Go to project root
+            # Setup paths - navigate to project root from backend/ingest/services/parser_service.py
+            current_file = Path(__file__)  # backend/ingest/services/parser_service.py
+            backend_dir = current_file.parent.parent.parent  # backend/
+            root_dir = backend_dir.parent  # project root
             aleapp_dir = root_dir / "ALEAPP"
             aleapp_script = aleapp_dir / "aleapp.py"
 
-            # Create output directory for ALEAPP
-            output_dir = Path(android_extraction_path).parent / "aleapp_output"
-            output_dir.mkdir(exist_ok=True)
+            # Create output directory for ALEAPP with consistent slug naming
+            if file_slug:
+                # Use slug-based naming in ALEAPP/output/ directory
+                aleapp_output_base = aleapp_dir / "output" / file_slug
+                aleapp_output_base.mkdir(parents=True, exist_ok=True)
+                output_dir = aleapp_output_base
+            else:
+                # Fallback to old method if no slug provided
+                output_dir = Path(android_extraction_path).parent / "aleapp_output"
+                output_dir.mkdir(exist_ok=True)
 
             if not aleapp_script.exists():
                 logger.error(f"ALEAPP script not found at: {aleapp_script}")

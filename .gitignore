@@ -31,3 +31,12 @@ backend/database.db
 /backend/files
 *.ufdr
 *.zip
+
+# ALEAPP - Generated output and temporary files
+ALEAPP/output/
+ALEAPP/__pycache__/
+ALEAPP/scripts/__pycache__/
+ALEAPP/scripts/ccl/__pycache__/
+ALEAPP/scripts/filetypes/__pycache__/
+ALEAPP/admin/data/generated/
+ALEAPP/admin/docs/generated/
