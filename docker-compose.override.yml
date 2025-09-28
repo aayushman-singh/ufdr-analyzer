@@ -1,0 +1,60 @@
+# Development overrides
+version: '3.8'
+
+services:
+  # Backend development overrides
+  backend:
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+    environment:
+      - DEBUG=true
+      - LOG_LEVEL=debug
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Frontend development overrides
+  frontend:
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    environment:
+      - NODE_ENV=development
+    command: npm run dev
+
+  # Worker development overrides
+  worker:
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+    environment:
+      - DEBUG=true
+      - LOG_LEVEL=debug
+    command: celery -A app.workers.celery_app worker --loglevel=debug --reload
+
+  # Add development tools
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: ufdr_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@ufdr.local
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks:
+      - ufdr_network
+
+  # Redis Commander
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: ufdr_redis_commander
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - ufdr_network

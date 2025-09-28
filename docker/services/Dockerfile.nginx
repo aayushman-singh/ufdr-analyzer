@@ -1,0 +1,25 @@
+# Nginx reverse proxy
+FROM nginx:1.25-alpine
+
+# Remove default nginx configuration
+RUN rm /etc/nginx/conf.d/default.conf
+
+# Copy custom nginx configuration
+COPY docker/nginx/nginx.conf /etc/nginx/nginx.conf
+COPY docker/nginx/default.conf /etc/nginx/conf.d/default.conf
+
+# Create necessary directories
+RUN mkdir -p /var/log/nginx /var/cache/nginx /var/run/nginx
+
+# Set proper permissions
+RUN chown -R nginx:nginx /var/log/nginx /var/cache/nginx /var/run/nginx
+
+# Expose ports
+EXPOSE 80 443
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost/health || exit 1
+
+# Start nginx
+CMD ["nginx", "-g", "daemon off;"]

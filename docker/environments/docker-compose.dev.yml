@@ -1,0 +1,70 @@
+# Development environment
+version: '3.8'
+
+services:
+  # Development database with more verbose logging
+  postgres:
+    environment:
+      - POSTGRES_DB=ufdr_analyzer_dev
+      - POSTGRES_USER=ufdr_user
+      - POSTGRES_PASSWORD=dev_password
+    command: postgres -c log_statement=all -c log_destination=stderr
+
+  # Development backend with hot reload
+  backend:
+    environment:
+      - DEBUG=true
+      - LOG_LEVEL=debug
+      - DATABASE_URL=postgresql://ufdr_user:dev_password@postgres:5432/ufdr_analyzer_dev
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Development frontend with hot reload
+  frontend:
+    environment:
+      - NODE_ENV=development
+      - NEXT_PUBLIC_API_URL=http://localhost/api
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    command: npm run dev
+
+  # Development worker with auto-reload
+  worker:
+    environment:
+      - DEBUG=true
+      - LOG_LEVEL=debug
+      - DATABASE_URL=postgresql://ufdr_user:dev_password@postgres:5432/ufdr_analyzer_dev
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+    command: celery -A app.workers.celery_app worker --loglevel=debug --reload
+
+  # Add development tools
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: ufdr_pgadmin_dev
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@ufdr.local
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks:
+      - ufdr_network
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: ufdr_redis_commander_dev
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - ufdr_network

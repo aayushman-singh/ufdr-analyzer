@@ -1,0 +1,226 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: ufdr_postgres
+    environment:
+      POSTGRES_DB: ufdr_analyzer
+      POSTGRES_USER: ufdr_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ufdr_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./databases/postgresql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ufdr_user -d ufdr_analyzer"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ufdr_network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: ufdr_redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ufdr_network
+
+  # Elasticsearch
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: ufdr_elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - ufdr_network
+
+  # Neo4j Graph Database
+  neo4j:
+    image: neo4j:5.15-community
+    container_name: ufdr_neo4j
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-neo4j_password}
+      - NEO4J_PLUGINS=["apoc"]
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD:-neo4j_password}", "RETURN 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - ufdr_network
+
+  # MinIO Object Storage
+  minio:
+    image: minio/minio:latest
+    container_name: ufdr_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - ufdr_network
+
+  # Backend API
+  backend:
+    build:
+      context: .
+      dockerfile: docker/services/Dockerfile.backend
+    container_name: ufdr_backend
+    environment:
+      - DATABASE_URL=postgresql://ufdr_user:${POSTGRES_PASSWORD:-ufdr_password}@postgres:5432/ufdr_analyzer
+      - REDIS_URL=redis://redis:6379
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - NEO4J_URL=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-neo4j_password}
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - ./backend:/app
+      - upload_data:/app/data/uploads
+      - export_data:/app/data/exports
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - ufdr_network
+
+  # Background Worker
+  worker:
+    build:
+      context: .
+      dockerfile: docker/services/Dockerfile.worker
+    container_name: ufdr_worker
+    environment:
+      - DATABASE_URL=postgresql://ufdr_user:${POSTGRES_PASSWORD:-ufdr_password}@postgres:5432/ufdr_analyzer
+      - REDIS_URL=redis://redis:6379
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - NEO4J_URL=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-neo4j_password}
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - ./backend:/app
+      - upload_data:/app/data/uploads
+      - export_data:/app/data/exports
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - ufdr_network
+
+  # Frontend
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/services/Dockerfile.frontend
+    container_name: ufdr_frontend
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost/api
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - ufdr_network
+
+  # Nginx Reverse Proxy
+  nginx:
+    build:
+      context: .
+      dockerfile: docker/services/Dockerfile.nginx
+    container_name: ufdr_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - ufdr_network
+
+# Volumes
+volumes:
+  postgres_data:
+  redis_data:
+  elasticsearch_data:
+  neo4j_data:
+  neo4j_logs:
+  minio_data:
+  upload_data:
+  export_data:
+
+# Networks
+networks:
+  ufdr_network:
+    driver: bridge

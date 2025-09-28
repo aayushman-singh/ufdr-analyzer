@@ -1,0 +1,97 @@
+***Background*:**
+
+When agencies like NIA seize digital devices (phones, laptops, etc.) during investigations, they use forensic extraction tools (like Cellebrite, Oxygen Forensics) to generate **UFDR reports**.
+
+- These reports contain **massive amounts of raw data** → chats, calls, contacts, images, videos, browsing history, app data.
+- Manually going through them takes weeks and delays investigations.
+- Investigating Officers (IOs) often lack technical skills to query such large, complex data.
+
+***Problem*:**
+
+Investigators need a **smart AI-based tool** that can:
+
+1. **Ingest UFDR reports** from different forensic tools.
+2. Allow **natural language queries** (like “Show me all WhatsApp chats mentioning Bitcoin addresses” or “List calls with international numbers”).
+3. Highlight **important connections** (link analysis between suspects, contacts, or activities).
+4. Generate **easy-to-read, investigation-ready reports** instead of raw technical dumps.
+
+***Expected Solution***
+
+- A **software platform** that reduces analysis time and helps officers quickly find actionable evidence.
+- Features should include:
+    - **UFDR ingestion** → parse reports into structured format.
+    - **Natural language interface** → no need for SQL/technical knowledge.
+    - **AI-powered search & summarization** → highlight key insights.
+    - **Reports & visualization** → graphs, summaries, PDF reports.
+- Must save time, improve accuracy, and make investigations more efficient.
+
+# Tech Stack
+
+## **1. Data Ingestion & Parsing**
+
+- **Language**: Python (ideal for parsing, text processing, ETL).
+- **Parsing UFDR**:
+    - Use `xmltodict` / `json` / `csv` → normalize into a consistent schema.
+    - Store media (images/videos) separately (local storage / S3).
+- **Storage**:
+    - **Postgres** → structured data (messages, calls, contacts).
+    - **ElasticSearch** → full-text + keyword search across chats, docs, metadata.
+
+---
+
+## **2. Query Interface (Natural Language → Data)**
+
+- **Approach**: NLQ → SQL/ES translation.
+- **Stack**:
+    - Use a light wrapper around an LLM (Hugging Face or OpenAI API if permitted) to translate natural queries into SQL/ES queries.
+    - Keep a curated prompt/grammar so it doesn’t hallucinate.
+
+---
+
+## **3. Entity Extraction & Intelligence**
+
+- **NER**: Use `spaCy` (fast, production-ready) + simple regex for phone numbers, crypto addresses, emails.
+- **Classification**: Rule-based + keyword lists for flags (terrorism, drugs, money laundering terms).
+- **Graph Representation**:
+    - Use **Neo4j** to map suspects, devices, numbers, and links (calls, messages).
+    - Precompute relationships (shortest path, centrality).
+
+## **4. Visualization & Reporting**
+
+- **Frontend**: React + Tailwind (quick to build dashboards).
+- **Charts/Graphs**:
+    - D3.js or Cytoscape.js for suspect networks.
+    - Chart.js for simple analytics (message volume, call frequency).
+- **Reports**:
+    - Auto-generate PDFs with `reportlab` (timeline, contact summary, communication graphs).
+
+---
+
+## **5. Backend & APIs**
+
+- **Framework**: FastAPI (Python).
+- **Responsibilities**:
+    - Expose ingestion, query, graph, and report APIs.
+    - AuthN/AuthZ with JWT + RBAC (basic roles: Investigator, Admin).
+- **Containerization**: Docker (K8s maybe for large deployments if nothing else to do).
+
+---
+
+## **6. Deployment**
+
+- **Ideal**: On-premise (air-gapped server in agency office).
+- Basic target:
+    - Docker Compose for DB, Elastic, Neo4j, API, Frontend.
+    - GitHub Actions for CI (lint/tests/build).
+
+---
+
+# Final Stack
+
+- **Ingestion**: Python ETL → Postgres + Elastic
+- **Query**: NLQ → SQL/ES (LLM-constrained)
+- **Entities/Links**: spaCy + Regex → Neo4j for graph
+- **Frontend**: React + D3.js + Tailwind
+- **Backend**: FastAPI APIs
+- **Reports**: PDF generator (reportlab)
+- **Deployment**: Docker Compose on-prem
