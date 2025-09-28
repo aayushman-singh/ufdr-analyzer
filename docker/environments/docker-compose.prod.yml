@@ -1,0 +1,105 @@
+# Production environment
+version: '3.8'
+
+services:
+  # Production database with optimized settings
+  postgres:
+    environment:
+      - POSTGRES_DB=ufdr_analyzer_prod
+      - POSTGRES_USER=ufdr_user
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    command: postgres -c shared_preload_libraries=pg_stat_statements -c max_connections=200 -c shared_buffers=256MB
+
+  # Production backend
+  backend:
+    environment:
+      - DEBUG=false
+      - LOG_LEVEL=info
+      - DATABASE_URL=postgresql://ufdr_user:${POSTGRES_PASSWORD}@postgres:5432/ufdr_analyzer_prod
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+        reservations:
+          memory: 512M
+          cpus: '0.25'
+
+  # Production frontend
+  frontend:
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=https://ufdr.local/api
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.25'
+        reservations:
+          memory: 256M
+          cpus: '0.1'
+
+  # Production worker
+  worker:
+    environment:
+      - DEBUG=false
+      - LOG_LEVEL=info
+      - DATABASE_URL=postgresql://ufdr_user:${POSTGRES_PASSWORD}@postgres:5432/ufdr_analyzer_prod
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+        reservations:
+          memory: 512M
+          cpus: '0.25'
+
+  # Production nginx with SSL
+  nginx:
+    volumes:
+      - ./docker/nginx/ssl:/etc/nginx/ssl:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    restart: unless-stopped
+
+  # Add monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ufdr_prometheus
+    volumes:
+      - ./docker/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - ufdr_network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ufdr_grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin123}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/monitoring/grafana:/etc/grafana/provisioning
+    ports:
+      - "3001:3000"
+    networks:
+      - ufdr_network
+
+# Production volumes
+volumes:
+  prometheus_data:
+  grafana_data:

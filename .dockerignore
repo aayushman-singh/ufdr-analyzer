@@ -1,0 +1,80 @@
+# Git
+.git
+.gitignore
+README.md
+
+# Docker
+docker/
+docker-compose*.yml
+Dockerfile*
+
+# Environment
+.env
+.env.*
+env.example
+
+# Node modules
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Data directories
+data/uploads/
+data/exports/
+data/logs/
+data/backups/
+data/temp/
+
+# Build artifacts
+dist/
+build/
+.next/
+out/
+
+# Test files
+tests/
+test_*
+*_test.py
+
+# Documentation
+docs/
+*.md
+
+# Scripts
+scripts/
+*.sh
+
+# Temporary files
+tmp/
+temp/
