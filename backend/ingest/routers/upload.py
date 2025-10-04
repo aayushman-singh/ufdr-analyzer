@@ -114,6 +114,25 @@ async def ingest_ufdr(
             processing_time = time.time() - start_time
             logger.info(f"Found cached result for file, returning in {processing_time:.2f}s")
 
+            # Generate ALEAPP URLs for cached results
+            aleapp_report_path = None
+            aleapp_web_url = None
+            slug = create_slug_from_path(str(file_path))
+
+            # Check if ALEAPP was processed by looking for ALEAPP output directory
+            aleapp_output_dir = get_aleapp_report_path(str(file_path))
+            if aleapp_output_dir.exists():
+                aleapp_reports = list(aleapp_output_dir.glob("ALEAPP_Reports_*"))
+                if aleapp_reports:
+                    # Use the first (and usually only) report directory
+                    report_dir = aleapp_reports[0]
+                    aleapp_report_path = str(report_dir.absolute())
+                    # Provide web URL if accessible
+                    aleapp_web_url = f"http://localhost:8080/ALEAPP/output/{slug}/{report_dir.name}/_HTML/index.html"
+
+                    # Update the processing stats to reflect ALEAPP was processed
+                    cached_result.processing_stats['aleapp_processed'] = True
+
             return {
                 "status": "success",
                 "cached": True,
@@ -125,7 +144,9 @@ async def ingest_ufdr(
                 "message": "Using cached results - file already processed",
                 "ingest_result": cached_result.processing_stats,
                 "aleapp_processed": cached_result.processing_stats.get('aleapp_processed', False),
-                "slug": create_slug_from_path(str(file_path))
+                "aleapp_report_path": aleapp_report_path,
+                "aleapp_web_url": aleapp_web_url,
+                "slug": slug
             }
 
         # Check if already processed (legacy cache check)

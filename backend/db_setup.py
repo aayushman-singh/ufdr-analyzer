@@ -26,6 +26,7 @@ class User(SQLModel, table=True):
     runs: List["Run"] = Relationship(back_populates="user")
     rules: List["Rule"] = Relationship(back_populates="user")
     backups: List["Backup"] = Relationship(back_populates="user")
+    queries: List["Query"] = Relationship(back_populates="user")
 
 
 class Rule(SQLModel, table=True):
@@ -75,7 +76,7 @@ class Run(SQLModel, table=True):
     media: List["Media"] = Relationship(back_populates="run")
     aleapp_artifacts: List["AleappArtifact"] = Relationship(back_populates="run")
     aleapp_reports: List["AleappReport"] = Relationship(back_populates="run")
-
+    queries: List["Query"] = Relationship(back_populates="run")
 
 class Result(SQLModel, table=True):
     """
@@ -201,6 +202,33 @@ class AleappReport(SQLModel, table=True):
 
     # Relationship
     run: Run = Relationship(back_populates="aleapp_reports")
+
+ class Query(SQLModel, table=True):
+      """Tracks natural language queries executed against UFDR data."""
+      id: Optional[uuid.UUID] = Field(
+          default_factory=uuid.uuid4, primary_key=True)
+      run_id: uuid.UUID = Field(foreign_key="run.id", index=True)
+      user_id: uuid.UUID = Field(foreign_key="user.id", index=True)
+      query_text: str  # Original natural language query
+      intent: Optional[str] = None  # Classified intent (e.g., "crypto_search", "foreign_numbers")
+      parameters: Optional[str] = Field(default=None, sa_column=Column(TEXT))  # JSON of extracted query parameters
+      results_summary: Optional[str] = Field(default=None, sa_column=Column(TEXT))  # JSON summary of results
+      result_count: int = 0  # Number of results returned
+      execution_time: Optional[float] = None  # Query execution time in seconds
+      status: str = "pending"  # "pending", "completed", "failed"
+      error_message: Optional[str] = None  # Error message if query failed
+      created_at: datetime.datetime = Field(
+          default_factory=datetime.datetime.now)
+
+      # Relationships
+      run: Run = Relationship(back_populates="queries")
+      user: User = Relationship(back_populates="queries")
+
+      # Add this line to the Run class relationships section:
+      queries: List["Query"] = Relationship(back_populates="run")
+
+      # Add this line to the User class relationships section:
+      queries: List["Query"] = Relationship(back_populates="user")
 
 
 # 2. Database Setup and Seeding

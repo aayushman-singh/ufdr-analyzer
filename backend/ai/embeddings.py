@@ -1,13 +1,40 @@
 """
-Embeddings Service
+Embeddings Service - Vector Embeddings for Semantic Search
 
-This module handles vector embeddings for semantic search and similarity matching
-across UFDR data. Enables finding similar content even with different wording.
+TODO: Implement this module for RAG (Retrieval-Augmented Generation) support
+
+This module will enable:
+1. Semantic search across UFDR data (find similar messages even with different wording)
+2. Vector similarity matching for contacts, conversations, patterns
+3. Clustering related communications/activities
+4. Finding conceptually similar content without exact keyword matches
+
+Recommended implementation approach:
+- Use sentence-transformers (e.g., all-MiniLM-L6-v2) for fast, lightweight embeddings
+- Store embeddings in Pinecone/Weaviate/Qdrant for vector search
+- Generate embeddings during ingestion (backend/ingest/services/ingest_service.py)
+- Add semantic search option to query_executor.py alongside keyword/pattern search
+
+Example flow:
+  Query: "Find discussions about illegal payments"
+  → Generate query embedding
+  → Vector search returns similar messages (even if they say "cash transfer", "money exchange", etc.)
+  → Combine with keyword search for best results
+
+Performance considerations:
+- Batch embed messages during ingestion (not at query time)
+- Cache embeddings in vector DB with run_id indexing
+- Use hybrid search: keyword (MeiliSearch) + semantic (vector DB) for best recall
+- For 30GB+ data, chunk large messages and embed separately
+
+Integration points:
+- backend/ingest/services/ingest_service.py:ingest_to_all() - add embedding generation
+- backend/ai/query_executor.py:execute() - add semantic search option
+- backend/ai/llm_client.py:parse_query() - detect when semantic search is needed
 """
 
 from typing import List, Dict, Any, Optional
 import logging
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -15,85 +42,115 @@ logger = logging.getLogger(__name__)
 class EmbeddingsService:
     """
     Service for generating and managing vector embeddings for semantic search.
-    Enables finding similar content across messages, calls, and other UFDR data.
+
+    TODO: Implement full RAG pipeline
+    - Initialize sentence-transformers model
+    - Connect to vector database (Pinecone/Weaviate/Qdrant)
+    - Batch embedding generation
+    - Hybrid search (keyword + semantic)
+    - Similarity scoring and ranking
     """
-    
+
     def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+        """
+        TODO: Initialize embedding model and vector DB connection
+
+        Args:
+            model_name: HuggingFace model for embeddings (all-MiniLM-L6-v2 is fast/good)
+        """
         self.model_name = model_name
         self.logger = logging.getLogger(__name__)
-        # TODO: Initialize embedding model
-    
-    def generate_embeddings(self, texts: List[str]) -> np.ndarray:
+        # TODO: from sentence_transformers import SentenceTransformer
+        # TODO: self.model = SentenceTransformer(model_name)
+        # TODO: self.vector_db = connect_to_vector_db()
+
+    def generate_embeddings(self, texts: List[str], batch_size: int = 32) -> List[List[float]]:
         """
-        Generate embeddings for a list of texts.
-        
+        TODO: Generate embeddings for a list of texts.
+
+        Implementation:
+        - Batch process for efficiency
+        - Normalize embeddings (cosine similarity)
+        - Handle empty/None texts gracefully
+        - Cache frequently embedded texts
+
         Args:
             texts: List of text strings to embed
-            
+            batch_size: Number of texts to process at once
+
         Returns:
-            Numpy array of embeddings
+            List of embedding vectors (384-dim for all-MiniLM-L6-v2)
         """
-        # TODO: Implement embedding generation
-        # TODO: Handle batch processing
-        # TODO: Add caching for repeated texts
-        
-        self.logger.info(f"Generating embeddings for {len(texts)} texts")
-        return np.array([])  # Placeholder
-    
-    def semantic_search(self, query: str, embeddings: np.ndarray, 
-                       texts: List[str], top_k: int = 10) -> List[Dict[str, Any]]:
+        # TODO: embeddings = self.model.encode(texts, batch_size=batch_size, show_progress_bar=False)
+        # TODO: return embeddings.tolist()
+        raise NotImplementedError("Embeddings service not yet implemented")
+
+    def semantic_search(self, query: str, run_id: str, top_k: int = 50,
+                       similarity_threshold: float = 0.7) -> List[Dict[str, Any]]:
         """
-        Perform semantic search using embeddings.
-        
+        TODO: Perform semantic search using vector similarity.
+
+        Implementation:
+        - Embed query text
+        - Search vector DB filtered by run_id
+        - Return top_k most similar results
+        - Filter by similarity_threshold
+
+        Args:
+            query: Natural language search query
+            run_id: UFDR run ID to search within
+            top_k: Number of top results to return
+            similarity_threshold: Minimum cosine similarity (0.0-1.0)
+
+        Returns:
+            List of {text, metadata, similarity_score} dicts
+        """
+        # TODO: query_embedding = self.generate_embeddings([query])[0]
+        # TODO: results = self.vector_db.query(query_embedding, filter={"run_id": run_id}, top_k=top_k)
+        # TODO: return [r for r in results if r["score"] >= similarity_threshold]
+        raise NotImplementedError("Semantic search not yet implemented")
+
+    def store_embeddings(self, run_id: str, texts: List[str], metadata: List[Dict[str, Any]]):
+        """
+        TODO: Generate and store embeddings in vector DB during ingestion.
+
+        Implementation:
+        - Batch generate embeddings
+        - Store with run_id, message_id, type (message/call/contact) in metadata
+        - Index for fast retrieval
+        - Handle duplicates gracefully
+
+        Args:
+            run_id: UFDR run ID
+            texts: List of text content (messages, contact names, etc.)
+            metadata: List of dicts with {id, type, timestamp, ...}
+        """
+        # TODO: embeddings = self.generate_embeddings(texts)
+        # TODO: self.vector_db.upsert(embeddings, metadata=metadata)
+        raise NotImplementedError("Embedding storage not yet implemented")
+
+    def hybrid_search(self, query: str, run_id: str, keyword_results: List[Dict[str, Any]],
+                     top_k: int = 50) -> List[Dict[str, Any]]:
+        """
+        TODO: Combine keyword search (MeiliSearch) + semantic search for best results.
+
+        Implementation:
+        - Run semantic search
+        - Merge with keyword_results
+        - Re-rank using weighted score (e.g., 0.6 * semantic + 0.4 * keyword)
+        - Deduplicate by message_id
+        - Return top_k overall
+
         Args:
             query: Search query
-            embeddings: Pre-computed embeddings
-            texts: Original texts
-            top_k: Number of top results to return
-            
-        Returns:
-            List of search results with similarity scores
-        """
-        # TODO: Implement semantic search
-        # TODO: Calculate cosine similarity
-        # TODO: Return ranked results
-        
-        return []
-    
-    def find_similar_messages(self, message: str, run_id: str, 
-                            threshold: float = 0.7) -> List[Dict[str, Any]]:
-        """
-        Find messages similar to the given message within a specific run.
-        
-        Args:
-            message: Reference message
             run_id: UFDR run ID
-            threshold: Similarity threshold
-            
+            keyword_results: Results from MeiliSearch/PostgreSQL keyword search
+            top_k: Final number of results to return
+
         Returns:
-            List of similar messages with scores
+            Ranked and merged results
         """
-        # TODO: Implement similarity search
-        # TODO: Query database for run messages
-        # TODO: Calculate similarities
-        # TODO: Filter by threshold
-        
-        return []
-    
-    def cluster_similar_content(self, texts: List[str], 
-                              n_clusters: int = 5) -> Dict[int, List[int]]:
-        """
-        Cluster similar content together.
-        
-        Args:
-            texts: List of texts to cluster
-            n_clusters: Number of clusters to create
-            
-        Returns:
-            Dictionary mapping cluster IDs to text indices
-        """
-        # TODO: Implement clustering
-        # TODO: Use K-means or similar algorithm
-        # TODO: Return cluster assignments
-        
-        return {}
+        # TODO: semantic_results = self.semantic_search(query, run_id, top_k=top_k*2)
+        # TODO: merged = merge_and_rerank(keyword_results, semantic_results)
+        # TODO: return merged[:top_k]
+        raise NotImplementedError("Hybrid search not yet implemented")

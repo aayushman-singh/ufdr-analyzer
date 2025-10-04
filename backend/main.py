@@ -10,7 +10,7 @@ import os
 import time
 import json
 
-from ingest.routers import health, upload, report
+from ingest.routers import health, upload, report, query
 from database import create_db_and_tables, get_session
 from ingest.services.ingest_service import IngestService
 from ingest.utils.logger import get_logger
@@ -184,6 +184,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 app.include_router(health.router)
 app.include_router(upload.router)
 app.include_router(report.router)
+app.include_router(query.router)
 
 # ------------------------
 # Root endpoint

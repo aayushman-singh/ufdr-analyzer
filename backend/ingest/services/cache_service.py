@@ -249,13 +249,17 @@ class CacheService:
 
         if existing_run and existing_run.status in ['complete', 'completed', 'success']:
             # Found completed run, create cached result
+            # ALEAPP processing check will be done in upload.py to avoid circular imports
+            aleapp_processed = False
+
             stats = {
                 'file_path': file_path,
                 'run_id': str(existing_run.id),
                 'status': existing_run.status,
                 'start_time': existing_run.start_time.isoformat(),
                 'end_time': existing_run.end_time.isoformat() if existing_run.end_time else None,
-                'processing_time': 'cached'
+                'processing_time': 'cached',
+                'aleapp_processed': aleapp_processed
             }
 
             return CachedResult(
