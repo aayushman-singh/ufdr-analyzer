@@ -39,6 +39,25 @@ services:
     networks:
       - ufdr_network
 
+  # MeiliSearch
+  meilisearch:
+    image: getmeili/meilisearch:v1.5
+    container_name: ufdr_meilisearch
+    environment:
+      - MEILI_ENV=development
+      - MEILI_NO_ANALYTICS=true
+    volumes:
+      - meilisearch_data:/meili_data
+    ports:
+      - "7700:7700"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ufdr_network
+
   # Elasticsearch
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
@@ -110,6 +129,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://ufdr_user:${POSTGRES_PASSWORD:-ufdr_password}@postgres:5432/ufdr_analyzer
       - REDIS_URL=redis://redis:6379
+      - MEILI_URL=http://meilisearch:7700
       - ELASTICSEARCH_URL=http://elasticsearch:9200
       - NEO4J_URL=bolt://neo4j:7687
       - NEO4J_USER=neo4j
@@ -127,6 +147,8 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      meilisearch:
         condition: service_healthy
       elasticsearch:
         condition: service_healthy
@@ -151,6 +173,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://ufdr_user:${POSTGRES_PASSWORD:-ufdr_password}@postgres:5432/ufdr_analyzer
       - REDIS_URL=redis://redis:6379
+      - MEILI_URL=http://meilisearch:7700
       - ELASTICSEARCH_URL=http://elasticsearch:9200
       - NEO4J_URL=bolt://neo4j:7687
       - NEO4J_USER=neo4j
@@ -166,6 +189,8 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      meilisearch:
         condition: service_healthy
       elasticsearch:
         condition: service_healthy
@@ -213,6 +238,7 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  meilisearch_data:
   elasticsearch_data:
   neo4j_data:
   neo4j_logs:

@@ -37,15 +37,20 @@ async def lifespan(app: FastAPI):
     logger.info("Application starting up...")
 
     try:
-        # Connect to Meilisearch
-        meili_client = MeiliClient(MEILI_URL, MEILI_KEY)
-        logger.info(f"Connected to Meilisearch at {MEILI_URL}")
-
         # Create DB and tables on startup
         create_db_and_tables()
         logger.info("Database and tables initialized.")
     except Exception as e:
-        logger.error(f"Failed to connect to required services on startup: {e}")
+        logger.error(f"Failed to initialize database: {e}")
+        raise
+
+    try:
+        # Connect to Meilisearch (optional)
+        meili_client = MeiliClient(MEILI_URL, MEILI_KEY)
+        logger.info(f"Connected to Meilisearch at {MEILI_URL}")
+    except Exception as e:
+        logger.warning(f"MeiliSearch not available: {e}")
+        meili_client = None
 
     yield
 
