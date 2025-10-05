@@ -9,6 +9,12 @@ from meilisearch import Client as MeiliClient
 import os
 import time
 import json
+from dotenv import load_dotenv
+from pathlib import Path
+
+# Load environment variables from .env file
+env_path = Path(__file__).parent.parent / '.env'
+load_dotenv(dotenv_path=env_path)
 
 from ingest.routers import health, upload, report, query
 from database import create_db_and_tables, get_session
@@ -16,7 +22,6 @@ from ingest.services.ingest_service import IngestService
 from ingest.utils.logger import get_logger
 from config import APP_NAME, APP_VERSION
 import subprocess
-import os
 
 logger = get_logger(__name__)
 

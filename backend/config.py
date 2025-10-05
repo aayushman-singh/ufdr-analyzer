@@ -27,8 +27,8 @@ DEBUG = True
 POSTGRES_CONFIG = {
     "host": "localhost",
     "port": 5432,
-    "user": "postgres",
-    "password": "password",
+    "user": "ufdr_user",
+    "password": "ufdr_password",
     "database": "ufdr_analyzer"
 }
 
