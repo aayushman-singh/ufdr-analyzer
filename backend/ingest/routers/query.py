@@ -149,8 +149,8 @@ async def execute_query(
         # Build context about the run
         context = {
             "run_id": request.run_id,
-            "device_info": run.device_info if hasattr(run, 'device_info') else None,
-            "file_name": run.filename
+            "device_info": run.extraction_metadata if hasattr(run, 'extraction_metadata') else None,
+            "file_name": run.ufdr_file_name
         }
 
         structured_params = llm_client.parse_query(request.query, context=context)

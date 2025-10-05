@@ -274,19 +274,49 @@ class CacheService:
             # Create a synthetic cached result from cache files
             logger.info(f"Found comprehensive cache for hash {file_hash[:12]}... - creating fast response")
 
-            synthetic_run_id = f"cache_{file_hash[:8]}"
+            # Get or create system user for cache-created runs
+            from db_setup import User
+            system_user = session.exec(select(User).where(User.email == "system@ufdr-analyzer.local")).first()
+            if not system_user:
+                system_user = User(
+                    username="System",
+                    email="system@ufdr-analyzer.local",
+                    password_hash="no_password_system_user",
+                    is_admin=False
+                )
+                session.add(system_user)
+                session.commit()
+                session.refresh(system_user)
+                logger.info(f"Created system user: {system_user.id}")
+
+            # Create a proper Run record in the database with UUID instead of synthetic ID
+            new_run = Run(
+                user_id=system_user.id,
+                ufdr_file_name=Path(file_path).name,
+                original_file_path=file_path,
+                file_content_hash=file_hash,
+                status='completed',
+                start_time=datetime.now(),
+                end_time=datetime.now()
+            )
+            session.add(new_run)
+            session.commit()
+            session.refresh(new_run)
+
+            logger.info(f"Created new Run record from cache: {new_run.id}")
+
             stats = {
                 'file_path': file_path,
-                'run_id': synthetic_run_id,
+                'run_id': str(new_run.id),
                 'status': 'cached',
-                'start_time': datetime.now().isoformat(),
-                'end_time': datetime.now().isoformat(),
+                'start_time': new_run.start_time.isoformat(),
+                'end_time': new_run.end_time.isoformat(),
                 'processing_time': 'sub-second',
                 'cache_source': 'comprehensive_cache'
             }
 
             return CachedResult(
-                run_id=synthetic_run_id,
+                run_id=str(new_run.id),
                 file_path=file_path,
                 cached_at=datetime.now(),
                 processing_stats=stats
