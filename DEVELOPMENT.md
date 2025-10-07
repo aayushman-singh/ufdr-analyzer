@@ -1,10 +1,43 @@
 # UFDR Analyzer - Development Setup
 
-## Quick Start with Docker (Recommended)
+## 🚀 Quick Start
 
-This is the **easiest and most reliable** way to get started. No manual PostgreSQL installation needed!
+**TL;DR:**
+- **Have PostgreSQL installed?** Run `./start-dev-local.bat` (Windows) or `./start-dev-local.sh` (Linux/Mac)
+- **Want Docker setup?** Install Docker Desktop, then run `./start-dev-services.bat`
 
-### Prerequisites
+Choose your preferred setup method:
+
+### Option 1: Local Setup (No Docker) ⚡ FASTEST TO START
+
+**For users with MSYS2 PostgreSQL already installed**
+
+**Prerequisites:**
+- PostgreSQL (via MSYS2 or standalone)
+- Python 3.10+
+- Git
+
+**One-Command Start:**
+```bash
+# Windows
+./start-dev-local.bat
+
+# Linux/Mac/Git Bash
+./start-dev-local.sh
+```
+
+This script will:
+- ✅ Check if PostgreSQL is running (start if needed)
+- ✅ Test database connection
+- ✅ Start the backend server automatically
+
+---
+
+### Option 2: Docker Setup (Recommended for Teams) 🐳
+
+**Best for new contributors and consistent environments**
+
+**Prerequisites:**
 - Docker Desktop installed ([Download here](https://www.docker.com/products/docker-desktop/))
 - Python 3.10+
 - Git

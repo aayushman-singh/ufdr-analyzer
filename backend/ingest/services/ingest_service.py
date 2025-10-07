@@ -12,6 +12,9 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from db_setup import Run, Message, Call, Contact, Media, AleappArtifact, AleappReport
 
+# Import embeddings service
+from ai.embeddings import EmbeddingsService
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -123,6 +126,54 @@ class IngestService:
             ]
             if meili_messages:
                 meili_client.index("messages").add_documents(meili_messages)
+
+            # --- Generate Embeddings for Semantic Search ---
+            # 5b. Create embeddings for messages (enables semantic search)
+            logger.info(f"Generating embeddings for {len(parsed_data.get('messages', []))} messages...")
+            try:
+                embeddings_service = EmbeddingsService()
+                
+                # Prepare texts and metadata for embedding
+                message_texts = []
+                message_metadata = []
+                
+                for i, msg in enumerate(parsed_data.get("messages", [])):
+                    # Create rich text representation for better semantic search
+                    content = msg.get("content", "")
+                    sender = msg.get("sender", "unknown")
+                    receiver = msg.get("receiver", "unknown")
+                    
+                    # Text to embed (include context)
+                    text_to_embed = f"From {sender} to {receiver}: {content}"
+                    message_texts.append(text_to_embed)
+                    
+                    # Metadata to store with embedding
+                    message_metadata.append({
+                        "id": str(messages_to_ingest[i].id) if i < len(messages_to_ingest) else str(uuid.uuid4()),
+                        "type": "message",
+                        "sender": sender,
+                        "receiver": receiver,
+                        "content": content[:200],  # Preview only
+                        "content_preview": content[:100] + "..." if len(content) > 100 else content,
+                        "timestamp": str(msg.get("timestamp", "")),
+                        "run_id": str(run_id)
+                    })
+                
+                # Generate and store embeddings
+                if message_texts:
+                    embeddings_service.create_index(
+                        run_id=str(run_id),
+                        texts=message_texts,
+                        metadata=message_metadata
+                    )
+                    logger.info(f"Successfully created embeddings index for run {run_id}")
+                else:
+                    logger.info("No messages to embed")
+                    
+            except Exception as e:
+                # Don't fail entire ingestion if embeddings fail
+                logger.error(f"Failed to generate embeddings: {e}")
+                logger.warning("Continuing ingestion without embeddings...")
 
             # --- Save Media to MinIO (via storage service) ---
             # 6. Save media files and get paths

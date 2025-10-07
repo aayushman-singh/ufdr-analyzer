@@ -7,13 +7,14 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from db_setup import Message, Call, Contact, Media, Run
+from ai.embeddings import EmbeddingsService
 
 logger = logging.getLogger(__name__)
 
 
 class QueryExecutor:
     """
-    Executes structured queries against PostgreSQL and MeiliSearch.
+    Executes structured queries against PostgreSQL, MeiliSearch, and semantic search.
     Combines results from multiple sources and ranks by relevance.
     """
 
@@ -27,11 +28,17 @@ class QueryExecutor:
         """
         self.session = session
         self.meili_client = meili_client
+        self.embeddings_service = EmbeddingsService()
         self.logger = logging.getLogger(__name__)
 
     def execute(self, run_id: str, structured_params: Dict[str, Any]) -> Dict[str, Any]:
         """
         Execute structured query parameters against data sources.
+        
+        Supports three search modes:
+        1. keyword: Traditional SQL/MeiliSearch keyword matching
+        2. semantic: Vector similarity search using embeddings
+        3. hybrid: Combines keyword + semantic for best results (recommended)
 
         Args:
             run_id: UFDR run ID to query against
@@ -44,24 +51,46 @@ class QueryExecutor:
         target_tables = structured_params.get("target_tables", ["messages"])
         filters = structured_params.get("filters", {})
         keywords = structured_params.get("keywords", [])
+        search_type = structured_params.get("search_type", "hybrid")  # "keyword", "semantic", or "hybrid"
 
         results = []
 
-        # Execute against each target table
-        for table in target_tables:
-            if table == "messages":
-                results.extend(self._search_messages(run_id, keywords, filters))
-            elif table == "calls":
-                results.extend(self._search_calls(run_id, filters))
-            elif table == "contacts":
-                results.extend(self._search_contacts(run_id, keywords, filters))
-            elif table == "media":
-                results.extend(self._search_media(run_id, filters))
+        # Determine if we should use semantic search
+        use_semantic = search_type in ["semantic", "hybrid"]
+        use_keyword = search_type in ["keyword", "hybrid"]
+        
+        # Query construction (what to search for)
+        query_text = " ".join(keywords) if keywords else structured_params.get("query", "")
 
-        # Optionally search MeiliSearch for full-text
-        if self.meili_client and keywords:
-            meili_results = self._search_meilisearch(run_id, keywords)
-            results.extend(meili_results)
+        # Keyword search (traditional SQL + MeiliSearch)
+        if use_keyword:
+            # Execute against each target table
+            for table in target_tables:
+                if table == "messages":
+                    results.extend(self._search_messages(run_id, keywords, filters))
+                elif table == "calls":
+                    results.extend(self._search_calls(run_id, filters))
+                elif table == "contacts":
+                    results.extend(self._search_contacts(run_id, keywords, filters))
+                elif table == "media":
+                    results.extend(self._search_media(run_id, filters))
+
+            # Optionally search MeiliSearch for full-text
+            if self.meili_client and keywords:
+                meili_results = self._search_meilisearch(run_id, keywords)
+                results.extend(meili_results)
+        
+        # Semantic search (vector similarity)
+        if use_semantic and query_text:
+            semantic_results = self._search_semantic(run_id, query_text, filters)
+            
+            if search_type == "hybrid" and results:
+                # Hybrid: merge keyword + semantic results
+                self.logger.info(f"Running hybrid search (keyword: {len(results)}, semantic: {len(semantic_results)})")
+                results = self._merge_hybrid_results(results, semantic_results)
+            else:
+                # Pure semantic search
+                results.extend(semantic_results)
 
         # Deduplicate and rank
         results = self._deduplicate_results(results)
@@ -71,6 +100,7 @@ class QueryExecutor:
             "total_results": len(results),
             "results": results[:100],  # Limit to top 100
             "intent": intent,
+            "search_type": search_type,
             "query_params": structured_params
         }
 
@@ -217,6 +247,105 @@ class QueryExecutor:
         except Exception as e:
             self.logger.warning(f"MeiliSearch query failed: {e}")
             return []
+
+    def _search_semantic(self, run_id: str, query_text: str, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Perform semantic search using vector embeddings.
+        
+        Args:
+            run_id: UFDR run ID
+            query_text: Natural language query
+            filters: Additional filters (currently not applied to semantic search)
+            
+        Returns:
+            List of semantically similar results
+        """
+        try:
+            # Check if embeddings exist for this run
+            if not self.embeddings_service.index_exists(run_id):
+                self.logger.info(f"No embeddings index for run {run_id}, skipping semantic search")
+                return []
+            
+            # Perform semantic search
+            semantic_results = self.embeddings_service.semantic_search(
+                query=query_text,
+                run_id=run_id,
+                top_k=50,
+                similarity_threshold=0.4  # Lower threshold for broader recall
+            )
+            
+            # Convert to standard result format
+            standardized_results = []
+            for result in semantic_results:
+                standardized_results.append({
+                    "type": result.get("type", "message"),
+                    "id": result.get("id"),
+                    "sender": result.get("sender"),
+                    "receiver": result.get("receiver"),
+                    "content": result.get("content"),
+                    "content_preview": result.get("content_preview"),
+                    "timestamp": result.get("timestamp"),
+                    "relevance_score": result.get("similarity_score", 0.5),
+                    "search_method": "semantic"
+                })
+            
+            self.logger.info(f"Semantic search returned {len(standardized_results)} results")
+            return standardized_results
+            
+        except Exception as e:
+            self.logger.error(f"Semantic search failed: {e}")
+            return []
+
+    def _merge_hybrid_results(self, keyword_results: List[Dict], semantic_results: List[Dict]) -> List[Dict]:
+        """
+        Merge keyword and semantic search results with weighted scoring.
+        
+        Args:
+            keyword_results: Results from keyword search
+            semantic_results: Results from semantic search
+            
+        Returns:
+            Merged results with combined scores
+        """
+        # Weight for combining scores (60% semantic, 40% keyword)
+        semantic_weight = 0.6
+        keyword_weight = 0.4
+        
+        merged = {}
+        
+        # Add keyword results
+        for result in keyword_results:
+            result_id = result.get("id")
+            if result_id:
+                result["keyword_score"] = result.get("relevance_score", 1.0)
+                result["semantic_score"] = 0.0
+                result["combined_score"] = keyword_weight * result["keyword_score"]
+                result["search_method"] = "keyword"
+                merged[result_id] = result
+        
+        # Add/merge semantic results
+        for result in semantic_results:
+            result_id = result.get("id")
+            if not result_id:
+                continue
+            
+            if result_id in merged:
+                # Found by both - boost score
+                merged[result_id]["semantic_score"] = result.get("relevance_score", 0.5)
+                merged[result_id]["combined_score"] = (
+                    semantic_weight * merged[result_id]["semantic_score"] +
+                    keyword_weight * merged[result_id]["keyword_score"]
+                )
+                merged[result_id]["search_method"] = "hybrid"
+            else:
+                # Only found by semantic
+                result["keyword_score"] = 0.0
+                result["semantic_score"] = result.get("relevance_score", 0.5)
+                result["combined_score"] = semantic_weight * result["semantic_score"]
+                result["search_method"] = "semantic"
+                merged[result_id] = result
+        
+        return list(merged.values())
 
     def _deduplicate_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Remove duplicate results based on type and ID."""
