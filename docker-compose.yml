@@ -58,26 +58,6 @@ services:
     networks:
       - ufdr_network
 
-  # Elasticsearch
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
-    container_name: ufdr_elasticsearch
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-    volumes:
-      - elasticsearch_data:/usr/share/elasticsearch/data
-    ports:
-      - "9200:9200"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    networks:
-      - ufdr_network
-
   # Neo4j Graph Database
   neo4j:
     image: neo4j:5.15-community
@@ -130,7 +110,6 @@ services:
       - DATABASE_URL=postgresql://ufdr_user:${POSTGRES_PASSWORD:-ufdr_password}@postgres:5432/ufdr_analyzer
       - REDIS_URL=redis://redis:6379
       - MEILI_URL=http://meilisearch:7700
-      - ELASTICSEARCH_URL=http://elasticsearch:9200
       - NEO4J_URL=bolt://neo4j:7687
       - NEO4J_USER=neo4j
       - NEO4J_PASSWORD=***REDACTED***
@@ -149,8 +128,6 @@ services:
       redis:
         condition: service_healthy
       meilisearch:
-        condition: service_healthy
-      elasticsearch:
         condition: service_healthy
       neo4j:
         condition: service_healthy
@@ -174,7 +151,6 @@ services:
       - DATABASE_URL=postgresql://ufdr_user:${POSTGRES_PASSWORD:-ufdr_password}@postgres:5432/ufdr_analyzer
       - REDIS_URL=redis://redis:6379
       - MEILI_URL=http://meilisearch:7700
-      - ELASTICSEARCH_URL=http://elasticsearch:9200
       - NEO4J_URL=bolt://neo4j:7687
       - NEO4J_USER=neo4j
       - NEO4J_PASSWORD=***REDACTED***
@@ -191,8 +167,6 @@ services:
       redis:
         condition: service_healthy
       meilisearch:
-        condition: service_healthy
-      elasticsearch:
         condition: service_healthy
       neo4j:
         condition: service_healthy
@@ -239,7 +213,6 @@ volumes:
   postgres_data:
   redis_data:
   meilisearch_data:
-  elasticsearch_data:
   neo4j_data:
   neo4j_logs:
   minio_data:
