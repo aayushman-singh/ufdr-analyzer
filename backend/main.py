@@ -9,6 +9,7 @@ from meilisearch import Client as MeiliClient
 import os
 import time
 import json
+from ingest.routers.graph_router import router as graph_router
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -106,16 +107,17 @@ app.add_middleware(
 # Request Logging Middleware
 # ------------------------
 
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     """Log all incoming requests and responses for debugging."""
     start_time = time.time()
-    
+
     # Log request details
     logger.info(f"Request: {request.method} {request.url}")
     logger.info(f"Headers: {dict(request.headers)}")
     logger.info(f"Query params: {dict(request.query_params)}")
-    
+
     # Log request body for POST/PUT requests (but be careful with large files)
     if request.method in ["POST", "PUT", "PATCH"]:
         try:
@@ -133,16 +135,16 @@ async def log_requests(request: Request, call_next):
                     logger.info("Request body: <empty>")
         except Exception as e:
             logger.warning(f"Could not read request body: {e}")
-    
+
     # Process request
     try:
         response = await call_next(request)
         process_time = time.time() - start_time
-        
+
         # Log response details
         logger.info(f"Response: {response.status_code} (took {process_time:.3f}s)")
         logger.info(f"Response headers: {dict(response.headers)}")
-        
+
         return response
     except Exception as e:
         process_time = time.time() - start_time
@@ -153,6 +155,7 @@ async def log_requests(request: Request, call_next):
 # Exception Handlers
 # ------------------------
 
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Handle request validation errors with detailed logging."""
@@ -160,11 +163,11 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     logger.error(f"Request URL: {request.url}")
     logger.error(f"Request method: {request.method}")
     logger.error(f"Request headers: {dict(request.headers)}")
-    
+
     # Log the specific validation errors
     for error in exc.errors():
         logger.error(f"Validation error: {error}")
-    
+
     return JSONResponse(
         status_code=400,
         content={
@@ -177,6 +180,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             }
         }
     )
+
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -195,6 +199,7 @@ app.include_router(health.router)
 app.include_router(upload.router)
 app.include_router(report.router)
 app.include_router(query.router)
+app.include_router(graph_router)
 
 # ------------------------
 # Root endpoint
@@ -209,33 +214,34 @@ async def root():
 # ALEAPP Integration
 # ------------------------
 
+
 def run_aleapp_analysis(input_path: str, output_path: str) -> dict:
     """
     Run ALEAPP analysis with admin privileges
-    
+
     Args:
         input_path: Path to Android extraction directory
         output_path: Path where ALEAPP report should be saved
-    
+
     Returns:
         dict: Result of the ALEAPP analysis
     """
     try:
         # Get the path to our admin wrapper script
         script_path = os.path.join(os.path.dirname(__file__), 'run_aleapp_admin.py')
-        
+
         # Run the admin wrapper script
         result = subprocess.run([
             'python', script_path, input_path, output_path
         ], capture_output=True, text=True, timeout=3600)  # 1 hour timeout
-        
+
         return {
             "success": result.returncode == 0,
             "stdout": result.stdout,
             "stderr": result.stderr,
             "returncode": result.returncode
         }
-        
+
     except subprocess.TimeoutExpired:
         return {
             "success": False,
