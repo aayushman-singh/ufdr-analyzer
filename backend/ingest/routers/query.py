@@ -171,25 +171,29 @@ async def execute_query(
         result_count = len(results)
         logger.info(f"Query returned {result_count} results")
 
-        # Step 3: Generate insights (optional, token-efficient)
+        # Step 3: Generate insights (always generate for conversational response)
         insights = None
-        if request.generate_insights and result_count > 0:
-            logger.info(f"Generating insights from {min(result_count, request.max_insight_results)} results (saving tokens)...")
+        if request.generate_insights:
+            logger.info(f"Generating conversational response...")
             try:
-                # Create subset of results for insight generation (token optimization)
-                insight_results = {
-                    "results": results[:request.max_insight_results],
-                    "total_results": result_count
-                }
-                insights = llm_client.generate_insights(
-                    query_results=insight_results,
-                    original_query=request.query,
-                    max_results=request.max_insight_results
-                )
+                if result_count > 0:
+                    # Create subset of results for insight generation (token optimization)
+                    insight_results = {
+                        "results": results[:request.max_insight_results],
+                        "total_results": result_count
+                    }
+                    insights = llm_client.generate_insights(
+                        query_results=insight_results,
+                        original_query=request.query,
+                        max_results=request.max_insight_results
+                    )
+                else:
+                    # No results - generate helpful response
+                    insights = f"I searched for '{request.query}' but didn't find any matching data in this device. Would you like me to try different search terms or broaden the criteria?"
                 logger.info("Insights generated successfully")
             except Exception as insight_error:
                 logger.warning(f"Failed to generate insights: {insight_error}")
-                insights = f"Found {result_count} results matching your query."
+                insights = f"Found {result_count} results matching your query." if result_count > 0 else "No results found."
 
         # Calculate execution time
         execution_time = time.time() - start_time
