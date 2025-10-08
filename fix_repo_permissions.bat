@@ -33,4 +33,3 @@ echo You can now run ALEAPP without admin privileges:
 echo   cd ALEAPP
 echo   python aleapp.py -t fs -i ../backend/UFDRConvert/android_13_image -o ../backend/storage/reports
 echo.
-pause

@@ -41,3 +41,24 @@ ALEAPP/scripts/filetypes/__pycache__/
 ALEAPP/admin/data/generated/
 ALEAPP/admin/docs/generated/
 /backend/cache
+
+# Rust build artifacts
+*/target/
+*/Cargo.lock
+
+# Test output
+*/test_output/
+
+# IDE
+*/.vscode/
+*/.idea/
+*.swp
+*.swo
+*~
+
+# OS
+*/.DS_Store
+*/Thumbs.db
+/backend/ufdr2dir-rs/target
+/backend/ufdr2dir-rs/UFDRConvert
+/backend/ufdr2dir-rs/test_output

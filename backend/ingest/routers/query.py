@@ -78,9 +78,10 @@ def get_or_create_system_user(session: Session) -> User:
 
     if not system_user:
         system_user = User(
-            name="System",
+            username="system",
             email="system@ufdr-analyzer.local",
-            role="system"
+            password_hash="",  # System user doesn't need password
+            is_admin=False
         )
         session.add(system_user)
         session.commit()

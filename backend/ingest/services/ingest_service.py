@@ -64,12 +64,26 @@ class IngestService:
                     "timeline_count": len(parsed_data["aleapp_data"].get("timeline", []))
                 }
 
+            # Get file hash for deduplication
+            file_content_hash = None
+            original_file_path = None
+            if "file_path" in parsed_data:
+                original_file_path = parsed_data["file_path"]
+                from ingest.services.cache_service import cache_service
+                try:
+                    file_content_hash = cache_service.get_file_hash_with_cache(original_file_path)
+                    logger.info(f"Calculated file hash: {file_content_hash[:12]}...")
+                except Exception as e:
+                    logger.warning(f"Could not calculate file hash: {e}")
+
             run = Run(
                 ufdr_file_name=parsed_data.get("filename"),
                 status="ingesting",
                 start_time=datetime.utcnow(),
                 user_id=user_id,
-                metadata=json.dumps(metadata) if metadata else None
+                metadata=json.dumps(metadata) if metadata else None,
+                file_content_hash=file_content_hash,
+                original_file_path=original_file_path
             )
             session.add(run)
             session.commit()

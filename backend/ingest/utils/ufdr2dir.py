@@ -14,6 +14,7 @@ import platform
 import shutil
 import hashlib
 import json
+import sys
 
 from pathlib import Path
 from pathlib import PurePath
@@ -37,7 +38,12 @@ PATH_MAPPING_FILE = "path_mapping.json"
 path_mapping = {}
 
 # Some users had trouble importing alive_progress on Windows
-try:from alive_progress import alive_it
+try:
+    from alive_progress import alive_it
+    # Disable progress bar on Windows to avoid Unicode issues
+    if sys.platform == "win32":
+        PROGRESSLIB = False
+        print('[INFO] Progress bar disabled on Windows to avoid Unicode issues.')
 except ImportError:
     print('[E] Could not find alive_progress library. Will not show progress.')
     PROGRESSLIB = False
@@ -58,6 +64,8 @@ def setArgs():
 
 def getZipReportXML(ufdr, OUTD):
     logging.info("Extracting report.xml...")
+    # Create output directory if it doesn't exist
+    Path(OUTD).mkdir(parents=True, exist_ok=True)
     with ZipFile(ufdr, 'r') as zip:
         # First, extract report.xml to the output directory
         report_xml_path = Path(OUTD) / "report.xml"
@@ -124,10 +132,17 @@ def extractToDir(zip, LOCALP, ORIGP, OUTD):
     #OUTPATH = PurePath(Path(OUTD), Path(ORIGP).parent)
     OUTPATH = PurePath(Path(OUTD), Path(ORIGP))
     logging.debug(f'Extracting {LOCALP} to {OUTPATH}')
+    
+    # Check if file exists in ZIP before attempting extraction
+    if LOCALP not in zip.namelist():
+        logging.debug(f'File not found in ZIP: {LOCALP}')
+        return  # Skip this file and continue
+    
     try:
         zip.extract(LOCALP)
     except KeyError as e:
-        logging.debug(e)
+        logging.debug(f'KeyError extracting {LOCALP}: {e}')
+        return  # Skip this file and continue
     except NotADirectoryError as e:
         logging.debug(f'Error writing to directory: {e}')
     except PermissionError as e:
@@ -137,8 +152,9 @@ def extractToDir(zip, LOCALP, ORIGP, OUTD):
         # Path too long error manifests as FileNotFoundError on Windows
         logging.warning(f'Path too long error during extraction: {e}')
         logging.warning(f'This should have been prevented by safe_path(). Please check the implementation.')
-    except:
-        logging.debug(f'General error extracting file to path.')
+    except Exception as e:
+        logging.debug(f'General error extracting file {LOCALP}: {e}')
+        return  # Skip this file and continue
     else:
         try:
             Path(LOCALP).rename(OUTPATH) # Move from CWD to original path + FN

@@ -253,7 +253,13 @@ class UFDRParser:
                 util_script = root_dir / "fix_repo_permissions.bat"
                 if util_script.exists():
                     logger.info("Running Windows permission fix script...")
-                    subprocess.run([str(util_script)], shell=True, check=True, cwd=str(root_dir))
+                    # Run without shell=True and suppress output for non-interactive execution
+                    subprocess.run(
+                        [str(util_script)], 
+                        cwd=str(root_dir),
+                        capture_output=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
+                    )
             else:
                 util_script = root_dir / "fix_repo_permissions.sh"
                 if util_script.exists():
