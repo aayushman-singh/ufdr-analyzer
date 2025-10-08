@@ -30,6 +30,7 @@ This script will:
 - ✅ Check if PostgreSQL is running (start if needed)
 - ✅ Test database connection
 - ✅ Start the backend server automatically
+- ✅ Run completely hands-free (no prompts or pauses)
 
 ---
 
@@ -150,6 +151,27 @@ MeiliSearch provides enhanced full-text search capabilities. The application wor
 
 - URL: `http://localhost:7700`
 - To override: `export MEILI_URL="http://your-meili-url:7700"`
+
+---
+
+## Data Ingestion
+
+### Ingest a UFDR file
+
+Make sure PostgreSQL is running first, then:
+
+```bash
+cd backend
+python ingest_cli.py ../Android_13_Image.ufdr
+```
+
+The ingestion process will:
+- Extract the UFDR file
+- Run ALEAPP for Android forensic analysis
+- Parse all data (messages, contacts, calls, media)
+- Store in PostgreSQL and index in MeiliSearch
+
+**Note:** The process is fully automated and hands-free. If you see connection errors, make sure PostgreSQL is running.
 
 ---
 

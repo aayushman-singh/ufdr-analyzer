@@ -5,9 +5,16 @@ Usage: python ingest_cli.py /path/to/file.ufdr
 """
 import sys
 import argparse
+import os
 from pathlib import Path
 from sqlmodel import Session
 from meilisearch import Client as MeiliClient
+
+# Fix Windows console encoding issues
+if sys.platform == "win32":
+    import codecs
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.detach())
 
 from ingest.services.parser_service import UFDRParser
 from ingest.services.ingest_service import IngestService
@@ -79,7 +86,17 @@ def ingest_file(file_path: str, user_id: int = 1) -> dict:
         return result
 
     except Exception as e:
-        logger.error(f"Ingestion failed: {e}")
+        # Check if this is a database connection error
+        error_msg = str(e)
+        if "Connection refused" in error_msg or "connection to server" in error_msg:
+            logger.error(f"Database connection failed: {e}")
+            logger.error("")
+            logger.error("PostgreSQL is not running. To start it:")
+            logger.error("  Option 1 (Docker):     ./start-dev-services.bat")
+            logger.error("  Option 2 (Local):      ./start-dev-local.bat")
+            logger.error("  See DEVELOPMENT.md for detailed setup instructions")
+        else:
+            logger.error(f"Ingestion failed: {e}")
         raise
 
 
@@ -97,18 +114,27 @@ def main():
 
     try:
         result = ingest_file(args.file_path, args.user_id)
-        print("✓ Ingestion successful!")
+        print("[SUCCESS] Ingestion successful!")
         print(f"Run ID: {result.get('run_id')}")
         print(f"Status: {result.get('status')}")
 
     except FileNotFoundError as e:
-        print(f"✗ Error: {e}")
+        print(f"[ERROR] {e}")
         sys.exit(1)
     except ValueError as e:
-        print(f"✗ Error: {e}")
+        print(f"[ERROR] {e}")
         sys.exit(1)
     except Exception as e:
-        print(f"✗ Ingestion failed: {e}")
+        error_msg = str(e)
+        if "Connection refused" in error_msg or "connection to server" in error_msg:
+            print(f"[ERROR] Database connection failed")
+            print("")
+            print("PostgreSQL is not running. To start it:")
+            print("  Option 1 (Docker):     ./start-dev-services.bat")
+            print("  Option 2 (Local):      ./start-dev-local.bat")
+            print("  See DEVELOPMENT.md for detailed setup instructions")
+        else:
+            print(f"[ERROR] Ingestion failed: {e}")
         sys.exit(1)
 
 

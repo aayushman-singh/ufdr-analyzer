@@ -14,6 +14,7 @@ import sys
 import os
 import re
 import time
+import uuid
 
 # Avoid circular import by getting meili_client directly
 def get_meili_client():
@@ -109,6 +110,9 @@ async def ingest_ufdr(
         # OPTIMIZATION: Check for content-based deduplication first
         start_time = time.time()
         cached_result = cache_service.check_existing_processing(str(file_path), session)
+        
+        # The cache service now validates that runs have actual data before returning them
+        # So we can trust cached_result if it exists
 
         if cached_result:
             processing_time = time.time() - start_time
@@ -169,6 +173,10 @@ async def ingest_ufdr(
                 }
                 logger.info("Normalizing cached data...")
                 parsed_data = UFDRParser._normalize(parsed_data, file_path.name)
+                
+                # Add file path for hash calculation and deduplication
+                parsed_data["file_path"] = str(file_path)
+                parsed_data["filename"] = file_path.name
 
                 # Check for cached ALEAPP data
                 aleapp_output_dir = get_aleapp_report_path(str(file_path))
@@ -192,6 +200,7 @@ async def ingest_ufdr(
                 # Modify the parser to use organized folders
                 parsed_data = UFDRParser.parse_file(str(file_path), output_dir=str(get_ufdr_cache_dir(str(file_path))))
                 parsed_data["filename"] = file_path.name
+                parsed_data["file_path"] = str(file_path)
                 logger.info(f"File parsing successful. Parsed {len(parsed_data)} fields")
             except Exception as parse_error:
                 logger.error(f"File parsing failed: {parse_error}")

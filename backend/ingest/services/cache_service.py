@@ -247,88 +247,48 @@ class CacheService:
         # Level 2: Check database for existing run with this hash
         existing_run = self.check_database_for_hash(file_hash, session)
 
-        if existing_run and existing_run.status in ['complete', 'completed', 'success']:
-            # Found completed run, create cached result
-            # ALEAPP processing check will be done in upload.py to avoid circular imports
-            aleapp_processed = False
+        if existing_run:
+            # Check if this run has any actual data (messages, calls, contacts, media)
+            from db_setup import Message, Call, Contact, Media
+            has_messages = session.exec(select(Message).where(Message.run_id == existing_run.id).limit(1)).first() is not None
+            has_calls = session.exec(select(Call).where(Call.run_id == existing_run.id).limit(1)).first() is not None
+            has_contacts = session.exec(select(Contact).where(Contact.run_id == existing_run.id).limit(1)).first() is not None
+            has_media = session.exec(select(Media).where(Media.run_id == existing_run.id).limit(1)).first() is not None
+            
+            has_data = has_messages or has_calls or has_contacts or has_media
+            
+            # If run has data, return it regardless of status
+            if has_data:
+                logger.info(f"Found existing run {existing_run.id} with data (status: {existing_run.status})")
+                stats = {
+                    'file_path': file_path,
+                    'run_id': str(existing_run.id),
+                    'status': existing_run.status,
+                    'start_time': existing_run.start_time.isoformat(),
+                    'end_time': existing_run.end_time.isoformat() if existing_run.end_time else None,
+                    'processing_time': 'cached',
+                    'aleapp_processed': False
+                }
 
-            stats = {
-                'file_path': file_path,
-                'run_id': str(existing_run.id),
-                'status': existing_run.status,
-                'start_time': existing_run.start_time.isoformat(),
-                'end_time': existing_run.end_time.isoformat() if existing_run.end_time else None,
-                'processing_time': 'cached',
-                'aleapp_processed': aleapp_processed
-            }
-
-            return CachedResult(
-                run_id=str(existing_run.id),
-                file_path=file_path,
-                cached_at=existing_run.start_time,
-                processing_stats=stats
-            )
-
-        # Check if we have comprehensive cache files that can create a fast response
-        if self.has_comprehensive_cache(file_hash, file_path):
-            # Create a synthetic cached result from cache files
-            logger.info(f"Found comprehensive cache for hash {file_hash[:12]}... - creating fast response")
-
-            # Get or create system user for cache-created runs
-            from db_setup import User
-            system_user = session.exec(select(User).where(User.email == "system@ufdr-analyzer.local")).first()
-            if not system_user:
-                system_user = User(
-                    username="System",
-                    email="system@ufdr-analyzer.local",
-                    password_hash="no_password_system_user",
-                    is_admin=False
+                return CachedResult(
+                    run_id=str(existing_run.id),
+                    file_path=file_path,
+                    cached_at=existing_run.start_time,
+                    processing_stats=stats
                 )
-                session.add(system_user)
-                session.commit()
-                session.refresh(system_user)
-                logger.info(f"Created system user: {system_user.id}")
+            elif existing_run.status in ['complete', 'completed', 'success']:
+                # Run is marked complete but has no data - this is an empty run
+                # Don't return it, let the system reprocess or create a proper run
+                logger.warning(f"Found completed run {existing_run.id} but it has no data - ignoring")
+            else:
+                # Run exists but has no data and isn't complete - probably failed or in progress
+                logger.info(f"Found run {existing_run.id} with status {existing_run.status} but no data - ignoring")
 
-            # Create a proper Run record in the database with UUID instead of synthetic ID
-            new_run = Run(
-                user_id=system_user.id,
-                ufdr_file_name=Path(file_path).name,
-                original_file_path=file_path,
-                file_content_hash=file_hash,
-                status='completed',
-                start_time=datetime.now(),
-                end_time=datetime.now()
-            )
-            session.add(new_run)
-            session.commit()
-            session.refresh(new_run)
-
-            logger.info(f"Created new Run record from cache: {new_run.id}")
-
-            stats = {
-                'file_path': file_path,
-                'run_id': str(new_run.id),
-                'status': 'cached',
-                'start_time': new_run.start_time.isoformat(),
-                'end_time': new_run.end_time.isoformat(),
-                'processing_time': 'sub-second',
-                'cache_source': 'comprehensive_cache'
-            }
-
-            return CachedResult(
-                run_id=str(new_run.id),
-                file_path=file_path,
-                cached_at=datetime.now(),
-                processing_stats=stats
-            )
-
-        # Level 3: Check cache files
-        cached_result = self.get_cached_ingestion_result(file_hash)
-        if cached_result:
-            logger.info(f"Found cached result for hash {file_hash[:12]}...")
-            return cached_result
-
-        logger.info("No existing processing found")
+        # NOTE: We no longer create new runs from cache files alone
+        # This was causing empty runs to be created without actual data
+        # If no run with data exists, we should fall through to reprocessing
+        
+        logger.info("No existing processing found with data")
         return None
 
     def has_comprehensive_cache(self, file_hash: str, file_path: str) -> bool:
