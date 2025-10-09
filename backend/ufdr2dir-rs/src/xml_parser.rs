@@ -1,6 +1,4 @@
-  use anyhow::{Context, Result};
-use quick_xml::events::Event;
-use quick_xml::Reader;
+use anyhow::{Context, Result};
 use regex::Regex;
 
 #[derive(Debug, Clone)]
@@ -23,6 +21,15 @@ pub fn parse_report_xml(xml_content: &str, debug: bool) -> Result<Vec<FileMappin
     for line in xml_content.lines() {
         // Check for <file fs tag with path attribute
         if line.contains("<file fs") {
+            // Skip embedded files (SQLite BLOB extractions)
+            if line.contains("embedded=\"true\"") {
+                current_original_path = None;
+                if debug {
+                    println!("[DEBUG] Skipping embedded file");
+                }
+                continue;
+            }
+            
             if let Some(captures) = path_regex.captures(line) {
                 if let Some(path_match) = captures.get(1) {
                     current_original_path = Some(path_match.as_str().to_string());
