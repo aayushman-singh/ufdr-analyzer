@@ -119,42 +119,82 @@ class LLMClient:
             }
     def _build_system_prompt(self, context: Optional[Dict[str, Any]]) -> str:
         """Build system prompt explaining UFDR schema and task."""
-        prompt = """You are a forensic data query assistant. Convert natural language queries into structured search parameters for UFDR (Universal Forensic Data 
-Report) data.
+        prompt = """You are an intelligent forensic data query assistant. Your job is to understand conversational queries and convert them into structured search parameters for Android device forensic data.
 
-**Available Data Tables:**
-- messages: Text messages (sender, receiver, content, timestamp)
-- calls: Call logs (caller, receiver, timestamp, duration)
-- contacts: Contact list (name, number)
-- media: Media files (path, type)
-- aleapp_artifacts: Android forensic artifacts
+**Available Data Sources:**
 
-**Query Intents:**
-- crypto_search: Find cryptocurrency mentions (Bitcoin, Ethereum, wallet addresses)
-- foreign_numbers: Find international phone numbers
-- keyword_search: Search for specific keywords/phrases
+1. **messages**: Generic SMS/text messages (sender, receiver, content, timestamp)
+2. **calls**: Call logs (caller, receiver, timestamp, duration)
+3. **contacts**: Contact list (name, number)
+4. **media**: Media files (path, type, size)
+5. **aleapp_artifacts**: ANDROID APP-SPECIFIC DATA extracted by ALEAPP
+   - WhatsApp messages, calls, media
+   - Instagram DMs, stories
+   - Snapchat messages
+   - Facebook Messenger
+   - Chrome browsing history
+   - And 100+ other Android app artifacts
+
+**Understanding App-Specific Queries:**
+
+When users ask about specific apps, you MUST search aleapp_artifacts:
+- "WhatsApp messages" → search aleapp_artifacts with app_name filter "WhatsApp"
+- "Instagram DMs" → search aleapp_artifacts with app_name filter "Instagram"
+- "Chrome history" → search aleapp_artifacts with app_name filter "Chrome"
+- "all social media" → search aleapp_artifacts with category filter "social_media"
+
+**Query Intents (be smart!):**
+- app_specific: Queries about specific apps (WhatsApp, Instagram, etc.) - USE ALEAPP_ARTIFACTS!
+- crypto_search: Cryptocurrency mentions (Bitcoin, Ethereum, wallet addresses)
+- foreign_numbers: International phone numbers
+- keyword_search: Generic keyword searches across multiple tables
 - timeline: Time-based queries
-- contact_search: Find specific contacts
+- contact_search: Specific contacts
 - pattern_match: Regex or pattern-based search
+- conversational: General "show me", "find", "list" queries
+
+**Search Strategy:**
+- Default to "hybrid" search (combines keyword + semantic) for best results
+- Use "semantic" for conceptual queries ("suspicious activity", "planning something")
+- Use "keyword" only for exact term matching
 
 **Output JSON Schema:**
 {
-  "intent": "string - primary intent",
-  "search_type": "string - 'keyword', 'semantic', 'pattern', 'structured'",
-  "target_tables": ["array of table names to search"],
+  "intent": "string - primary intent (use 'app_specific' for app queries!)",
+  "search_type": "string - 'keyword', 'semantic', or 'hybrid' (default: hybrid)",
+  "target_tables": ["array - ALWAYS include 'aleapp_artifacts' for app queries"],
   "filters": {
-    "time_range": {"start": "ISO datetime", "end": "ISO datetime"},
-    "phone_numbers": ["array of numbers to filter"],
-    "keywords": ["array of search terms"]
+    "time_range": {"start": "ISO datetime or null", "end": "ISO datetime or null"},
+    "phone_numbers": ["array of numbers"],
+    "keywords": ["array of search terms"],
+    "app_name": "string - specific app name (WhatsApp, Instagram, Chrome, etc.)",
+    "artifact_category": "string - messages, calls, browsing_history, media, etc."
   },
   "entities": [
-    {"type": "phone|crypto|email|location", "value": "extracted value"}
+    {"type": "phone|crypto|email|location|app", "value": "extracted value"}
   ],
-  "keywords": ["array of search keywords"],
+  "keywords": ["relevant search terms - extract intelligently"],
   "confidence": 0.0-1.0
 }
 
-Extract entities, classify intent, and generate search parameters."""
+**CRITICAL: For app-specific queries:**
+1. Set intent to "app_specific"
+2. MUST include "aleapp_artifacts" in target_tables
+3. Add app_name to filters (e.g., "WhatsApp", "Instagram")
+4. Set search_type to "hybrid" for best results
+5. Extract relevant keywords (e.g., "messages" → artifact_category: "messages")
+
+**Examples:**
+Query: "show me whatsapp messages"
+→ intent: "app_specific", target_tables: ["aleapp_artifacts"], filters: {app_name: "WhatsApp", artifact_category: "messages"}
+
+Query: "find instagram DMs from last week"
+→ intent: "app_specific", target_tables: ["aleapp_artifacts"], filters: {app_name: "Instagram", artifact_category: "messages", time_range: {start: "last week"}}
+
+Query: "all social media activity"
+→ intent: "app_specific", target_tables: ["aleapp_artifacts"], keywords: ["social", "media"], artifact_category: "any"
+
+Be conversational, intelligent, and USE ALEAPP ARTIFACTS for app queries!"""
 
         # Add context if provided
         if context:
@@ -232,16 +272,28 @@ Extract entities, classify intent, and generate search parameters."""
         Returns:
             Natural language summary/insights with key findings
         """
-        system_prompt = """You are a forensic analyst assistant. Your task:
-1. Analyze query results and identify KEY PATTERNS and INSIGHTS
-2. Highlight suspicious activities, important contacts, or critical evidence
-3. Provide actionable intelligence for investigators
-4. Be concise but thorough - focus on what matters
+        system_prompt = """You are a conversational forensic analyst assistant. Your task:
+1. Answer the user's query in NATURAL, CONVERSATIONAL language
+2. Provide SPECIFIC details from the data (dates, names, counts, etc.)
+3. Highlight patterns, suspicious activities, or important findings
+4. Be helpful, clear, and thorough - like a colleague explaining findings
 
-Format your response with:
-- Executive Summary (2-3 sentences)
-- Key Findings (bullet points of important patterns/entities)
-- Recommended Next Steps (if applicable)"""
+CRITICAL: Be conversational and specific!
+- Instead of: "Found 5 results"
+- Say: "I found 5 WhatsApp conversations from this device, spanning from Jan 15 to Feb 20, 2024."
+
+- Instead of: "Messages contain keywords"
+- Say: "The conversations mention Bitcoin 12 times, with specific wallet addresses discussed on Feb 3rd."
+
+Format your response naturally:
+- Start with a direct answer to their question
+- Provide key findings with specific details
+- Suggest related queries or next steps if useful
+
+CRITICAL: If results are from ALEAPP artifacts:
+- Explain what you found (e.g., "WhatsApp messages", "Instagram DMs")
+- Mention the artifact type and how many items
+- Show sample data if relevant"""
 
         # Build efficient result summary (limit data sent to LLM)
         result_count = query_results.get("total_results", 0)
@@ -270,6 +322,24 @@ Format your response with:
 
                 elif result_type == "media":
                     result_summary += f"{i}. [MEDIA] {result.get('file_path', 'N/A')} ({result.get('media_type', 'unknown')}) - {result.get('size', 'N/A')} bytes\n"
+
+                elif result_type == "aleapp_artifact":
+                    # ALEAPP artifacts - show filename, category, and row count
+                    result_summary += f"{i}. [ALEAPP] {result.get('filename', 'N/A')} | Category: {result.get('category', 'N/A')} | {result.get('row_count', 0)} rows\n"
+                    if result.get('sample_data'):
+                        result_summary += f"   Sample: {str(result['sample_data'][0])[:100]}...\n"
+
+                elif result_type == "device_info":
+                    # Device info - show what type of info and key details
+                    info_type = result.get('info_type', 'unknown')
+                    if info_type == 'extraction_metadata':
+                        result_summary += f"{i}. [DEVICE INFO] Extraction: {result.get('file_name', 'N/A')} | Status: {result.get('status', 'N/A')}\n"
+                        if result.get('extraction_metadata'):
+                            result_summary += f"   Metadata: {str(result['extraction_metadata'])[:100]}...\n"
+                    elif info_type == 'system_file':
+                        result_summary += f"{i}. [SYSTEM FILE] {result.get('original_path', 'N/A')}\n"
+                    else:
+                        result_summary += f"{i}. [DEVICE INFO] {result.get('filename', 'N/A')} | {result.get('category', 'N/A')}\n"
 
                 else:
                     # Generic format for unknown types
@@ -315,3 +385,79 @@ Format your response with:
         except Exception as e:
             self.logger.error(f"Failed to generate insights: {e}")
             return f"Found {result_count} results matching your query."
+
+    def _generate_no_results_response(self, original_query: str, query_results: Dict[str, Any]) -> str:
+        """
+        Generate a helpful response when no results are found.
+        Analyzes what data IS available and suggests alternatives.
+        """
+        # Check what data is actually available
+        available_data = []
+        
+        # This would need to be passed from the query executor
+        # For now, provide a generic helpful response
+        query_lower = original_query.lower()
+        
+        if 'whatsapp' in query_lower or 'wa' in query_lower:
+            return """I searched for WhatsApp messages but didn't find any WhatsApp data in this device extraction. 
+
+This could mean:
+• WhatsApp wasn't installed on this device
+• WhatsApp data wasn't included in the UFDR extraction
+• WhatsApp data is encrypted and not accessible
+
+**What I can help you find instead:**
+• SMS messages (if any exist)
+• Call logs and contacts
+• Other app data that was extracted
+• Media files and documents
+
+Try asking: "What communication data is available?" or "Show me all messages and calls" to see what data exists."""
+        
+        elif 'message' in query_lower or 'chat' in query_lower:
+            return """I searched for messages but didn't find any message data in this device extraction.
+
+This could mean:
+• No messaging apps were installed
+• Message data wasn't included in the UFDR
+• Messages are encrypted or protected
+
+**What I can help you find instead:**
+• Call logs and contacts
+• Media files and documents  
+• App installation data
+• System files and logs
+
+Try asking: "What data is available?" or "Show me all contacts and calls" to explore what exists."""
+        
+        elif 'android' in query_lower or 'version' in query_lower or 'device' in query_lower or 'system' in query_lower:
+            return """I searched for device information but didn't find specific Android version or system details in this extraction.
+
+This could mean:
+• System information wasn't included in the UFDR
+• Device details are in encrypted system files
+• The extraction focused on app data rather than system info
+
+**What I can help you find instead:**
+• Installed apps and their versions
+• Media files and documents
+• ALEAPP analysis results
+• Extraction metadata and file information
+
+Try asking: "What apps were installed?" or "Show me all extracted data" to see what information is available."""
+        
+        else:
+            return f"""I searched for '{original_query}' but didn't find any matching data in this device extraction.
+
+**This could mean:**
+• The specific data you're looking for isn't in this UFDR file
+• The data might be encrypted or protected
+• The extraction didn't capture that type of data
+
+**What I can help you find instead:**
+• Available communication data (calls, contacts, messages)
+• Media files and documents
+• App data and system information
+• Any other data that was successfully extracted
+
+Try asking: "What data is available?" or "Show me all extracted data" to see what exists in this device."""

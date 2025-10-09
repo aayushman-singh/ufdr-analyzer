@@ -6,10 +6,45 @@ from datetime import datetime
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from db_setup import Message, Call, Contact, Media, Run
+from db_setup import Message, Call, Contact, Media, Run, AleappArtifact
 from ai.embeddings import EmbeddingsService
 
 logger = logging.getLogger(__name__)
+
+# App name mappings - handles variations and common aliases
+APP_NAME_MAPPING = {
+    # WhatsApp variations
+    "whatsapp": ["WhatsApp", "whatsapp", "WA", "com.whatsapp"],
+    "wa": ["WhatsApp", "whatsapp", "WA", "com.whatsapp"],
+    
+    # Instagram variations
+    "instagram": ["Instagram", "instagram", "IG", "com.instagram"],
+    "ig": ["Instagram", "instagram", "IG", "com.instagram"],
+    "insta": ["Instagram", "instagram", "IG", "com.instagram"],
+    
+    # Facebook Messenger
+    "messenger": ["Messenger", "messenger", "facebook messenger", "com.facebook.orca"],
+    "facebook messenger": ["Messenger", "messenger", "facebook messenger", "com.facebook.orca"],
+    
+    # Snapchat
+    "snapchat": ["Snapchat", "snapchat", "com.snapchat"],
+    "snap": ["Snapchat", "snapchat", "com.snapchat"],
+    
+    # Telegram
+    "telegram": ["Telegram", "telegram", "org.telegram"],
+    
+    # Signal
+    "signal": ["Signal", "signal", "org.thoughtcrime.securesms"],
+    
+    # Chrome/Browser
+    "chrome": ["Chrome", "chrome", "browser", "com.android.chrome"],
+    "browser": ["Chrome", "chrome", "browser", "com.android.chrome"],
+    
+    # SMS/Messages
+    "sms": ["SMS", "sms", "messages", "text messages"],
+    "text": ["SMS", "sms", "messages", "text messages"],
+    "messages": ["SMS", "sms", "messages", "text messages"],
+}
 
 
 class QueryExecutor:
@@ -74,6 +109,10 @@ class QueryExecutor:
                     results.extend(self._search_contacts(run_id, keywords, filters))
                 elif table == "media":
                     results.extend(self._search_media(run_id, filters))
+                elif table == "aleapp_artifacts":
+                    results.extend(self._search_aleapp_artifacts(run_id, keywords, filters))
+                elif table == "device_info":
+                    results.extend(self._search_device_info(run_id, keywords, filters))
 
             # Optionally search MeiliSearch for full-text
             if self.meili_client and keywords:
@@ -217,6 +256,143 @@ class QueryExecutor:
             "media_type": media.media_type,
             "relevance_score": 1.0
         } for media in media_items]
+
+    def _search_aleapp_artifacts(self, run_id: str, keywords: List[str], filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Search ALEAPP artifacts for app-specific data.
+        This is the key to intelligent app queries like "WhatsApp messages".
+        """
+        query = select(AleappArtifact).where(AleappArtifact.run_id == run_id)
+
+        # App-specific filter (e.g., "WhatsApp", "Instagram")
+        if filters.get("app_name"):
+            app_name = filters["app_name"].lower()
+            
+            # Map app name to all variations (handles "whatsapp", "wa", "WhatsApp", etc.)
+            app_variations = APP_NAME_MAPPING.get(app_name, [app_name])
+            self.logger.info(f"Searching ALEAPP artifacts for app: {app_name} (variations: {app_variations})")
+            
+            # Build query for all app variations
+            app_filters = []
+            for variation in app_variations:
+                app_filters.append(AleappArtifact.filename.ilike(f"%{variation}%"))
+                app_filters.append(AleappArtifact.category.ilike(f"%{variation}%"))
+                app_filters.append(AleappArtifact.file_path.ilike(f"%{variation}%"))
+            
+            if app_filters:
+                query = query.where(or_(*app_filters))
+
+        # Artifact category filter (e.g., "messages", "calls", "media")
+        if filters.get("artifact_category"):
+            category = filters["artifact_category"]
+            if category != "any":
+                self.logger.info(f"Filtering by artifact category: {category}")
+                query = query.where(
+                    or_(
+                        AleappArtifact.category.ilike(f"%{category}%"),
+                        AleappArtifact.filename.ilike(f"%{category}%")
+                    )
+                )
+
+        # Keyword filter (search in filename, category, and data)
+        if keywords:
+            keyword_filters = []
+            for kw in keywords:
+                keyword_filters.append(
+                    or_(
+                        AleappArtifact.filename.ilike(f"%{kw}%"),
+                        AleappArtifact.category.ilike(f"%{kw}%"),
+                        AleappArtifact.data.ilike(f"%{kw}%") if AleappArtifact.data else False
+                    )
+                )
+            if keyword_filters:
+                query = query.where(or_(*keyword_filters))
+
+        artifacts = self.session.exec(query).all()
+        self.logger.info(f"Found {len(artifacts)} ALEAPP artifacts")
+
+        results = []
+        for artifact in artifacts:
+            # Parse JSON data if available
+            artifact_data = None
+            if artifact.data:
+                try:
+                    import json
+                    artifact_data = json.loads(artifact.data)
+                except:
+                    pass
+
+            result = {
+                "type": "aleapp_artifact",
+                "id": str(artifact.id),
+                "artifact_type": artifact.artifact_type,
+                "filename": artifact.filename,
+                "file_path": artifact.file_path,
+                "category": artifact.category,
+                "row_count": artifact.row_count,
+                "relevance_score": 1.5,  # Boost ALEAPP artifacts - they're app-specific!
+                "created_at": artifact.created_at.isoformat() if artifact.created_at else None
+            }
+
+            # Add sample data if available
+            if artifact_data:
+                if isinstance(artifact_data, list) and len(artifact_data) > 0:
+                    result["sample_data"] = artifact_data[:5]  # First 5 rows
+                elif isinstance(artifact_data, dict):
+                    result["data_summary"] = {k: str(v)[:100] for k, v in list(artifact_data.items())[:5]}
+
+            results.append(result)
+
+        return results
+
+    def _search_device_info(self, run_id: str, keywords: List[str], filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Search for device information across available data sources.
+        Since we don't have a dedicated device_info table, we search:
+        1. ALEAPP artifacts for system information
+        2. Media files for system-related files
+        3. Run metadata for extraction information
+        """
+        results = []
+        
+        # Search ALEAPP artifacts for system/device info
+        aleapp_results = self._search_aleapp_artifacts(run_id, keywords, filters)
+        for result in aleapp_results:
+            # Check if this artifact contains device info
+            if any(keyword in result.get('filename', '').lower() for keyword in ['system', 'device', 'android', 'version', 'build']):
+                result['type'] = 'device_info'
+                result['info_type'] = 'aleapp_artifact'
+                results.append(result)
+        
+        # Search media files for system-related files
+        media_results = self._search_media(run_id, filters)
+        for result in media_results:
+            file_path = result.get('original_path', '').lower()
+            if any(keyword in file_path for keyword in ['system', 'build', 'version', 'android', 'prop']):
+                result['type'] = 'device_info'
+                result['info_type'] = 'system_file'
+                results.append(result)
+        
+        # Add run metadata as device info
+        try:
+            run = self.session.get(Run, run_id)
+            if run:
+                device_info = {
+                    'type': 'device_info',
+                    'info_type': 'extraction_metadata',
+                    'id': str(run.id),
+                    'file_name': run.ufdr_file_name,
+                    'status': run.status,
+                    'start_time': run.start_time.isoformat() if run.start_time else None,
+                    'end_time': run.end_time.isoformat() if run.end_time else None,
+                    'extraction_metadata': run.extraction_metadata,
+                    'relevance_score': 1.0
+                }
+                results.append(device_info)
+        except Exception as e:
+            self.logger.warning(f"Failed to get run metadata: {e}")
+        
+        return results
 
     def _search_meilisearch(self, run_id: str, keywords: List[str]) -> List[Dict[str, Any]]:
         """Search MeiliSearch for full-text search."""
