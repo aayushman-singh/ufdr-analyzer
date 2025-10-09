@@ -62,3 +62,6 @@ ALEAPP/admin/docs/generated/
 /backend/ufdr2dir-rs/target
 /backend/ufdr2dir-rs/UFDRConvert
 /backend/ufdr2dir-rs/test_output
+
+# Permission marker file
+.permissions_ok

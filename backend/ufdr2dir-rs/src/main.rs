@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use rayon::prelude::*;
-use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -15,7 +13,7 @@ use xml_parser::FileMapping;
 use path_utils::{safe_path, sanitize_windows_path, PathMappingStore};
 
 const MAX_PATH_LENGTH: usize = 240;
-const VERSION: &str = "0.1.10";
+const VERSION: &str = "0.1.11";
 
 /// Convert a Cellebrite Reader UFDR file to its original directory structure
 #[derive(Parser, Debug)]
