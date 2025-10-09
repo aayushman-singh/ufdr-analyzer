@@ -190,7 +190,7 @@ async def execute_query(
                     )
                 else:
                     # No results - generate helpful response
-                    insights = f"I searched for '{request.query}' but didn't find any matching data in this device. Would you like me to try different search terms or broaden the criteria?"
+                    insights = llm_client._generate_no_results_response(request.query, insight_results)
                 logger.info("Insights generated successfully")
             except Exception as insight_error:
                 logger.warning(f"Failed to generate insights: {insight_error}")
