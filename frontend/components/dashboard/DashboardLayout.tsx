@@ -1,50 +1,125 @@
 "use client"
+
 import { useState } from "react"
+import Link from "next/link"
 import { Shield } from "lucide-react"
+
 import {
   Sidebar,
   SidebarContent,
   SidebarFooter,
-  SidebarGroup,
-  SidebarGroupLabel,
-  SidebarGroupContent,
   SidebarHeader,
   SidebarInset,
   SidebarProvider,
   SidebarTrigger,
 } from "@/components/ui/sidebar"
-import { menuItems, mockChatMessages, ChatMessage } from "./data"
+import { ChatMessage, menuItems, mockChatMessages } from "./data"
 import { SidebarNav } from "./SidebarNav"
-
-// Import all your view components
 import { AiAssistantView } from "./views/AiAssistantView"
 import { EvidenceSearchView } from "./views/EvidenceSearchView"
 import { TimelineAnalysisView } from "./views/TimelineAnalysisView"
 import { ReportsAnalyticsView } from "./views/ReportAnalyticsView"
 import { DataVisualizationView } from "./views/DataVisualizationView"
-import Link from "next/link"
-
 
 export function DashboardLayout() {
   const [activeContent, setActiveContent] = useState("ai-assistant")
   const [chatInput, setChatInput] = useState("")
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>(mockChatMessages)
+  const [isSending, setIsSending] = useState(false)
 
-  const handleSendMessage = () => {
-    if (!chatInput.trim()) return
-    const newMessage = { id: chatMessages.length + 1, type: "user" as const, message: chatInput, timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) };
-    setChatMessages([...chatMessages, newMessage]);
-    setChatInput("");
-    setTimeout(() => {
-      const aiResponse = { id: chatMessages.length + 2, type: "assistant" as const, message: "I'm analyzing your request...", timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) };
-      setChatMessages((prev) => [...prev, aiResponse]);
-    }, 1000);
+  const handleSendMessage = async () => {
+    const trimmedInput = chatInput.trim()
+    if (!trimmedInput || isSending) return
+
+    // Retrieve the run_id from local storage for the API call.
+    const runId = localStorage.getItem("run_id")
+    if (!runId) {
+      alert("Error: No active analysis session found. Please upload a file first.")
+      return
+    }
+
+    setIsSending(true)
+
+  
+    const userMessage: ChatMessage = {
+      id: Date.now(), // Use a more unique ID
+      type: "user",
+      message: trimmedInput,
+      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    }
+
+  
+    const loadingMessageId = Date.now() + 1
+    const loadingMessage: ChatMessage = {
+      id: loadingMessageId,
+      type: "assistant",
+      message: "",
+      isLoading: true,
+      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    }
+
+    setChatMessages(prev => [...prev, userMessage, loadingMessage])
+    setChatInput("")
+
+    try {
+    
+      const response = await fetch("http://localhost:8000/query/execute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query: trimmedInput,
+          run_id: runId,
+          provider: "openrouter",
+          generate_insights: true,
+        }),
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json()
+        throw new Error(errorData.message || "Network response was not ok.")
+      }
+
+      const data = await response.json()
+
+      const aiResponse: ChatMessage = {
+        id: loadingMessageId,
+        type: "assistant",
+        message: data.insights || "No insights found.",
+        isLoading: false,
+        results: data.results,
+        result_count: data.result_count,
+        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      }
+
+      
+      setChatMessages(prev => prev.map(msg => (msg.id === loadingMessageId ? aiResponse : msg)))
+    } catch (error:any) {
+      console.error("Failed to fetch AI response:", error)
+      const errorMessage: ChatMessage = {
+        id: loadingMessageId,
+        type: "assistant",
+        message: `Sorry, an error occurred: ${error.message}`,
+        isLoading: false,
+        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      }
+      setChatMessages(prev => prev.map(msg => (msg.id === loadingMessageId ? errorMessage : msg)))
+    } finally {
+      setIsSending(false)
+    }
   }
 
   const renderContent = () => {
     switch (activeContent) {
       case "ai-assistant":
-        return <AiAssistantView chatMessages={chatMessages} chatInput={chatInput} setChatInput={setChatInput} handleSendMessage={handleSendMessage} />
+        return (
+          <AiAssistantView
+            chatMessages={chatMessages}
+            chatInput={chatInput}
+            isSending={isSending}
+            setChatInput={setChatInput}
+            handleSendMessage={handleSendMessage}
+          />
+        )
       case "evidence-search":
         return <EvidenceSearchView />
       case "timeline-analysis":
@@ -64,32 +139,27 @@ export function DashboardLayout() {
         <Sidebar>
           <SidebarHeader>
             <div className="flex items-center gap-2 p-2">
-                <div className="w-8 h-8 bg-gradient-to-br from-purple-600 to-purple-800 rounded-lg flex items-center justify-center">
-                    <Shield className="w-4 h-4 text-white" />
-                </div>
-                <Link href="/"><span className="text-sm font-medium">ForensicAI</span>
-            </Link>
-                </div>
+              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-purple-600 to-purple-800">
+                <Shield className="h-4 w-4 text-white" />
+              </div>
+              <Link href="/">
+                <span className="text-sm font-medium">ForensicAI</span>
+              </Link>
+            </div>
           </SidebarHeader>
           <SidebarContent>
-            <SidebarGroup>
-                <SidebarGroupLabel>Investigation Tools</SidebarGroupLabel>
-                <SidebarGroupContent>
-                    <SidebarNav menuItems={menuItems} activeContent={activeContent} setActiveContent={setActiveContent} />
-                </SidebarGroupContent>
-            </SidebarGroup>
+            <SidebarNav menuItems={menuItems} activeContent={activeContent} setActiveContent={setActiveContent} />
           </SidebarContent>
           <SidebarFooter>
             <div className="p-2">
-                <div className="text-sm font-medium">Case-2024-001</div>
+              <div className="text-sm font-medium">Case-2025-001</div>
             </div>
           </SidebarFooter>
         </Sidebar>
 
         <SidebarInset>
-          <header className="flex h-16 shrink-0 items-center gap-2 border-b px-4 bg-white">
+          <header className="flex h-16 shrink-0 items-center gap-2 border-b bg-white px-4">
             <SidebarTrigger className="-ml-1" />
-            {/* Breadcrumbs can go here */}
           </header>
           <main className="flex-1 overflow-auto p-6">{renderContent()}</main>
         </SidebarInset>

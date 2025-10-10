@@ -10,10 +10,13 @@ export interface MenuItem {
 }
 
 export interface ChatMessage {
-  id: number
-  type: "user" | "assistant"
-  message: string
-  timestamp: string
+  id: number;
+  type: "user" | "assistant";
+  message: string;
+  timestamp: string;
+  isLoading?: boolean;      
+  results?: any[];          
+  result_count?: number;    
 }
 
 export interface TimelineEvent {
@@ -35,10 +38,10 @@ export const menuItems: MenuItem[] = [
 ];
 
 export const mockChatMessages: ChatMessage[] = [
-  { id: 1, type: "user", message: "Show me all deleted WhatsApp messages from last week", timestamp: "10:30 AM" },
-  { id: 2, type: "assistant", message: "I found 23 deleted WhatsApp messages from March 15-22, 2024. Here's what I discovered:\n\n• 15 messages from contact 'Mike Johnson'\n• 5 messages from 'Sarah Wilson'\n• 3 messages from unknown number +1-555-0123\n\nWould you like me to show the content of these messages or analyze them for specific keywords?", timestamp: "10:31 AM" },
-  { id: 3, type: "user", message: "Find connections between John Doe and suspicious contacts", timestamp: "10:35 AM" },
-  { id: 4, type: "assistant", message: "Analysis complete! I found several connections between John Doe and flagged contacts:\n\n🔗 **Direct Connections:**\n• 47 calls with 'Mike Johnson' (flagged for fraud)\n• 12 WhatsApp conversations with 'Alex Rivera' (money laundering suspect)\n\n📍 **Location Overlaps:**\n• Both visited 123 Oak Street on March 10th\n• Simultaneous presence at Central Bank on March 15th\n\n💰 **Financial Patterns:**\n• $2,500 transfer mentioned in messages\n• Coordinated ATM withdrawals within 30 minutes", timestamp: "10:36 AM" },
+  // { id: 1, type: "user", message: "Show me all deleted WhatsApp messages from last week", timestamp: "10:30 AM" },
+
+{ id: 1, type: "assistant", message: "Welcome to your AI Forensic Assistant. I am connected to the case data and ready to help you with your investigation. Here's what I can do:\n\n• **Search for Evidence:** Find specific files, messages, or browser history.\n• **Analyze Timelines:** Reconstruct a sequence of events from digital footprints.\n• **Summarize Communications:** Condense conversations or logs into key points.\n• **Identify Connections:** Uncover relationships between contacts, files, and events.\n\nTo get started, simply ask me a question about the data, like 'Were there any images downloaded on October 5th, 2025?'", timestamp: "10:50 PM" } // { id: 3, type: "user", message: "Find connections between John Doe and suspicious contacts", timestamp: "10:35 AM" },
+  // { id: 4, type: "assistant", message: "Analysis complete! I found several connections between John Doe and flagged contacts:\n\n🔗 **Direct Connections:**\n• 47 calls with 'Mike Johnson' (flagged for fraud)\n• 12 WhatsApp conversations with 'Alex Rivera' (money laundering suspect)\n\n📍 **Location Overlaps:**\n• Both visited 123 Oak Street on March 10th\n• Simultaneous presence at Central Bank on March 15th\n\n💰 **Financial Patterns:**\n• $2,500 transfer mentioned in messages\n• Coordinated ATM withdrawals within 30 minutes", timestamp: "10:36 AM" },
 ];
 
 export const predefinedQuestions: string[] = [
