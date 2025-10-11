@@ -1,4 +1,4 @@
-import { Bot, Search, Clock, BarChart3, Network, LucideIcon, MapPin, Phone, MessageCircle, Users, Activity } from "lucide-react"
+import { Bot, Search, Clock, BarChart3, Network, LucideIcon, MapPin, Phone, MessageCircle, Users, Activity, GitBranch } from "lucide-react"
 
 // Type Definitions
 export interface MenuItem {
@@ -35,6 +35,7 @@ export const menuItems: MenuItem[] = [
   { title: "Timeline Analysis", icon: Clock, description: "Chronological view of events and activities", content: "timeline-analysis" },
   { title: "Reports & Analytics", icon: BarChart3, description: "Generate reports, visualizations, and summaries", content: "reports-analytics" },
   { title: "Data Visualization", icon: Network, description: "Charts, graphs, network diagrams for evidence", content: "data-visualization" },
+  { title: "Graph Analysis", icon: GitBranch, description: "Network analysis and relationship mapping", badge: "New", content: "graph-analysis" },
 ];
 
 export const mockChatMessages: ChatMessage[] = [
