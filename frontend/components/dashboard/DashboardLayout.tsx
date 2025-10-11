@@ -20,6 +20,7 @@ import { EvidenceSearchView } from "./views/EvidenceSearchView"
 import { TimelineAnalysisView } from "./views/TimelineAnalysisView"
 import { ReportsAnalyticsView } from "./views/ReportAnalyticsView"
 import { DataVisualizationView } from "./views/DataVisualizationView"
+import { GraphAnalysisView } from "./views/GraphAnalysisView"
 
 export function DashboardLayout() {
   const [activeContent, setActiveContent] = useState("ai-assistant")
@@ -128,6 +129,8 @@ export function DashboardLayout() {
         return <ReportsAnalyticsView />
       case "data-visualization":
         return <DataVisualizationView />
+      case "graph-analysis":
+        return <GraphAnalysisView />
       default:
         return <div>Select a menu item</div>
     }
