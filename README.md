@@ -55,6 +55,261 @@ An AI-powered software solution that:
 - **Containerization**: Docker + Docker Compose
 - **CI/CD**: GitHub Actions
 - **Deployment**: On-premise (air-gapped)
+- **Desktop App**: Electron wrapper for offline usage
+
+---
+
+## 🖥️ Electron Desktop Application
+
+The UFDR Analyzer is also available as a desktop application using Electron, providing native file system access and offline capabilities for forensic investigators.
+
+### **🚀 Quick Start - Electron Version**
+
+#### **Prerequisites**
+- Node.js 18+ and npm
+- Python 3.9+ (for backend)
+- Git
+
+#### **1. Clone and Setup**
+```bash
+git clone https://github.com/your-org/ufdr-analyzer.git
+cd ufdr-analyzer
+```
+
+#### **2. Install Dependencies**
+```bash
+# Install frontend dependencies
+cd frontend
+npm install
+
+# Install backend dependencies
+cd ../backend
+pip install -r requirements.txt
+```
+
+#### **3. Start Backend Server**
+```bash
+# From backend directory
+python server.py
+# Server will start on http://localhost:8000
+```
+
+#### **4. Run Electron App**
+```bash
+# From frontend directory
+npm run electron:dev
+```
+
+This will:
+- Start the Next.js development server
+- Launch the Electron desktop application
+- Open the app with native file system access
+
+### **📦 Building for Production**
+
+#### **Development Build**
+```bash
+cd frontend
+npm run electron:dev
+```
+
+#### **Production Build**
+```bash
+# Build the Next.js app
+npm run build
+
+# Build Electron app for current platform
+npm run electron:build
+```
+
+#### **Cross-Platform Builds**
+```bash
+# Build for Windows
+npm run electron:build -- --win
+
+# Build for macOS
+npm run electron:build -- --mac
+
+# Build for Linux
+npm run electron:build -- --linux
+
+# Build for all platforms
+npm run electron:build -- --win --mac --linux
+```
+
+### **🔧 Electron Configuration**
+
+#### **Main Process** (`frontend/electron/main.js`)
+- Handles native file dialogs
+- Manages window creation
+- Provides IPC communication
+
+#### **Preload Script** (`frontend/electron/preload.js`)
+- Secure bridge between main and renderer processes
+- Exposes file selection API to frontend
+
+#### **Build Configuration** (`frontend/electron-builder.json`)
+```json
+{
+  "appId": "com.ufdr-analyzer.app",
+  "productName": "UFDR Analyzer",
+  "directories": {
+    "output": "dist"
+  },
+  "files": [
+    "out/**/*",
+    "electron/**/*",
+    "node_modules/**/*"
+  ],
+  "mac": {
+    "category": "public.app-category.developer-tools"
+  },
+  "win": {
+    "target": "nsis"
+  },
+  "linux": {
+    "target": "AppImage"
+  }
+}
+```
+
+### **🎯 Electron Features**
+
+#### **Native File System Access**
+- **File Selection**: Native OS file dialogs for UFDR files
+- **Path Validation**: Automatic file path validation
+- **Large File Support**: Handle files up to 150GB+ without upload
+
+#### **Offline Capabilities**
+- **Local Processing**: Process UFDR files without network upload
+- **Cached Results**: Store analysis results locally
+- **Background Processing**: Continue analysis when offline
+
+#### **Security Features**
+- **Sandboxed Environment**: Secure execution context
+- **File System Permissions**: Controlled access to local files
+- **No Network Dependencies**: Process sensitive data locally
+
+### **📱 Deployment Options**
+
+#### **Option 1: Standalone Desktop App**
+```bash
+# Build and distribute as executable
+npm run electron:build
+# Creates installers in frontend/dist/
+```
+
+#### **Option 2: Portable Version**
+```bash
+# Create portable app (no installation required)
+npm run electron:build -- --portable
+```
+
+#### **Option 3: Enterprise Deployment**
+```bash
+# Create MSI installer for Windows
+npm run electron:build -- --win --x64 --ia32
+
+# Create DMG for macOS
+npm run electron:build -- --mac --x64 --arm64
+```
+
+### **🔒 Security Considerations**
+
+#### **Data Protection**
+- **Local Processing**: UFDR files never leave the investigator's machine
+- **Encrypted Storage**: Analysis results stored with encryption
+- **Audit Logging**: Track all file access and processing
+
+#### **Network Security**
+- **Optional Backend**: Can run completely offline
+- **Secure Communication**: HTTPS when connecting to backend
+- **API Authentication**: JWT tokens for secure API access
+
+### **🛠️ Development Workflow**
+
+#### **Hot Reload Development**
+```bash
+# Terminal 1: Start backend
+cd backend && python server.py
+
+# Terminal 2: Start Electron with hot reload
+cd frontend && npm run electron:dev
+```
+
+#### **Debugging**
+- **Main Process**: Use VS Code debugger or Chrome DevTools
+- **Renderer Process**: Built-in Chrome DevTools
+- **IPC Communication**: Console logging for debugging
+
+#### **Testing**
+```bash
+# Run frontend tests
+npm test
+
+# Run Electron-specific tests
+npm run test:electron
+
+# Run integration tests
+npm run test:integration
+```
+
+### **📋 Troubleshooting**
+
+#### **Common Issues**
+
+**1. Electron App Won't Start**
+```bash
+# Clear node_modules and reinstall
+rm -rf node_modules package-lock.json
+npm install
+```
+
+**2. File Selection Not Working**
+- Ensure `window.electronAPI` is available
+- Check preload script is loaded correctly
+- Verify IPC handlers are registered
+
+**3. Backend Connection Issues**
+- Verify backend is running on port 8000
+- Check CORS settings in backend
+- Ensure firewall allows local connections
+
+**4. Build Failures**
+```bash
+# Clear build cache
+npm run clean
+rm -rf out/ dist/
+npm run build
+```
+
+#### **Performance Optimization**
+- **Memory Management**: Large UFDR files may require increased memory limits
+- **File Processing**: Use streaming for very large files
+- **Caching**: Implement result caching for repeated analyses
+
+### **📦 Distribution**
+
+#### **Creating Installers**
+```bash
+# Windows (NSIS installer)
+npm run electron:build -- --win --x64
+
+# macOS (DMG)
+npm run electron:build -- --mac --x64 --arm64
+
+# Linux (AppImage)
+npm run electron:build -- --linux --x64
+```
+
+#### **Code Signing** (Optional)
+```bash
+# Sign Windows executable
+npm run electron:build -- --win --x64 --sign
+
+# Sign macOS app
+npm run electron:build -- --mac --x64 --arm64 --sign
+```
 
 ---
 

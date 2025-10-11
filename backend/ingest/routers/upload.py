@@ -71,6 +71,60 @@ def is_already_processed(file_path: str) -> bool:
     aleapp_output = get_aleapp_report_path(file_path)
     return cache_dir.exists() and report_xml.exists() and aleapp_output.exists()
 
+@router.get("/validate-path")
+async def validate_file_path(file_path: str):
+    """
+    Validate if a file path exists and is accessible.
+    """
+    try:
+        path = Path(file_path)
+        
+        if not path.exists():
+            return {
+                "valid": False,
+                "error": "File does not exist",
+                "file_path": file_path
+            }
+        
+        if not path.is_file():
+            return {
+                "valid": False,
+                "error": "Path is not a file",
+                "file_path": file_path
+            }
+        
+        # Check file extension
+        file_extension = path.suffix.lower()
+        supported_extensions = ['.ufdr', '.xml', '.json', '.csv']
+        
+        if file_extension not in supported_extensions:
+            return {
+                "valid": False,
+                "error": f"Unsupported file type: {file_extension}",
+                "file_path": file_path
+            }
+        
+        # Get file size
+        file_size_bytes = path.stat().st_size
+        file_size_gb = round(file_size_bytes / (1024**3), 2)
+        
+        return {
+            "valid": True,
+            "file_path": file_path,
+            "file_size_bytes": file_size_bytes,
+            "file_size_gb": file_size_gb,
+            "readable": True,
+            "file_extension": file_extension
+        }
+        
+    except Exception as e:
+        logger.error(f"File validation error: {e}")
+        return {
+            "valid": False,
+            "error": f"Validation error: {str(e)}",
+            "file_path": file_path
+        }
+
 @router.post("/")
 async def ingest_ufdr(
     request: IngestRequest,
