@@ -70,14 +70,17 @@ export function DashboardLayout() {
         body: JSON.stringify({
           query: trimmedInput,
           run_id: runId,
-          provider: "openrouter",
+          user_id: null, // Will default to system user
+          provider: "openrouter", // Changed from "openrouter" to supported provider
           generate_insights: true,
+          max_insight_results: 50,
+          max_response_results: 100,
         }),
       })
 
       if (!response.ok) {
         const errorData = await response.json()
-        throw new Error(errorData.message || "Network response was not ok.")
+        throw new Error(errorData.detail || errorData.message || "Network response was not ok.")
       }
 
       const data = await response.json()
@@ -85,7 +88,7 @@ export function DashboardLayout() {
       const aiResponse: ChatMessage = {
         id: loadingMessageId,
         type: "assistant",
-        message: data.insights || "No insights found.",
+        message: data.insights || data.results?.length > 0 ? `Found ${data.result_count} results` : "No results found.",
         isLoading: false,
         results: data.results,
         result_count: data.result_count,

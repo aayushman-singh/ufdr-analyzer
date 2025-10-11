@@ -1,5 +1,5 @@
 "use client"
-import { useState } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { FileUpload } from "@/components/ui/file-upload"
 import { FileTree } from "@/components/ui/file-tree"
 import { HierarchicalTree } from "@/components/ui/heirarchial-tree"
@@ -151,35 +151,128 @@ const ufdrStructure = [
 ]
 
 export default function UploadPage() {
-  const [files, setFiles] = useState<File[]>([])
-  const [isAnalyzing, setIsAnalyzing] = useState(false)
-  const [showStructure, setShowStructure] = useState(false)
-  const [maximizeHierarchical, setMaximizeHierarchical] = useState(false)
-  const router = useRouter()
+  const [filePath, setFilePath] = useState("");
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [showStructure, setShowStructure] = useState(false);
+  const [maximizeHierarchical, setMaximizeHierarchical] = useState(false);
+  const [fileInfo, setFileInfo] = useState<any>(null);
+  const [isValidating, setIsValidating] = useState(false);
+  const router = useRouter();
 
-  const handleFileUpload = (uploadedFiles: File[]) => {
-    setFiles(uploadedFiles)
-    console.log("Files uploaded:", uploadedFiles)
-  }
-
-  const handleStartAnalysis = () => {
-    if (files.length === 0) {
-      alert("Please upload a UFDR file first.")
-      return
+  const validateFilePath = useCallback(async (pathToValidate?: string) => {
+    const path = pathToValidate || filePath;
+    if (!path.trim()) {
+      return;
     }
 
-    setIsAnalyzing(true)
-    setTimeout(() => {
-      setIsAnalyzing(false)
-      setShowStructure(true)
-    }, 3000)
-  }
+    setIsValidating(true);
+    try {
+      const response = await fetch(
+        `http://localhost:8000/ingest/validate-path?file_path=${encodeURIComponent(
+          path
+        )}`
+      );
+      const data = await response.json();
+
+      if (data.valid) {
+        setFileInfo(data);
+      } else {
+        alert(`Invalid file path: ${data.error}`);
+        setFileInfo(null);
+      }
+    } catch (error) {
+      console.error("Validation failed:", error);
+      setFileInfo(null);
+      // Don't show alert for network errors, just log them
+      if (error instanceof TypeError && error.message.includes('fetch')) {
+        console.log("Backend server not running - validation skipped");
+      } else {
+        alert(
+          "Failed to validate file path. Please check the server connection."
+        );
+      }
+    } finally {
+      setIsValidating(false);
+    }
+  }, [filePath]);
+
+  // Auto-validate file path when it changes
+  useEffect(() => {
+    if (filePath.trim()) {
+      const timeoutId = setTimeout(() => {
+        validateFilePath();
+      }, 1000);
+      return () => clearTimeout(timeoutId);
+    }
+  }, [filePath, validateFilePath]);
+
+  const handleFilePathChange = (path: string) => {
+    setFilePath(path);
+    setFileInfo(null);
+  };
+
+  const handleSelectFile = async () => {
+    if (window.electronAPI) {
+      const selectedPath = await window.electronAPI.selectFile();
+      if (selectedPath) {
+        setFilePath(selectedPath);
+        setFileInfo(null);
+        // Automatically validate the selected file
+        await validateFilePath(selectedPath);
+      }
+    } else {
+      alert("File selection is only available in the Electron app");
+    }
+  };
+
+  const handleStartAnalysis = async () => {
+    if (!filePath.trim()) {
+      alert("Please enter a file path first.");
+      return;
+    }
+
+    // If validation failed due to network issues, allow proceeding anyway
+    if (fileInfo && !fileInfo.valid) {
+      alert("Please fix the file path before proceeding.");
+      return;
+    }
+
+    setIsAnalyzing(true);
+    try {
+      const response = await fetch("http://localhost:8000/ingest/", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          file_path: filePath,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.detail || "Processing failed");
+      }
+
+      const result = await response.json();
+      console.log("Processing result:", result);
+
+      // Show success and proceed to structure view
+      setShowStructure(true);
+    } catch (error: any) {
+      console.error("Processing failed:", error);
+      alert(`Processing failed: ${error.message}`);
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
 
   const handleProceedToDashboard = () => {
-    router.push("/dashboard")
-  }
+    router.push("/dashboard");
+  };
 
-return (
+  return (
     <div className="min-h-screen w-full relative bg-white">
       {/* Purple Glow Top */}
       <div
@@ -207,40 +300,90 @@ return (
             <>
               <div className="text-center mb-12">
                 <h1 className="text-4xl font-light text-gray-900 mb-4">
-                  Upload New UFDR Report
+                  Process UFDR File
                 </h1>
                 <p className="text-lg text-gray-600 font-light">
-                  Upload your forensic data file to begin AI-powered analysis
+                  Enter the server file path to begin AI-powered analysis
                 </p>
               </div>
 
-              <div className="mb-12">
-                <FileUpload
-                  onChange={handleFileUpload}
-                  accept=".ufdr"
-                  maxSize={500}
-                  className="max-w-3xl mx-auto"
-                />
-              </div>
+              <div className="mb-12 max-w-3xl mx-auto">
+                <div className="bg-white rounded-xl border border-gray-200 p-6">
+                  <div className="space-y-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">
+                        Server File Path
+                      </label>
+                      <div className="flex space-x-2">
+                        <input
+                          type="text"
+                          value={filePath}
+                          onChange={(e) => handleFilePathChange(e.target.value)}
+                          placeholder="/data/ufdr/case-001.ufdr"
+                          className="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+                        />
+                        <button
+                          onClick={handleSelectFile}
+                          className="px-4 py-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors"
+                        >
+                          Browse
+                        </button>
+                      </div>
+                      <p className="text-sm text-gray-500 mt-1">
+                        Enter the full path to your UFDR file on the server (validation happens automatically)
+                      </p>
+                    </div>
 
-              {files.length > 0 && (
-                <div className="text-center">
-                  <button
-                    onClick={handleStartAnalysis}
-                    disabled={isAnalyzing}
-                    className="bg-slate-900 text-white font-medium py-3 px-8 rounded-lg hover:bg-slate-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    {isAnalyzing ? "Starting Analysis..." : "Start Analysis"}
-                  </button>
+                    {isValidating && (
+                      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                        <div className="flex items-center space-x-2 text-blue-800">
+                          <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600"></div>
+                          <span className="font-medium">Validating file path...</span>
+                        </div>
+                      </div>
+                    )}
+
+                    {fileInfo && (
+                      <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+                        <div className="flex items-center space-x-2 text-green-800 mb-2">
+                          <div className="w-2 h-2 bg-green-500 rounded-full"></div>
+                          <span className="font-medium">File Validated</span>
+                        </div>
+                        <div className="text-sm text-green-700 space-y-1">
+                          <div>File Size: {fileInfo.file_size_gb} GB</div>
+                          <div>Path: {fileInfo.file_path}</div>
+                          <div>
+                            Readable: {fileInfo.readable ? "Yes" : "No"}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="flex justify-center">
+                      <button
+                        onClick={handleStartAnalysis}
+                        disabled={isAnalyzing || (fileInfo && !fileInfo.valid)}
+                        className="bg-slate-900 text-white font-medium py-3 px-8 rounded-lg hover:bg-slate-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {isAnalyzing ? "Processing..." : "Start Analysis"}
+                      </button>
+                    </div>
+                  </div>
                 </div>
-              )}
+              </div>
 
               {isAnalyzing && (
                 <div className="mt-8 text-center">
                   <div className="inline-flex items-center space-x-2 text-purple-600">
                     <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-purple-600"></div>
-                    <span>Processing your UFDR file...</span>
+                    <span>
+                      Processing large UFDR file... This may take several
+                      minutes.
+                    </span>
                   </div>
+                  <p className="text-sm text-gray-500 mt-2">
+                    Large files (30-150GB) require significant processing time
+                  </p>
                 </div>
               )}
             </>
@@ -257,7 +400,8 @@ return (
                   UFDR File Structure
                 </h1>
                 <p className="text-lg text-gray-600 font-light">
-                  Your forensic data has been processed and indexed. Explore the structure below.
+                  Your forensic data has been processed and indexed. Explore the
+                  structure below.
                 </p>
               </div>
 
@@ -275,40 +419,47 @@ return (
                     <FileTree data={ufdrStructure} className="max-w-full" />
                   </div>
                 )}
-{/* Full-screen Hierarchical Tree when maximized */}
-{maximizeHierarchical && (
-  <div className="fixed inset-0 bg-white z-50 flex flex-col">
-    <div className="flex justify-between items-center p-4 border-b">
-      <h3 className="text-xl font-semibold text-gray-900">Hierarchical Overview</h3>
-      <button
-        onClick={() => setMaximizeHierarchical(false)}
-        className="text-gray-500 hover:text-gray-700"
-      >
-        <Minimize2 className="w-5 h-5" />
-      </button>
-    </div>
-    <div className="flex-1 overflow-auto p-4">
-      <HierarchicalTree data={ufdrStructure} className="w-full h-full" />
-    </div>
-  </div>
-)}
+                {/* Full-screen Hierarchical Tree when maximized */}
+                {maximizeHierarchical && (
+                  <div className="fixed inset-0 bg-white z-50 flex flex-col">
+                    <div className="flex justify-between items-center p-4 border-b">
+                      <h3 className="text-xl font-semibold text-gray-900">
+                        Hierarchical Overview
+                      </h3>
+                      <button
+                        onClick={() => setMaximizeHierarchical(false)}
+                        className="text-gray-500 hover:text-gray-700"
+                      >
+                        <Minimize2 className="w-5 h-5" />
+                      </button>
+                    </div>
+                    <div className="flex-1 overflow-auto p-4">
+                      <HierarchicalTree
+                        data={ufdrStructure}
+                        className="w-full h-full"
+                      />
+                    </div>
+                  </div>
+                )}
 
                 {/* Hierarchical Tree Structure */}
-              <div className="bg-gray-50 rounded-xl p-6 relative">
-  <div className="flex justify-between items-center mb-4">
-    <h3 className="text-xl font-semibold text-gray-900 text-center flex-1">
-      Hierarchical Overview
-    </h3>
-    <button
-      onClick={() => setMaximizeHierarchical(true)}
-      className="text-gray-500 hover:text-gray-700"
-    >
-      <Maximize2 className="w-5 h-5" />
-    </button>
-  </div>
-  <HierarchicalTree data={ufdrStructure} className="max-w-full" />
-</div>
-
+                <div className="bg-gray-50 rounded-xl p-6 relative">
+                  <div className="flex justify-between items-center mb-4">
+                    <h3 className="text-xl font-semibold text-gray-900 text-center flex-1">
+                      Hierarchical Overview
+                    </h3>
+                    <button
+                      onClick={() => setMaximizeHierarchical(true)}
+                      className="text-gray-500 hover:text-gray-700"
+                    >
+                      <Maximize2 className="w-5 h-5" />
+                    </button>
+                  </div>
+                  <HierarchicalTree
+                    data={ufdrStructure}
+                    className="max-w-full"
+                  />
+                </div>
               </div>
 
               <div className="text-center space-x-4">
@@ -330,5 +481,5 @@ return (
         </main>
       </div>
     </div>
-  )
+  );
 }

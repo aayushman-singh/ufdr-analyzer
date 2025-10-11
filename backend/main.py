@@ -96,11 +96,22 @@ def get_meili_client():
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allow all origins
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allow all HTTP methods
+    allow_headers=["*"],  # Allow all headers
+    expose_headers=["*"],  # Expose all headers
 )
+
+# Additional CORS headers for maximum compatibility
+@app.middleware("http")
+async def add_cors_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
 
 # ------------------------
 # Request Logging Middleware
@@ -131,6 +142,8 @@ async def log_requests(request: Request, call_next):
                         logger.info(f"Request body: <binary data, {len(body)} bytes>")
                 else:
                     logger.info("Request body: <empty>")
+            else:
+                logger.info("Request body: <multipart form data>")
         except Exception as e:
             logger.warning(f"Could not read request body: {e}")
     
@@ -165,11 +178,22 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     for error in exc.errors():
         logger.error(f"Validation error: {error}")
     
+    # Clean up errors to ensure JSON serialization
+    clean_errors = []
+    for error in exc.errors():
+        clean_error = {
+            "type": error.get("type"),
+            "loc": error.get("loc"),
+            "msg": error.get("msg"),
+            "input": str(error.get("input", "")) if error.get("input") is not None else None
+        }
+        clean_errors.append(clean_error)
+    
     return JSONResponse(
         status_code=400,
         content={
             "detail": "There was an error parsing the body",
-            "errors": exc.errors(),
+            "errors": clean_errors,
             "request_info": {
                 "url": str(request.url),
                 "method": request.method,
@@ -197,6 +221,14 @@ app.include_router(report.router)
 app.include_router(query.router)
 app.include_router(graph_router.router)
 app.include_router(sync_router.router)
+
+# ------------------------
+# CORS Preflight Handler
+# ------------------------
+
+@app.options("/{path:path}")
+async def options_handler(path: str):
+    return {"message": "OK"}
 
 # ------------------------
 # Root endpoint
