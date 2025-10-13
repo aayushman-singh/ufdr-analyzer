@@ -66,6 +66,20 @@ class QueryExecutor:
         self.embeddings_service = EmbeddingsService()
         self.logger = logging.getLogger(__name__)
 
+    def _parse_iso_datetime(self, datetime_str: str) -> datetime:
+        """
+        Parse ISO datetime string, handling timezone indicators like 'Z'.
+        """
+        try:
+            # Remove 'Z' suffix and replace with '+00:00' for UTC
+            if datetime_str.endswith('Z'):
+                datetime_str = datetime_str[:-1] + '+00:00'
+            return datetime.fromisoformat(datetime_str)
+        except ValueError as e:
+            logger.warning(f"Failed to parse datetime '{datetime_str}': {e}")
+            # Fallback to current time if parsing fails
+            return datetime.utcnow()
+
     def execute(self, run_id: str, structured_params: Dict[str, Any]) -> Dict[str, Any]:
         """
         Execute structured query parameters against data sources.
@@ -165,9 +179,11 @@ class QueryExecutor:
         # Apply time range filters
         if filters.get("time_range"):
             if filters["time_range"].get("start"):
-                query = query.where(Message.timestamp >= datetime.fromisoformat(filters["time_range"]["start"]))
+                start_time = self._parse_iso_datetime(filters["time_range"]["start"])
+                query = query.where(Message.timestamp >= start_time)
             if filters["time_range"].get("end"):
-                query = query.where(Message.timestamp <= datetime.fromisoformat(filters["time_range"]["end"]))
+                end_time = self._parse_iso_datetime(filters["time_range"]["end"])
+                query = query.where(Message.timestamp <= end_time)
 
         messages = self.session.exec(query).all()
 
@@ -198,9 +214,11 @@ class QueryExecutor:
         # Apply time range filters
         if filters.get("time_range"):
             if filters["time_range"].get("start"):
-                query = query.where(Call.timestamp >= datetime.fromisoformat(filters["time_range"]["start"]))
+                start_time = self._parse_iso_datetime(filters["time_range"]["start"])
+                query = query.where(Call.timestamp >= start_time)
             if filters["time_range"].get("end"):
-                query = query.where(Call.timestamp <= datetime.fromisoformat(filters["time_range"]["end"]))
+                end_time = self._parse_iso_datetime(filters["time_range"]["end"])
+                query = query.where(Call.timestamp <= end_time)
 
         calls = self.session.exec(query).all()
 
@@ -561,7 +579,7 @@ class QueryExecutor:
             # Boost for recency (if timestamp available)
             if result.get("timestamp"):
                 try:
-                    ts = datetime.fromisoformat(result["timestamp"])
+                    ts = self._parse_iso_datetime(result["timestamp"])
                     days_old = (datetime.now() - ts).days
                     recency_boost = max(0, 1 - (days_old / 365))  # Decay over 1 year
                     score += recency_boost * 0.1
