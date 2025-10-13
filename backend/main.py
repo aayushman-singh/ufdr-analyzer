@@ -16,7 +16,7 @@ from pathlib import Path
 env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
-from ingest.routers import health, upload, report, query, graph_router, sync_router
+from ingest.routers import health, upload, report, query, graph_router, sync_router, aleapp_structure
 from database import create_db_and_tables, get_session
 from ingest.services.ingest_service import IngestService
 from ingest.utils.logger import get_logger
@@ -221,6 +221,7 @@ app.include_router(report.router)
 app.include_router(query.router)
 app.include_router(graph_router.router)
 app.include_router(sync_router.router)
+app.include_router(aleapp_structure.router)
 
 # ------------------------
 # CORS Preflight Handler

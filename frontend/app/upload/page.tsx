@@ -1,14 +1,152 @@
 "use client"
 import { useState, useEffect, useCallback } from "react"
-import { FileUpload } from "@/components/ui/file-upload"
 import { FileTree } from "@/components/ui/file-tree"
 import { HierarchicalTree } from "@/components/ui/heirarchial-tree"
-import { Shield, ArrowLeft, Database, Network, Clock, Maximize2,
-  Minimize2, Hash, FileText, HardDrive, Settings } from "lucide-react"
-import Link from "next/link"
+import { BackendDataDisplay } from "@/components/ui/backend-data-display"
+import { Database, Maximize2, Minimize2, FileText, HardDrive, Network, Clock, Hash, Settings } from "lucide-react"
 import { useRouter } from "next/navigation"
 import Header from "@/components/header"
 
+// Types for backend data
+interface BackendData {
+  status: string;
+  filename: string;
+  file_path: string;
+  processing_time: string;
+  ingest_result?: {
+    messages?: Array<{content?: string; [key: string]: unknown}>;
+    contacts?: Array<{name?: string; [key: string]: unknown}>;
+    calls?: Array<{duration?: string; [key: string]: unknown}>;
+    media?: Array<{[key: string]: unknown}>;
+    total_files?: number;
+  };
+  aleapp_processed?: boolean;
+  aleapp_report_path?: string;
+  aleapp_web_url?: string;
+}
+
+// Function to extract file structure from ALEAPP report
+const extractAleappFileStructure = async (backendData: BackendData | null) => {
+  if (!backendData?.aleapp_report_path) {
+    return null;
+  }
+
+  try {
+    // Fetch the ALEAPP report directory structure
+    const response = await fetch(`http://localhost:8000/ingest/aleapp-structure?report_path=${encodeURIComponent(backendData.aleapp_report_path)}`);
+    if (!response.ok) {
+      console.warn('Failed to fetch ALEAPP structure');
+      return null;
+    }
+    
+    const structure = await response.json();
+    return structure;
+  } catch (error) {
+    console.warn('Error fetching ALEAPP structure:', error);
+    return null;
+  }
+};
+
+// Types for ALEAPP structure
+interface AleappFile {
+  name: string;
+  path: string;
+  size: number;
+  size_formatted: string;
+  extension: string;
+}
+
+interface AleappStructure {
+  root: string;
+  directories: Array<{name: string; path: string; size: number}>;
+  files: AleappFile[];
+  total_files: number;
+  total_dirs: number;
+  categories: {
+    html_reports: AleappFile[];
+    tsv_exports: AleappFile[];
+    databases: AleappFile[];
+    timeline: AleappFile[];
+    data_extraction: AleappFile[];
+    scripts: AleappFile[];
+    other: AleappFile[];
+  };
+}
+
+// Function to transform ALEAPP structure into tree format
+const transformAleappToTree = (aleappData: AleappStructure | null) => {
+  if (!aleappData) {
+    return ufdrStructure; // Fallback to original structure
+  }
+
+  const { categories } = aleappData;
+  
+  // Create array of category definitions
+  const categoryDefinitions = [
+    {
+      id: "aleapp-reports",
+      name: "ALEAPP Analysis Reports",
+      icon: <FileText className="w-4 h-4 text-purple-500" />,
+      data: categories.html_reports,
+      limit: 10
+    },
+    {
+      id: "aleapp-exports", 
+      name: "TSV Exports",
+      icon: <Database className="w-4 h-4 text-blue-500" />,
+      data: categories.tsv_exports,
+      limit: 10
+    },
+    {
+      id: "aleapp-databases",
+      name: "Analysis Databases", 
+      icon: <HardDrive className="w-4 h-4 text-green-500" />,
+      data: categories.databases,
+      limit: null
+    },
+    {
+      id: "aleapp-timeline",
+      name: "Timeline Data",
+      icon: <Clock className="w-4 h-4 text-indigo-500" />,
+      data: categories.timeline,
+      limit: null
+    },
+    {
+      id: "aleapp-data",
+      name: "Extracted Data",
+      icon: <Settings className="w-4 h-4 text-orange-500" />,
+      data: categories.data_extraction,
+      limit: 10
+    },
+    {
+      id: "aleapp-scripts",
+      name: "Script Logs",
+      icon: <Network className="w-4 h-4 text-cyan-500" />,
+      data: categories.scripts,
+      limit: null
+    }
+  ];
+
+  // Filter out categories with no data and transform the rest
+  return categoryDefinitions
+    .filter(category => category.data && category.data.length > 0)
+    .map(category => ({
+      id: category.id,
+      name: category.name,
+      type: "folder" as const,
+      icon: category.icon,
+      count: category.data!.length,
+      children: (category.limit ? category.data!.slice(0, category.limit) : category.data!)
+        .map((file: AleappFile, index: number) => ({
+          id: `${category.id}-${index}`,
+          name: file.name,
+          type: "file" as const,
+          size: file.size_formatted
+        }))
+    }));
+};
+
+// Original hardcoded UFDR structure
 const ufdrStructure = [
   {
     id: "case-info",
@@ -148,15 +286,18 @@ const ufdrStructure = [
       { id: "findings", name: "Key-Findings.docx", type: "file" as const, size: "4.2 MB" },
     ],
   },
-]
+];
 
 export default function UploadPage() {
   const [filePath, setFilePath] = useState("");
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [showStructure, setShowStructure] = useState(false);
   const [maximizeHierarchical, setMaximizeHierarchical] = useState(false);
-  const [fileInfo, setFileInfo] = useState<any>(null);
+  const [fileInfo, setFileInfo] = useState<{valid: boolean; file_size_gb: number; file_path: string; readable: boolean} | null>(null);
   const [isValidating, setIsValidating] = useState(false);
+  const [backendData, setBackendData] = useState<BackendData | null>(null);
+  const [aleappStructure, setAleappStructure] = useState<AleappStructure | null>(null);
+  const [isLoadingStructure, setIsLoadingStructure] = useState(false);
   const router = useRouter();
 
   const validateFilePath = useCallback(async (pathToValidate?: string) => {
@@ -257,11 +398,38 @@ export default function UploadPage() {
       const result = await response.json();
       console.log("Processing result:", result);
 
+      // Store backend data
+      setBackendData(result);
+
+      // Store run_id in localStorage for chat system
+      if (result.run_id) {
+        localStorage.setItem("run_id", result.run_id);
+        console.log("Stored run_id in localStorage:", result.run_id);
+      }
+
+      // Load ALEAPP structure if available
+      if (result.aleapp_processed && result.aleapp_report_path) {
+        console.log('Loading ALEAPP structure for:', result.aleapp_report_path);
+        setIsLoadingStructure(true);
+        try {
+          const aleappStructure = await extractAleappFileStructure(result);
+          console.log('ALEAPP structure loaded:', aleappStructure);
+          setAleappStructure(aleappStructure);
+        } catch (error) {
+          console.warn('Failed to load ALEAPP structure:', error);
+        } finally {
+          setIsLoadingStructure(false);
+        }
+      } else {
+        console.log('No ALEAPP processing or report path available');
+      }
+
       // Show success and proceed to structure view
       setShowStructure(true);
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.error("Processing failed:", error);
-      alert(`Processing failed: ${error.message}`);
+      const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+      alert(`Processing failed: ${errorMessage}`);
     } finally {
       setIsAnalyzing(false);
     }
@@ -362,7 +530,7 @@ export default function UploadPage() {
                     <div className="flex justify-center">
                       <button
                         onClick={handleStartAnalysis}
-                        disabled={isAnalyzing || (fileInfo && !fileInfo.valid)}
+                        disabled={isAnalyzing || (fileInfo?.valid === false)}
                         className="bg-slate-900 text-white font-medium py-3 px-8 rounded-lg hover:bg-slate-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         {isAnalyzing ? "Processing..." : "Start Analysis"}
@@ -403,22 +571,78 @@ export default function UploadPage() {
                   Your forensic data has been processed and indexed. Explore the
                   structure below.
                 </p>
-              </div>
-
-              <div
-                className={`grid gap-8 mb-8 ${
-                  maximizeHierarchical ? "grid-cols-1" : "lg:grid-cols-2"
-                }`}
-              >
-                {/* File Tree Structure */}
-                {!maximizeHierarchical && (
-                  <div className="bg-gray-50 rounded-xl p-6">
-                    <h3 className="text-xl font-semibold text-gray-900 mb-4 text-center">
-                      Detailed File Structure
-                    </h3>
-                    <FileTree data={ufdrStructure} className="max-w-full" />
+                {backendData && (
+                  <div className="text-sm text-gray-500 mt-2">
+                    Processed {backendData.filename} in {backendData.processing_time}
                   </div>
                 )}
+              </div>
+
+              {/* Backend Data Display */}
+              {backendData && (
+                <div className="mb-8">
+                  <BackendDataDisplay data={backendData} />
+                  
+                  {/* Debug: Manual ALEAPP structure loading */}
+                  {backendData.aleapp_processed && backendData.aleapp_report_path && !aleappStructure && (
+                    <div className="mt-4 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
+                      <p className="text-sm text-yellow-800 mb-2">
+                        ALEAPP structure not loaded. Click to load manually:
+                      </p>
+                      <button
+                        onClick={async () => {
+                          console.log('Manually loading ALEAPP structure...');
+                          setIsLoadingStructure(true);
+                          try {
+                            const structure = await extractAleappFileStructure(backendData);
+                            console.log('Manual load result:', structure);
+                            setAleappStructure(structure);
+                          } catch (error) {
+                            console.error('Manual load failed:', error);
+                          } finally {
+                            setIsLoadingStructure(false);
+                          }
+                        }}
+                        className="bg-yellow-600 text-white px-3 py-1 rounded text-sm hover:bg-yellow-700"
+                      >
+                        Load ALEAPP Structure
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* File Tree Structure */}
+              {!maximizeHierarchical && (
+                <div className="bg-gray-50 rounded-xl p-6 mb-8">
+                  <h3 className="text-xl font-semibold text-gray-900 mb-4 text-center">
+                    Detailed File Structure
+                  </h3>
+                  {/* Debug info */}
+                  <div className="text-xs text-gray-500 mb-2 text-center">
+                    {aleappStructure ? `Using ALEAPP data (${aleappStructure.total_files} files)` : 'Using hardcoded data'}
+                  </div>
+                  {isLoadingStructure ? (
+                    <div className="flex items-center justify-center py-8">
+                      <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-purple-600"></div>
+                      <span className="ml-2 text-gray-600">Loading ALEAPP structure...</span>
+                    </div>
+                  ) : (
+                    <FileTree
+                      data={aleappStructure ? (() => {
+                        console.log('Using ALEAPP structure:', aleappStructure);
+                        return transformAleappToTree(aleappStructure);
+                      })() : (() => {
+                        console.log('Using hardcoded structure');
+                        return ufdrStructure;
+                      })()}
+                      className="max-w-full"
+                    />
+                  )}
+                </div>
+              )}
+
+              <div className="mb-8">
                 {/* Full-screen Hierarchical Tree when maximized */}
                 {maximizeHierarchical && (
                   <div className="fixed inset-0 bg-white z-50 flex flex-col">
@@ -435,7 +659,13 @@ export default function UploadPage() {
                     </div>
                     <div className="flex-1 overflow-auto p-4">
                       <HierarchicalTree
-                        data={ufdrStructure}
+                        data={aleappStructure ? (() => {
+                          console.log('Using ALEAPP structure (maximized):', aleappStructure);
+                          return transformAleappToTree(aleappStructure);
+                        })() : (() => {
+                          console.log('Using hardcoded structure (maximized)');
+                          return ufdrStructure;
+                        })()}
                         className="w-full h-full"
                       />
                     </div>
@@ -443,7 +673,7 @@ export default function UploadPage() {
                 )}
 
                 {/* Hierarchical Tree Structure */}
-                <div className="bg-gray-50 rounded-xl p-6 relative">
+                <div className="bg-gray-50 rounded-xl p-6 relative mb-8">
                   <div className="flex justify-between items-center mb-4">
                     <h3 className="text-xl font-semibold text-gray-900 text-center flex-1">
                       Hierarchical Overview
@@ -456,29 +686,35 @@ export default function UploadPage() {
                     </button>
                   </div>
                   <HierarchicalTree
-                    data={ufdrStructure}
-                    className="max-w-full"
+                    data={aleappStructure ? (() => {
+                      console.log('Using ALEAPP structure (regular):', aleappStructure);
+                      return transformAleappToTree(aleappStructure);
+                    })() : (() => {
+                      console.log('Using hardcoded structure (regular)');
+                      return ufdrStructure;
+                    })()}
+                    className="w-full"
                   />
                 </div>
-              </div>
 
-              <div className="text-center space-x-4">
-                <button
-                  onClick={handleProceedToDashboard}
-                  className="bg-black text-white font-medium py-3 px-8 rounded-lg hover:bg-purple-700 transition-colors"
-                >
-                  Start Investigation
-                </button>
-                <button
-                  onClick={() => setShowStructure(false)}
-                  className="bg-gray-100 text-gray-700 font-medium py-3 px-8 rounded-lg hover:bg-gray-200 transition-colors"
-                >
-                  Upload Another File
-                </button>
+                <div className="text-center space-x-4">
+                  <button
+                    onClick={handleProceedToDashboard}
+                    className="bg-black text-white font-medium py-3 px-8 rounded-lg hover:bg-purple-700 transition-colors"
+                  >
+                    Start Investigation
+                  </button>
+                  <button
+                    onClick={() => setShowStructure(false)}
+                    className="bg-gray-100 text-gray-700 font-medium py-3 px-8 rounded-lg hover:bg-gray-200 transition-colors"
+                  >
+                    Upload Another File
+                  </button>
+                </div>
               </div>
             </div>
           )}
-        </main>
+          </main>
       </div>
     </div>
   );
