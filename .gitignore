@@ -64,4 +64,4 @@ ALEAPP/admin/docs/generated/
 /backend/ufdr2dir-rs/test_output
 
 # Permission marker file
-.permissions_ok
+.permissions_ok.env
