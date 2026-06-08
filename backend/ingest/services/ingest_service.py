@@ -81,7 +81,7 @@ class IngestService:
                 status="ingesting",
                 start_time=datetime.utcnow(),
                 user_id=user_id,
-                metadata=json.dumps(metadata) if metadata else None,
+                extraction_metadata=json.dumps(metadata) if metadata else None,
                 file_content_hash=file_content_hash,
                 original_file_path=original_file_path
             )
