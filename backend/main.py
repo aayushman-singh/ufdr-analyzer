@@ -16,7 +16,7 @@ from pathlib import Path
 env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
-from ingest.routers import health, upload, report, query, graph_router, sync_router, aleapp_structure, query_plan_router, audit_router, entity_router, analytics_router, cross_case_router
+from ingest.routers import health, upload, report, query, graph_router, sync_router, aleapp_structure, query_plan_router, audit_router, entity_router, analytics_router, cross_case_router, transcription_router
 from database import create_db_and_tables, get_session
 from ingest.services.ingest_service import IngestService
 from ingest.utils.logger import get_logger
@@ -219,6 +219,7 @@ app.include_router(audit_router.router)  # tamper-evident audit trail + signed P
 app.include_router(entity_router.router)  # Postgres-CTE entity graph (slim profile)
 app.include_router(analytics_router.router)  # temporal patterns / anomaly detection
 app.include_router(cross_case_router.router)  # cross-case entity linking
+app.include_router(transcription_router.router)  # voice-note transcription
 app.include_router(graph_router.router)
 app.include_router(sync_router.router)
 app.include_router(aleapp_structure.router)
