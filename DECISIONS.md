@@ -29,6 +29,21 @@ Autonomous calls made by the orchestrator. Per HANDOFF rule 1, the user is never
 - **Export re-runs the query** rather than exporting a frozen prior result — fine for the static demo case; a real system should export an immutable stored result snapshot.
 - Timestamp round-trip across DB drivers could theoretically affect chain re-hash on Postgres (verified consistent on SQLite). Would store the exact hashed ISO string in prod.
 
+## V2 — feature discovery (go big)
+
+Brainstormed candidates, scored on (a) investigator value, (b) wow-for-hire, (c) one-session feasibility (no heavy deps / external services, testable on SQLite):
+
+| Candidate | (a) | (b) | (c) | Verdict |
+|---|---|---|---|---|
+| **Temporal patterns & anomaly detection** (spikes, late-night, dropoff/cessation, bursts, new-contact emergence) + deterministic English narration | High | High | High | **SHIP #1** |
+| **Cross-case entity linking** (salted-hash identifier index → "this number appears in N other cases") | High | High | High | **SHIP #2** |
+| LLM-narrated timeline | Med | Med | High | Folded into #1 as a deterministic narrator (LLM-optional, not required) |
+| Court-grade x509 + RFC-3161 TSA export | High | Med | Med | Deferred — directly answers the codex "HMAC≠PKI" critique but RFC-3161 needs a live TSA and is less demoable than #1/#2. Documented as next step. |
+| Voice-note transcription + sentiment (faster-whisper) | Med | High | **Low** | Rejected this session — heavy ML model, needs the 395MB audio artifacts + a runtime we don't have; unverifiable here. |
+| Risk-scoring / suspicious-entity ranking | Med | Med | High | Partially subsumed by #1 (anomaly severity) + #2; not built standalone. |
+
+**Why these two:** #1 is the within-case behavioral lever ("activity with X ceased after March 4") an investigator actually reasons with; #2 is the across-case correlation ("I'd let this near a real case") that single-case tools lack. Both are deterministic, citation-backed, testable on SQLite, and demoable without an LLM key or cloud. #2's salted-hash index also keeps raw PII out of the shared index — deliberately avoiding the secret-leak class the original recon flagged.
+
 ## Blocked-on-user (carried to SESSION_SUMMARY.md)
 - **ROTATE the OpenRouter API key and Neo4j Aura password** that were present in `.env` — treat as compromised.
 - Fly.io + Vercel account/login, DNS — needed for real deploy (configs + runbook provided).
