@@ -136,6 +136,25 @@ class AuditEvent(SQLModel, table=True):
     entry_hash: str = Field(default="", index=True)  # sha256 over prev_hash + canonical fields
 
 
+class EntityIndex(SQLModel, table=True):
+    """Cross-case identifier index — PII-minimized.
+
+    One row per (run, identifier) recording only a SALTED HASH of the normalized
+    identifier (phone/email), never the raw value. This lets us answer "does this
+    number appear in other cases?" by matching hashes across runs, without
+    duplicating raw personal data into a shared index. The matching identifier is
+    always supplied by the querying case, so no other case's PII is revealed.
+    """
+    id: Optional[uuid.UUID] = Field(
+        default_factory=uuid.uuid4, primary_key=True)
+    run_id: uuid.UUID = Field(index=True)
+    identifier_hash: str = Field(index=True)  # salted sha256 of normalized identifier
+    identifier_type: str  # "phone" | "email"
+    first_seen: Optional[datetime.datetime] = Field(default=None)
+    last_seen: Optional[datetime.datetime] = Field(default=None)
+    occurrence_count: int = 0
+
+
 class Message(SQLModel, table=True):
     """Represents a message from UFDR data."""
     id: Optional[uuid.UUID] = Field(
