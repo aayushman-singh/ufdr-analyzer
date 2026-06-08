@@ -1,6 +1,10 @@
-import pytest
-from pathlib import Path
 import shutil
+from pathlib import Path
+
+import pytest
+
+# The `client` fixture imports `main`, which loads meilisearch at module level.
+pytest.importorskip("meilisearch")
 
 REPORT_DIR = Path("storage/reports")
 

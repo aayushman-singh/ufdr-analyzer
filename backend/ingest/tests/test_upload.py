@@ -1,5 +1,10 @@
 from io import BytesIO
 
+import pytest
+
+# The `client` fixture imports `main`, which loads meilisearch at module level.
+pytest.importorskip("meilisearch")
+
 
 def test_upload_ufdr(client):
     dummy_file = BytesIO(b'{"dummy": "data"}')
