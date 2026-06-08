@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "buildCommand": "next build",
+  "installCommand": "npm install",
+  "_comment_build": "next.config.ts sets `output: \"export\"`, so `next build` emits a fully static site (the same build used for the Electron bundle). Vercel serves it as static assets — there is no Next.js server/SSR/route-handler runtime in this profile.",
+  "_comment_env": "NEXT_PUBLIC_API_URL is the only required env var. It must point at the deployed Fly backend (e.g. https://ufdr-analyzer-api.fly.dev). Because it is inlined at build time (NEXT_PUBLIC_ prefix), set it in Vercel Project Settings > Environment Variables BEFORE the build, then redeploy. It cannot be changed without a rebuild.",
+  "_comment_cors": "The Access-Control-* headers in next.config.ts are ignored under `output: export`. CORS is enforced server-side by FastAPI via CORS_ALLOWED_ORIGINS, which must list this Vercel origin."
+}

@@ -1,0 +1,88 @@
+# fly.toml — FastAPI backend for the ufdr-analyzer SLIM DEMO profile.
+#
+# Slim profile = Postgres + Meilisearch + MinIO + FastAPI (this app) + Next.js (Vercel).
+# Neo4j / Celery / Redis / nginx are intentionally NOT part of this profile.
+#
+# Build: this app's image is the existing backend Dockerfile. The build context
+# must be the REPO ROOT (the Dockerfile does `COPY backend/ .`), so deploy with:
+#
+#     flyctl deploy --dockerfile docker/services/Dockerfile.backend .
+#
+# The container entrypoint is `uvicorn main:app` on port 8000 (see Dockerfile CMD).
+#
+# ---------------------------------------------------------------------------
+# SECRETS — never put these in [env]; set them out-of-band with `fly secrets set`.
+# Names below MUST match backend/config.py exactly. Placeholder values shown.
+#
+#   fly secrets set POSTGRES_PASSWORD='REPLACE_WITH_REAL'
+#   fly secrets set MEILI_MASTER_KEY='REPLACE_WITH_REAL'
+#   fly secrets set MINIO_ACCESS_KEY='REPLACE_WITH_REAL'
+#   fly secrets set MINIO_SECRET_KEY='REPLACE_WITH_REAL'
+#   fly secrets set OPENAI_API_KEY='REPLACE_WITH_ROTATED_KEY'   # omit to use DEMO stub planner
+#
+# Alternatively supply a full connection string instead of POSTGRES_* parts:
+#   fly secrets set DATABASE_URL='postgresql://user:pass@host:5432/ufdr_analyzer'
+#
+# NOTE: the previously-committed OpenRouter + Neo4j Aura creds are COMPROMISED.
+#       Rotate them before setting OPENAI_API_KEY here. See DECISIONS.md.
+# ---------------------------------------------------------------------------
+
+app = "ufdr-analyzer-api"
+primary_region = "iad"
+
+[build]
+  dockerfile = "docker/services/Dockerfile.backend"
+
+# Non-secret config only. Secrets go via `fly secrets set` (see header).
+[env]
+  HOST = "0.0.0.0"
+  PORT = "8000"
+  DEBUG = "false"
+  LOG_LEVEL = "info"
+
+  # Demo profile: disable upload, enable "Reset to sample".
+  DEMO_MODE = "1"
+
+  # Graph reads use Postgres recursive CTE in the slim profile (no Neo4j).
+  GRAPH_BACKEND = "postgres"
+
+  # Allowed credentialed-CORS origins. MUST list the deployed Vercel origin
+  # explicitly — wildcard "*" is rejected loudly by config.py.
+  CORS_ALLOWED_ORIGINS = "https://ufdr-analyzer.vercel.app"
+
+  # Postgres connection (non-secret parts). Password is a secret (above).
+  # Point these at the managed/Fly Postgres app.
+  POSTGRES_HOST = "ufdr-analyzer-db.internal"
+  POSTGRES_PORT = "5432"
+  POSTGRES_USER = "ufdr_user"
+  POSTGRES_DB = "ufdr_analyzer"
+
+  # Meilisearch (master key is a secret, above).
+  MEILI_URL = "http://ufdr-analyzer-meili.internal:7700"
+
+  # MinIO object storage (access/secret keys are secrets, above).
+  MINIO_ENDPOINT = "ufdr-analyzer-minio.internal:9000"
+  MINIO_BUCKET = "ufdr-files"
+
+  # LLM provider base + model (the API key is a secret, above).
+  OPENAI_BASE_URL = "https://openrouter.ai/api/v1"
+  LLM_MODEL = "anthropic/claude-3.5-sonnet"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    # Health route is mounted at /health/ (router prefix "/health" + path "/").
+    path = "/health/"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
