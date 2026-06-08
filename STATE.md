@@ -20,8 +20,17 @@ _Single source of truth for orchestration progress. Updated continuously._
 | E | Audit log + signed PDF export | DONE (hash-chained AuditEvent + verify + signed PDF + tests) |
 | F | Hosted demo configs + README polish | DONE (DEPLOY.md, fly.toml, vercel.json, README Mermaid). Actual deploy BLOCKED (no creds) |
 
-## Test status: 21 passing (tests/), ingest/tests collect cleanly (guarded skips)
-## Routes added: /query/plan, /query/plan/preview, /audit, /audit/verify, /audit/evidence-report, /entities/graph, /entities/neighborhood
+## Test status: 33 passing (tests/), ingest/tests collect cleanly (guarded skips)
+## Routes added (Phase 1): /query/plan, /query/plan/preview, /audit, /audit/verify, /audit/evidence-report, /entities/graph, /entities/neighborhood
+
+## V2 (go big) — shipped
+| Feature | Modules | Routes | Tests |
+|---|---|---|---|
+| Temporal patterns & anomaly detection (+ deterministic narrator) | ingest/services/analytics_service.py | GET /analytics/patterns | 6 |
+| Cross-case entity linking (salted-hash index, PII-minimized) | ingest/services/cross_case_service.py, db_setup.EntityIndex | POST /cross-case/index, GET /cross-case/links, GET /cross-case/lookup | 6 |
+- Codex review: codex/phase-v2.md (running) → apply criticisms
+- UI: /patterns + /cross-case pages (subagent, running)
+- Deferred: court-grade x509/RFC-3161 export (answers HMAC≠PKI critique) — documented in DECISIONS.md
 
 ## Deferred / blocked (see DECISIONS.md + SESSION_SUMMARY.md)
 - SSE inline-ingest endpoint (Phase B3): designed; not implemented this session (ingest path needs heavy deps + a Docker host to exercise). Celery worker gated behind `full` profile.

@@ -1,47 +1,65 @@
-"""Cross-case entity linking — "this number appears in N other cases".
+"""Cross-case identifier linking — "this number appears in N other cases".
 
 Single-case forensic tools can't answer the question investigators most want:
-*have I seen this person before?* This service builds a privacy-preserving index
-of identifiers (phone numbers, emails) across every ingested run, storing only a
-**salted hash** of each normalized identifier — never the raw value. Matching is
-then a hash join across runs, so a hit reveals only *that another case contains
-the same identifier you already hold*, not any other PII from that case.
+*have I seen this identifier before?* This service builds an occurrence index of
+identifiers (phone numbers, emails) across every ingested run, keyed by an
+**HMAC of the canonicalized identifier** — never the raw value. Linking is a
+keyed-hash equality join across runs, so a hit reveals only *that another run
+contains an identifier the querying run already holds*.
 
-Deterministic given the salt; testable on SQLite. Normalization is explicit so
-"+1 (555) 010" and "+1555010" collapse to the same hash.
+Design constraints (hardened after review):
+- The HMAC key (`CROSS_CASE_SALT`) is **required** — a public/default salt over a
+  small phone-number space is brute-forceable, so a missing key fails loudly.
+- There is intentionally **no arbitrary-identifier lookup endpoint**: that would
+  be a cross-case membership oracle. Only a run's own identifiers can be linked.
+- Output is deterministic: identifiers are surfaced in their canonical normalized
+  form (not whichever raw formatting happened to be read first), and lists sorted.
+- The hash is never returned over the API.
 """
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
 
 from sqlmodel import Session, delete, select
 
 from db_setup import Call, Contact, EntityIndex, Message
 
-# A salt prevents trivial rainbow-tabling of a small phone-number space. It is
-# config, not a credential; set CROSS_CASE_SALT to a shared secret for real
-# cross-organization linking. Default is documented and deterministic.
-_SALT = os.getenv("CROSS_CASE_SALT", "ufdr-cross-case-v1")
-
 _EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 _DIGITS_RE = re.compile(r"\d")
+_MIN_PHONE_DIGITS = 7  # below this, digit strings are not treated as phone numbers
+
+
+def _require_key() -> bytes:
+    """The HMAC key for identifier hashing. Required — no default (brute-force)."""
+    salt = os.getenv("CROSS_CASE_SALT")
+    if not salt:
+        raise RuntimeError(
+            "CROSS_CASE_SALT is not set. Cross-case linking hashes identifiers with "
+            "a keyed HMAC; a missing or default key makes phone/email hashes "
+            "brute-forceable. Set CROSS_CASE_SALT to a strong shared secret."
+        )
+    return salt.encode("utf-8")
 
 
 def normalize(identifier: str) -> tuple[str, str] | None:
-    """Return (normalized_value, type) or None if not a usable identifier."""
+    """Return (canonical_value, type) or None. Canonical phone = digits only.
+
+    Canonicalizing to digits-only collapses '+1 (555) 010-2030' and '15550102030'
+    to the same value, so they hash identically and link.
+    """
     if not identifier:
         return None
     s = identifier.strip()
     if _EMAIL_RE.fullmatch(s):
         return s.lower(), "email"
-    # Phone: keep a leading '+' and the digits; require >= 6 digits.
     digits = "".join(_DIGITS_RE.findall(s))
-    if len(digits) >= 6:
-        plus = "+" if s.lstrip().startswith("+") else ""
-        return plus + digits, "phone"
+    if len(digits) >= _MIN_PHONE_DIGITS:
+        return digits, "phone"
     return None
 
 
@@ -50,14 +68,13 @@ def hash_identifier(identifier: str) -> str | None:
     if norm is None:
         return None
     value, _type = norm
-    return hashlib.sha256((_SALT + "|" + value).encode("utf-8")).hexdigest()
+    return hmac.new(_require_key(), value.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 @dataclass
 class RunLink:
-    identifier: str            # the querying run's OWN raw identifier (already held)
+    identifier: str            # the querying run's own identifier, canonical form
     identifier_type: str
-    identifier_hash: str
     also_in_runs: list[str]    # other run ids sharing this identifier
     case_count: int            # number of distinct runs (incl. this one)
 
@@ -66,35 +83,57 @@ class CrossCaseService:
     def __init__(self, session: Session):
         self.session = session
 
-    def _identifiers_for_run(self, run_id) -> dict[str, tuple[str, str]]:
-        """hash -> (raw_example, type) for every identifier appearing in a run."""
-        out: dict[str, tuple[str, str]] = {}
-        sources: list[str] = []
-        for c in self.session.exec(select(Contact).where(Contact.run_id == run_id)).all():
-            sources.append(c.number)
-        for m in self.session.exec(select(Message).where(Message.run_id == run_id)).all():
-            sources += [m.sender, m.receiver]
-        for c in self.session.exec(select(Call).where(Call.run_id == run_id)).all():
-            sources += [c.caller, c.receiver]
-        for raw in sources:
+    def _run_exists(self, run_id) -> bool:
+        from db_setup import Run
+        return self.session.get(Run, run_id) is not None
+
+    def _occurrences(self, run_id) -> dict[str, dict]:
+        """hash -> {value, type, count, first, last} for identifiers in a run.
+
+        Deterministic: the surfaced `value` is the canonical normalized form, not
+        a raw formatting variant, so row order cannot change the output.
+        """
+        key = _require_key()
+        acc: dict[str, dict] = {}
+
+        def add(raw: str | None, ts: datetime | None):
             if not raw:
-                continue
+                return
             norm = normalize(raw)
             if norm is None:
-                continue
+                return
             value, vtype = norm
-            h = hashlib.sha256((_SALT + "|" + value).encode("utf-8")).hexdigest()
-            out.setdefault(h, (raw, vtype))
-        return out
+            h = hmac.new(key, value.encode("utf-8"), hashlib.sha256).hexdigest()
+            slot = acc.setdefault(
+                h, {"value": value, "type": vtype, "count": 0, "first": None, "last": None})
+            slot["count"] += 1
+            if ts is not None:
+                slot["first"] = ts if slot["first"] is None else min(slot["first"], ts)
+                slot["last"] = ts if slot["last"] is None else max(slot["last"], ts)
+
+        for c in self.session.exec(select(Contact).where(Contact.run_id == run_id)).all():
+            add(c.number, None)
+        for m in self.session.exec(select(Message).where(Message.run_id == run_id)).all():
+            add(m.sender, m.timestamp)
+            add(m.receiver, m.timestamp)
+        for c in self.session.exec(select(Call).where(Call.run_id == run_id)).all():
+            add(c.caller, c.timestamp)
+            add(c.receiver, c.timestamp)
+        return acc
 
     def index_run(self, run_id) -> int:
-        """(Re)build the cross-case index rows for a run. Returns row count."""
+        """(Re)build the index rows for a run. Returns row count. Fails loud on
+        a nonexistent run rather than silently indexing nothing."""
+        if not self._run_exists(run_id):
+            raise ValueError(f"run {run_id} does not exist")
         self.session.exec(delete(EntityIndex).where(EntityIndex.run_id == run_id))
-        idents = self._identifiers_for_run(run_id)
+        occ = self._occurrences(run_id)
         rows = [
-            EntityIndex(run_id=run_id, identifier_hash=h, identifier_type=vtype,
-                        occurrence_count=1)
-            for h, (_raw, vtype) in idents.items()
+            EntityIndex(
+                run_id=run_id, identifier_hash=h, identifier_type=d["type"],
+                first_seen=d["first"], last_seen=d["last"], occurrence_count=d["count"],
+            )
+            for h, d in occ.items()
         ]
         self.session.add_all(rows)
         self.session.commit()
@@ -102,40 +141,25 @@ class CrossCaseService:
 
     def links_for_run(self, run_id) -> list[RunLink]:
         """Identifiers in this run that also appear in other indexed runs."""
-        idents = self._identifiers_for_run(run_id)
-        if not idents:
+        if not self._run_exists(run_id):
+            raise ValueError(f"run {run_id} does not exist")
+        occ = self._occurrences(run_id)
+        if not occ:
             return []
-        hashes = list(idents)
         rows = self.session.exec(
-            select(EntityIndex).where(EntityIndex.identifier_hash.in_(hashes))
+            select(EntityIndex).where(EntityIndex.identifier_hash.in_(list(occ)))
         ).all()
         by_hash: dict[str, set] = {}
         for r in rows:
             by_hash.setdefault(r.identifier_hash, set()).add(str(r.run_id))
 
         links: list[RunLink] = []
-        for h, (raw, vtype) in sorted(idents.items(), key=lambda kv: kv[1][0]):
+        for h, d in sorted(occ.items(), key=lambda kv: kv[1]["value"]):
             run_set = by_hash.get(h, set())
             others = sorted(run_set - {str(run_id)})
             if others:  # only surface genuine cross-case hits
                 links.append(RunLink(
-                    identifier=raw, identifier_type=vtype, identifier_hash=h,
+                    identifier=d["value"], identifier_type=d["type"],
                     also_in_runs=others, case_count=len(run_set | {str(run_id)}),
                 ))
         return links
-
-    def lookup(self, identifier: str) -> dict:
-        """Which runs contain this identifier (by salted hash)?"""
-        h = hash_identifier(identifier)
-        if h is None:
-            return {"identifier": identifier, "normalized": None, "runs": [], "count": 0}
-        rows = self.session.exec(
-            select(EntityIndex).where(EntityIndex.identifier_hash == h)
-        ).all()
-        runs = sorted({str(r.run_id) for r in rows})
-        return {
-            "identifier": identifier,
-            "identifier_hash": h,
-            "runs": runs,
-            "count": len(runs),
-        }
