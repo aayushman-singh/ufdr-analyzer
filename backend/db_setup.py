@@ -5,7 +5,7 @@ import json
 from typing import List, Optional
 
 from sqlmodel import Field, SQLModel, Relationship, create_engine, Session
-from sqlalchemy import Column, TEXT
+from sqlalchemy import Column, TEXT, UniqueConstraint
 # Vector extension will be handled at runtime
 VECTOR_AVAILABLE = False
 Vector = None
@@ -145,10 +145,13 @@ class EntityIndex(SQLModel, table=True):
     duplicating raw personal data into a shared index. The matching identifier is
     always supplied by the querying case, so no other case's PII is revealed.
     """
+    __table_args__ = (
+        UniqueConstraint("run_id", "identifier_hash", name="uq_entityindex_run_hash"),
+    )
     id: Optional[uuid.UUID] = Field(
         default_factory=uuid.uuid4, primary_key=True)
     run_id: uuid.UUID = Field(index=True)
-    identifier_hash: str = Field(index=True)  # salted sha256 of normalized identifier
+    identifier_hash: str = Field(index=True)  # HMAC of the canonical identifier
     identifier_type: str  # "phone" | "email"
     first_seen: Optional[datetime.datetime] = Field(default=None)
     last_seen: Optional[datetime.datetime] = Field(default=None)

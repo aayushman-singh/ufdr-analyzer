@@ -9,13 +9,14 @@ import pytest
 BACKEND = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND))
 os.environ.setdefault("DATABASE_URL", "sqlite://")
+os.environ.setdefault("CROSS_CASE_SALT", "test-cross-case-key")  # HMAC key is required
 
 from sqlmodel import Session, SQLModel, create_engine  # noqa: E402
 
 import db_setup  # noqa: E402,F401
 from db_setup import Call, Contact, EntityIndex, Message, Run, User  # noqa: E402
 from ingest.services.cross_case_service import (  # noqa: E402
-    CrossCaseService, hash_identifier, normalize,
+    CrossCaseService, _require_key, hash_identifier, normalize,
 )
 
 
@@ -41,14 +42,22 @@ def user(session):
 
 
 def test_normalize_phone_and_email():
-    assert normalize("+1 (555) 010-2030") == ("+15550102030", "phone")
+    # Canonical phone = digits only, so '+' and formatting collapse.
+    assert normalize("+1 (555) 010-2030") == ("15550102030", "phone")
+    assert normalize("15550102030") == ("15550102030", "phone")
     assert normalize("Foo@Bar.com") == ("foo@bar.com", "email")
     assert normalize("hi") is None  # not an identifier
 
 
 def test_same_number_different_formatting_same_hash():
-    assert hash_identifier("+1 555 010 2030") == hash_identifier("+15550102030")
+    assert hash_identifier("+1 555 010 2030") == hash_identifier("15550102030")
     assert hash_identifier("a@b.com") != hash_identifier("c@b.com")
+
+
+def test_missing_salt_fails_loud(monkeypatch):
+    monkeypatch.delenv("CROSS_CASE_SALT", raising=False)
+    with pytest.raises(RuntimeError, match="CROSS_CASE_SALT"):
+        _require_key()
 
 
 def test_index_only_stores_hashes_not_raw(session, user):
@@ -78,25 +87,36 @@ def test_links_across_two_cases(session, user):
     svc.index_run(run_b)
 
     links = svc.links_for_run(run_a)
-    shared_link = [l for l in links if l.identifier == shared]
+    # identifier is surfaced in canonical (digits-only) form
+    shared_link = [l for l in links if l.identifier == "15550102030"]
     assert shared_link, "shared number should link across cases"
     assert str(run_b) in shared_link[0].also_in_runs
     assert shared_link[0].case_count == 2
 
 
-def test_lookup_returns_all_runs(session, user):
-    run_a = _mk_run(session, user)
-    run_b = _mk_run(session, user)
-    num = "+447700900111"
+def test_nonexistent_run_fails_loud(session):
+    import uuid as _uuid
+    with pytest.raises(ValueError, match="does not exist"):
+        CrossCaseService(session).index_run(_uuid.uuid4())
+
+
+def test_metadata_is_computed(session, user):
+    run_id = _mk_run(session, user)
     base = datetime(2024, 1, 1)
-    for rid in (run_a, run_b):
-        session.add(Contact(run_id=rid, name="X", number=num))
+    session.add(Message(run_id=run_id, sender="+15550102030", receiver="+15550000001",
+                        timestamp=base, content="a"))
+    session.add(Call(run_id=run_id, caller="+15550102030", receiver="+15550000002",
+                    timestamp=datetime(2024, 1, 5), duration=9))
     session.commit()
     svc = CrossCaseService(session)
-    svc.index_run(run_a); svc.index_run(run_b)
-    out = svc.lookup("+44 7700 900111")
-    assert out["count"] == 2
-    assert set(out["runs"]) == {str(run_a), str(run_b)}
+    svc.index_run(run_id)
+    row = session.exec(
+        __import__("sqlmodel").select(EntityIndex).where(
+            EntityIndex.identifier_hash == hash_identifier("15550102030"))
+    ).first()
+    assert row.occurrence_count == 2          # appears in the message and the call
+    assert row.first_seen == base
+    assert row.last_seen == datetime(2024, 1, 5)
 
 
 def test_reindex_is_idempotent(session, user):

@@ -16,7 +16,7 @@ from __future__ import annotations
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from sqlmodel import Session, select
 
@@ -35,6 +35,16 @@ _DROP_RATIO = 0.6         # >= 60% relative drop after a change-point
 _BURST_MIN_DAYS = 3       # consecutive above-mean days to be a "burst"
 _EMERGENCE_MIN_EVENTS = 8 # new contact must reach this volume to be notable
 _MAX_CITATIONS = 25
+_DROP_MIN_BASELINE = 2.0  # before-window must average >= this/day to be a real drop
+
+
+def _to_utc_naive(ts: datetime | None) -> datetime | None:
+    """Normalize a timestamp to naive-UTC; None stays None."""
+    if ts is None:
+        return None
+    if ts.tzinfo is not None:
+        return ts.astimezone(timezone.utc).replace(tzinfo=None)
+    return ts
 
 
 @dataclass
@@ -72,6 +82,7 @@ class PatternReport:
     daily_series: list[dict]
     findings: list[Finding]
     narrative: str
+    excluded_events: int = 0  # rows skipped for missing timestamps (surfaced, not hidden)
 
     def to_dict(self) -> dict:
         return {
@@ -79,6 +90,7 @@ class PatternReport:
             "span_start": self.span_start,
             "span_end": self.span_end,
             "total_events": self.total_events,
+            "excluded_events": self.excluded_events,
             "daily_series": self.daily_series,
             "findings": [
                 {
@@ -96,22 +108,43 @@ class AnalyticsService:
     def __init__(self, session: Session):
         self.session = session
 
-    def _load_events(self, run_id) -> list[_Event]:
+    def _load_events(self, run_id) -> tuple[list[_Event], int]:
+        """Return (events, excluded_count). Rows with no timestamp are excluded
+        and counted (surfaced to the caller) — never silently dropped.
+
+        Timestamps are normalized to naive-UTC so bucketing, late-night hours,
+        and sorting are consistent regardless of stored tz-awareness.
+        """
         events: list[_Event] = []
+        excluded = 0
         for m in self.session.exec(select(Message).where(Message.run_id == run_id)).all():
-            if m.timestamp is not None:
-                events.append(_Event("message", str(m.id), m.timestamp, m.sender, m.receiver))
+            ts = _to_utc_naive(m.timestamp)
+            if ts is None:
+                excluded += 1
+                continue
+            events.append(_Event("message", str(m.id), ts, m.sender, m.receiver))
         for c in self.session.exec(select(Call).where(Call.run_id == run_id)).all():
-            if c.timestamp is not None:
-                events.append(_Event("call", str(c.id), c.timestamp, c.caller, c.receiver))
+            ts = _to_utc_naive(c.timestamp)
+            if ts is None:
+                excluded += 1
+                continue
+            events.append(_Event("call", str(c.id), ts, c.caller, c.receiver))
         events.sort(key=lambda e: (e.ts, e.kind, e.id))
-        return events
+        return events, excluded
 
     def analyze(self, run_id) -> PatternReport:
-        events = self._load_events(run_id)
+        # Distinguish "run has no activity" from "run does not exist" — the
+        # latter is a caller error, not an empty-but-valid result.
+        from db_setup import Run
+        if self.session.get(Run, run_id) is None:
+            raise ValueError(f"run {run_id} does not exist")
+
+        events, excluded = self._load_events(run_id)
         if not events:
-            return PatternReport(str(run_id), None, None, 0, [], [],
-                                 "No communication activity was found for this run.")
+            note = "No communication activity was found for this run."
+            if excluded:
+                note += f" ({excluded} event(s) were excluded for missing timestamps.)"
+            return PatternReport(str(run_id), None, None, 0, [], [], note, excluded)
 
         by_day: dict[date, list[_Event]] = defaultdict(list)
         for e in events:
@@ -123,7 +156,7 @@ class AnalyticsService:
         findings: list[Finding] = []
         findings += self._spikes(by_day, series)
         findings += self._late_night(events)
-        findings += self._cessation(events, span_end)
+        findings += self._cessation(events)
         findings += self._drop(series, by_day)
         findings += self._bursts(series, by_day)
         findings += self._new_contacts(events, span_start)
@@ -141,6 +174,7 @@ class AnalyticsService:
                            "total": mc[0] + mc[1]} for d, mc in series],
             findings=findings,
             narrative=narrate(findings, span_start, span_end, len(events)),
+            excluded_events=excluded,
         )
 
     # -- detectors ---------------------------------------------------------
@@ -159,14 +193,17 @@ class AnalyticsService:
         totals = [m + c for _, (m, c) in series]
         if len(totals) < 3:
             return []
-        mean = statistics.fmean(totals)
-        std = statistics.pstdev(totals)
-        if std == 0:
-            return []
         out: list[Finding] = []
-        for d, (m, c) in series:
+        for idx, (d, (m, c)) in enumerate(series):
             vol = m + c
             if vol < _SPIKE_MIN_EVENTS:
+                continue
+            # Leave-one-out baseline: exclude the candidate day so a single huge
+            # day cannot inflate its own mean/std and mask itself.
+            baseline = totals[:idx] + totals[idx + 1:]
+            mean = statistics.fmean(baseline)
+            std = statistics.pstdev(baseline)
+            if std == 0:
                 continue
             z = (vol - mean) / std
             if z >= _SPIKE_Z:
@@ -204,32 +241,37 @@ class AnalyticsService:
             citations=[Citation(e.kind, e.id) for e in late[:_MAX_CITATIONS]],
         )]
 
-    def _cessation(self, events, span_end: date) -> list[Finding]:
-        last = events[-1].ts.date()
-        gap = (span_end - last).days
-        # span_end == last by construction, so detect cessation relative to the
-        # *bulk* end: find the last day carrying >=2 events and measure trailing gap.
+    def _cessation(self, events) -> list[Finding]:
+        # Find the single longest silence between two consecutive active days —
+        # a dormancy period bracketed by real activity. Honestly framed as a gap
+        # (the timeline resumes afterwards), not a permanent cessation.
         active_days = sorted({e.ts.date() for e in events})
         if len(active_days) < 3:
             return []
-        last_active = active_days[-1]
-        # trailing silence between the penultimate burst and the true end:
-        gap = (last_active - active_days[-2]).days
+        biggest = max(
+            ((active_days[i] - active_days[i - 1]).days, active_days[i - 1], active_days[i])
+            for i in range(1, len(active_days))
+        )
+        gap, before_day, after_day = biggest
         if gap < _CESSATION_GAP_DAYS:
             return []
+        # Cite the events that bracket the silence.
+        bracket = {before_day, after_day}
+        cites = [Citation(e.kind, e.id) for e in events
+                 if e.ts.date() in bracket][:_MAX_CITATIONS]
         return [Finding(
-            type="cessation",
+            type="dormancy",
             severity="high",
-            title=f"Communication gap of {gap} days",
-            description=(f"After {active_days[-2].isoformat()} there was no activity for "
-                         f"{gap} days until {last_active.isoformat()} — a sustained break."),
-            dates=[active_days[-2].isoformat(), last_active.isoformat()],
+            title=f"Dormancy gap of {gap} days",
+            description=(f"Activity paused for {gap} days between {before_day.isoformat()} "
+                         f"and {after_day.isoformat()}, then resumed."),
+            dates=[before_day.isoformat(), after_day.isoformat()],
             stats={"gap_days": gap},
-            citations=[],
+            citations=cites,
         )]
 
     def _drop(self, series, by_day) -> list[Finding]:
-        totals = [t for _, (m, c) in series for t in [m + c]]
+        totals = [m + c for _, (m, c) in series]
         n = len(totals)
         if n < 2 * _DROP_WINDOW:
             return []
@@ -238,7 +280,9 @@ class AnalyticsService:
         for i in range(_DROP_WINDOW, n - _DROP_WINDOW + 1):
             before = statistics.fmean(totals[i - _DROP_WINDOW:i])
             after = statistics.fmean(totals[i:i + _DROP_WINDOW])
-            if before <= 0:
+            # Require a real baseline, not one event over a week — otherwise any
+            # sparse blip becomes a fake "100% drop".
+            if before < _DROP_MIN_BASELINE:
                 continue
             drop = (before - after) / before
             if drop >= _DROP_RATIO and (best is None or drop > best[1]):
@@ -246,6 +290,11 @@ class AnalyticsService:
         if best:
             i, drop, before, after = best
             change_date = series[i][0]
+            # Cite the surviving activity in the after-window so the claim is
+            # backed by (the absence/scarcity of) real events.
+            after_days = [series[j][0] for j in range(i, min(i + _DROP_WINDOW, n))]
+            cites = [Citation(e.kind, e.id)
+                     for d in after_days for e in by_day.get(d, [])][:_MAX_CITATIONS]
             out.append(Finding(
                 type="drop",
                 severity="high" if drop >= 0.8 else "medium",
@@ -255,7 +304,7 @@ class AnalyticsService:
                 dates=[change_date.isoformat()],
                 stats={"before_mean": round(before, 2), "after_mean": round(after, 2),
                        "drop_ratio": round(drop, 3)},
-                citations=[],
+                citations=cites,
             ))
         return out
 
@@ -293,27 +342,37 @@ class AnalyticsService:
         ))
 
     def _new_contacts(self, events, span_start: date) -> list[Finding]:
+        # Group by a canonical identifier so formatting variants of the same
+        # number aren't counted as different contacts. Parties present from the
+        # start (e.g. the device owner) never qualify — emergence requires a
+        # first appearance >= 7 days into the timeline.
+        from ingest.services.cross_case_service import normalize
+
         first_seen: dict[str, date] = {}
         per_contact: dict[str, list[_Event]] = defaultdict(list)
+        display: dict[str, str] = {}
         for e in events:
             for party in (e.a, e.b):
                 if not party:
                     continue
-                per_contact[party].append(e)
-                if party not in first_seen or e.ts.date() < first_seen[party]:
-                    first_seen[party] = e.ts.date()
+                norm = normalize(party)
+                key = norm[0] if norm else party
+                display.setdefault(key, party)
+                per_contact[key].append(e)
+                if key not in first_seen or e.ts.date() < first_seen[key]:
+                    first_seen[key] = e.ts.date()
         out: list[Finding] = []
-        for party, evs in sorted(per_contact.items()):
-            emerged = first_seen[party]
-            # "New" = first appears at least a week into the timeline, then active.
+        for key, evs in sorted(per_contact.items()):
+            emerged = first_seen[key]
             if (emerged - span_start).days >= 7 and len(evs) >= _EMERGENCE_MIN_EVENTS:
+                who = display[key]
                 out.append(Finding(
                     type="new_contact",
                     severity="medium",
-                    title=f"New contact '{party}' emerged on {emerged.isoformat()}",
-                    description=(f"'{party}' first appears on {emerged.isoformat()} "
+                    title=f"New contact '{who}' emerged on {emerged.isoformat()}",
+                    description=(f"'{who}' first appears on {emerged.isoformat()} "
                                 f"({(emerged - span_start).days} days into the timeline) "
-                                f"with {len(evs)} subsequent events."),
+                                f"and accounts for {len(evs)} events thereafter."),
                     dates=[emerged.isoformat()],
                     stats={"first_seen": emerged.isoformat(), "events": len(evs)},
                     citations=[Citation(e.kind, e.id) for e in evs[:_MAX_CITATIONS]],
