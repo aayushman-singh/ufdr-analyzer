@@ -7,6 +7,7 @@
 """
 import logging
 import os
+import uuid
 from io import BytesIO
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -43,7 +44,7 @@ def verify_audit(session: Session = Depends(get_session)) -> dict:
 
 class EvidenceReportRequest(BaseModel):
     question: str
-    run_id: str
+    run_id: uuid.UUID  # invalid UUIDs are rejected with 422 before any DB work
     context: dict | None = None
 
 
@@ -53,11 +54,22 @@ def evidence_report(req: EvidenceReportRequest, session: Session = Depends(get_s
     if not req.question.strip():
         raise HTTPException(status_code=422, detail="question must not be empty")
 
+    # Validate signing config BEFORE doing anything that mutates the audit
+    # chain — otherwise the chain would claim an export that never produced a
+    # valid signed artifact.
+    secret_key = os.getenv("SECRET_KEY")
+    if not secret_key:
+        raise HTTPException(
+            status_code=500,
+            detail="SECRET_KEY not configured — cannot sign the evidence export.",
+        )
+
     plan, planner = plan_question(req.question, req.context)
     answer = run_plan(session, plan, req.run_id, question=req.question, planner=planner).to_dict()
 
-    # Record the export in the tamper-evident chain BEFORE signing so the PDF can
-    # cite the resulting chain head.
+    # Record the export, committing to the content hash, then build the PDF that
+    # cites the resulting chain head. The audit head is folded into the signed
+    # payload so the chain-of-custody pointer cannot be edited post-hoc.
     from ingest.services.evidence_report import content_hash
     event = audit_service.record(
         session, "export",
@@ -65,13 +77,6 @@ def evidence_report(req: EvidenceReportRequest, session: Session = Depends(get_s
                  "total": answer["total"]},
         run_id=req.run_id,
     )
-
-    secret_key = os.getenv("SECRET_KEY")
-    if not secret_key:
-        raise HTTPException(
-            status_code=500,
-            detail="SECRET_KEY not configured — cannot sign the evidence export.",
-        )
     pdf = build_evidence_pdf(answer, secret_key, audit_head_hash=event.entry_hash)
 
     return StreamingResponse(

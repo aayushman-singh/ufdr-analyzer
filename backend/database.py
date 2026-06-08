@@ -9,9 +9,14 @@ DATABASE_URL = os.getenv(
     POSTGRES_URL
 )
 
+# SQL echo is OFF by default: this is forensic data, and SQLAlchemy's echo logs
+# statements and bound parameters (phone numbers, message text, identifiers).
+# Enable explicitly with SQL_ECHO=1 only for local debugging.
+_echo = os.getenv("SQL_ECHO", "0").lower() in ("1", "true", "yes")
+
 # Connection-pool tuning is PostgreSQL-specific. SQLite (used by the test
 # suite and CI) rejects these kwargs, so apply them only for non-sqlite URLs.
-_engine_kwargs: dict = {"echo": True}
+_engine_kwargs: dict = {"echo": _echo}
 if not DATABASE_URL.startswith("sqlite"):
     _engine_kwargs.update(
         pool_size=20,        # PostgreSQL connection pool settings for large uploads

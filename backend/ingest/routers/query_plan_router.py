@@ -6,6 +6,7 @@ audit bundle: the typed plan the LLM produced, the exact SQL that ran, and every
 result row annotated with the evidence span that explains its match.
 """
 import logging
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -22,7 +23,7 @@ router = APIRouter(prefix="/query", tags=["Query Plan (auditable)"])
 
 class PlanQueryRequest(BaseModel):
     question: str
-    run_id: str
+    run_id: uuid.UUID  # invalid UUIDs are rejected with 422 before any DB work
     context: dict | None = None
 
 
@@ -39,14 +40,23 @@ def plan_and_run(req: PlanQueryRequest, session: Session = Depends(get_session))
     # 2+3. Compile to SQL + execute with citation hydration.
     answer = run_plan(session, plan, req.run_id, question=req.question, planner=planner)
 
-    # 4. Record the query in the tamper-evident audit trail.
+    # 4. Record the query in the tamper-evident audit trail. The payload
+    # captures the evidence-bearing artifacts — the typed plan, the compiled
+    # SQL, and the result row ids — so the chain can prove what actually ran.
+    result = answer.to_dict()
     audit_service.record(
         session, "query",
-        payload={"question": req.question, "planner": planner,
-                 "total": answer.total, "targets": [t.value for t in plan.targets]},
+        payload={
+            "question": req.question,
+            "planner": planner,
+            "plan": result["plan"],
+            "sql": result["sql"],
+            "total": answer.total,
+            "row_ids": [r["row_id"] for r in result["rows"]],
+        },
         run_id=req.run_id,
     )
-    return answer.to_dict()
+    return result
 
 
 @router.post("/plan/preview")
