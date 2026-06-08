@@ -116,6 +116,26 @@ class Backup(SQLModel, table=True):
     user: User = Relationship(back_populates="backups")
 
 
+class AuditEvent(SQLModel, table=True):
+    """Tamper-evident audit trail entry (chain-of-custody).
+
+    Every query / ingest / export is recorded here. Each row carries the hash
+    of the previous row, forming an append-only hash chain: altering or deleting
+    any past event breaks every subsequent `entry_hash`, so tampering is
+    detectable by recomputing the chain (`AuditService.verify_chain`).
+    """
+    id: Optional[uuid.UUID] = Field(
+        default_factory=uuid.uuid4, primary_key=True)
+    seq: Optional[int] = Field(default=None, primary_key=False, index=True)  # monotonic order
+    event_type: str = Field(index=True)  # "query" | "ingest" | "export"
+    run_id: Optional[uuid.UUID] = Field(default=None, index=True)
+    user_id: Optional[uuid.UUID] = Field(default=None, index=True)
+    timestamp: datetime.datetime = Field(default_factory=datetime.datetime.utcnow, index=True)
+    payload: Optional[str] = Field(default=None, sa_column=Column(TEXT))  # canonical JSON
+    prev_hash: str = Field(default="")          # entry_hash of the previous event ("" for genesis)
+    entry_hash: str = Field(default="", index=True)  # sha256 over prev_hash + canonical fields
+
+
 class Message(SQLModel, table=True):
     """Represents a message from UFDR data."""
     id: Optional[uuid.UUID] = Field(
