@@ -16,7 +16,7 @@ from pathlib import Path
 env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
-from ingest.routers import health, upload, report, query, graph_router, sync_router, aleapp_structure
+from ingest.routers import health, upload, report, query, graph_router, sync_router, aleapp_structure, query_plan_router, audit_router
 from database import create_db_and_tables, get_session
 from ingest.services.ingest_service import IngestService
 from ingest.utils.logger import get_logger
@@ -214,6 +214,8 @@ app.include_router(health.router)
 app.include_router(upload.router)
 app.include_router(report.router)
 app.include_router(query.router)
+app.include_router(query_plan_router.router)  # auditable NL -> IR -> cited results
+app.include_router(audit_router.router)  # tamper-evident audit trail + signed PDF
 app.include_router(graph_router.router)
 app.include_router(sync_router.router)
 app.include_router(aleapp_structure.router)
