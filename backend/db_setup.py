@@ -107,8 +107,7 @@ class Backup(SQLModel, table=True):
     id: Optional[uuid.UUID] = Field(
         default_factory=uuid.uuid4, primary_key=True)
     user_id: uuid.UUID = Field(foreign_key="user.id")
-    event_type: str  # e.g., "database_snapshot", "user_login",
-    "security_event"
+    event_type: str  # e.g. "database_snapshot", "user_login", "security_event"
     timestamp: datetime.datetime = Field(default_factory=datetime.datetime.now)
     description: str
     snapshot_path: Optional[str] = None  # Path to the actual snapshot file

@@ -65,3 +65,17 @@ ALEAPP/admin/docs/generated/
 
 # Permission marker file
 .permissions_ok.env
+
+# Secrets — never commit real env files (.env held live API keys, see DECISIONS.md)
+.env
+.env.*
+!.env.example
+!env.example
+
+# Committed SQLite DBs are not schema truth (db_setup.py is) — keep them out
+*.db
+backend/ufdr_analyzer.db
+backend/ingest/database.db
+
+# Orchestration scratch
+orchestrator.log

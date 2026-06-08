@@ -94,24 +94,19 @@ def get_meili_client():
 # ------------------------
 
 
+# Credentialed CORS requires an explicit origin allow-list — the wildcard
+# "*" + allow_credentials=True combo is rejected by the Fetch spec and was a
+# real bug here. Origins come from config (CORS_ALLOWED_ORIGINS env var).
+from config import CORS_ALLOWED_ORIGINS  # noqa: E402
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=CORS_ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all HTTP methods
-    allow_headers=["*"],  # Allow all headers
-    expose_headers=["*"],  # Expose all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
 )
-
-# Additional CORS headers for maximum compatibility
-@app.middleware("http")
-async def add_cors_headers(request, call_next):
-    response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    response.headers["Access-Control-Allow-Credentials"] = "true"
-    return response
 
 # ------------------------
 # Request Logging Middleware
