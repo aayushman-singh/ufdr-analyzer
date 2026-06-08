@@ -210,7 +210,12 @@ def compile_plan(plan: QueryPlan) -> CompiledQuery:
         else:
             select_cols.append("NULL AS event_time")
 
-        sql = f"SELECT {', '.join(select_cols)}\nFROM {schema.table}\nWHERE " + "\n  AND ".join(where)
+        # Quote the table identifier: `call` and `user` are SQL reserved words
+        # on PostgreSQL. Double quotes are portable to SQLite too.
+        sql = (
+            f"SELECT {', '.join(select_cols)}\nFROM \"{schema.table}\"\nWHERE "
+            + "\n  AND ".join(where)
+        )
 
         # Ordering + limit ------------------------------------------------
         if plan.sort.by_time and schema.time_column:

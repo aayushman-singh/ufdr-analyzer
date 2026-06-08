@@ -24,32 +24,48 @@ from reportlab.platypus import (
 )
 
 
-def _canonical_content(answer: dict) -> str:
-    """Stable serialization of the logical answer — the thing we hash/sign."""
+def _canonical_content(answer: dict, audit_head_hash: Optional[str] = None) -> str:
+    """Stable serialization of the logical answer — the thing we hash/sign.
+
+    Every field rendered in the report that matters for custody is included,
+    so nothing printed in the PDF is left unauthenticated.
+    """
     core = {
         "question": answer.get("question", ""),
+        "planner": answer.get("planner", ""),
         "plan": answer.get("plan", {}),
         "sql": answer.get("sql", ""),
+        "total": answer.get("total", 0),
         "rows": answer.get("rows", []),
+        "audit_head_hash": audit_head_hash or "",
     }
     return json.dumps(core, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def content_hash(answer: dict) -> str:
-    return hashlib.sha256(_canonical_content(answer).encode("utf-8")).hexdigest()
+def content_hash(answer: dict, audit_head_hash: Optional[str] = None) -> str:
+    return hashlib.sha256(
+        _canonical_content(answer, audit_head_hash).encode("utf-8")
+    ).hexdigest()
 
 
-def sign(answer: dict, secret_key: str) -> str:
-    digest = content_hash(answer)
+def sign(answer: dict, secret_key: str, audit_head_hash: Optional[str] = None) -> str:
+    digest = content_hash(answer, audit_head_hash)
     return hmac.new(secret_key.encode("utf-8"), digest.encode("utf-8"),
                     hashlib.sha256).hexdigest()
 
 
 def build_evidence_pdf(answer: dict, secret_key: str,
                        audit_head_hash: Optional[str] = None) -> bytes:
-    """Render the signed evidence PDF and return its bytes."""
-    chash = content_hash(answer)
-    signature = sign(answer, secret_key)
+    """Render the signed evidence PDF and return its bytes.
+
+    The HMAC here is a keyed integrity signature using the server SECRET_KEY —
+    it proves the report was produced by this server and has not been altered.
+    It is intentionally NOT a public-key/PKI digital signature (no third-party
+    verifiability); that is a documented limitation, not a substitute for X.509
+    signing in a true chain-of-custody deployment.
+    """
+    chash = content_hash(answer, audit_head_hash)
+    signature = sign(answer, secret_key, audit_head_hash)
 
     buf = BytesIO()
     doc = SimpleDocTemplate(

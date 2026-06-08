@@ -14,11 +14,19 @@ _Single source of truth for orchestration progress. Updated continuously._
 | Phase | Title | Status |
 |-------|-------|--------|
 | A | Boot compose stack (creds, CORS, Dockerfile, schema drift, gitignore) | DONE (boot unverifiable — no docker) |
-| B | Slim demo profile (drop Neo4j/Celery, CTE graph, SSE ingest) | pending |
-| C | Tests + CI | in progress (Phase D suite green: 10/10) |
-| D | NL → IR → cited-results pipeline (headline) | core DONE (IR+compiler+executor+planner+tests); route/UI pending |
-| E | Audit log + signed PDF export | pending |
-| F | Hosted demo configs + README polish | pending |
+| B | Slim demo profile (drop Neo4j/Celery, CTE graph) | DONE (compose + entity CTE + tests). SSE inline-ingest: deferred (documented) |
+| C | Tests + CI | DONE (21 backend tests green; CI workflow; ingest imports fixed) |
+| D | NL → IR → cited-results pipeline (headline) | DONE (IR+compiler+executor+planner+route+tests). UI page added (subagent) |
+| E | Audit log + signed PDF export | DONE (hash-chained AuditEvent + verify + signed PDF + tests) |
+| F | Hosted demo configs + README polish | DONE (DEPLOY.md, fly.toml, vercel.json, README Mermaid). Actual deploy BLOCKED (no creds) |
+
+## Test status: 21 passing (tests/), ingest/tests collect cleanly (guarded skips)
+## Routes added: /query/plan, /query/plan/preview, /audit, /audit/verify, /audit/evidence-report, /entities/graph, /entities/neighborhood
+
+## Deferred / blocked (see DECISIONS.md + SESSION_SUMMARY.md)
+- SSE inline-ingest endpoint (Phase B3): designed; not implemented this session (ingest path needs heavy deps + a Docker host to exercise). Celery worker gated behind `full` profile.
+- Hosted deploy (Phase F1-3): needs Fly/Vercel creds — runbook ready.
+- SECRET INCIDENT: live OpenRouter key + Neo4j Aura pw were committed to git history (commits d76f478, 357bd36). MUST rotate + purge history.
 
 ## Phase A checklist
 - [x] A1 Strip hardcoded creds from `backend/config.py`; fill `env.example`; `.env` gitignored

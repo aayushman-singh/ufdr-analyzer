@@ -76,7 +76,12 @@ class AuditService:
         run_id: Optional[uuid.UUID | str] = None,
         user_id: Optional[uuid.UUID | str] = None,
     ) -> AuditEvent:
-        """Append an event, linking it to the current chain head."""
+        """Append an event, linking it to the current chain head.
+
+        Note: this commits the caller's session so the event is durable before
+        any signed artifact references it. Pass a session whose only pending
+        work is meant to be persisted alongside the audit event.
+        """
         head = session.exec(
             select(AuditEvent).order_by(AuditEvent.seq.desc())
         ).first()

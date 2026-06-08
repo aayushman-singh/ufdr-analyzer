@@ -17,12 +17,14 @@ from sqlmodel import Session
 
 # Undirected participant edges from both messages and calls, aggregated with a
 # weight = interaction count. Built once and reused by both queries below.
+# `message`/`call` are quoted — `call` and `user` are SQL reserved words on
+# PostgreSQL. The deterministic ORDER BY makes the edge list reproducible.
 _EDGES_CTE = """
 WITH pair AS (
-    SELECT sender AS a, receiver AS b FROM message
+    SELECT sender AS a, receiver AS b FROM "message"
         WHERE run_id = :run_id AND sender IS NOT NULL AND receiver IS NOT NULL
     UNION ALL
-    SELECT caller AS a, receiver AS b FROM call
+    SELECT caller AS a, receiver AS b FROM "call"
         WHERE run_id = :run_id AND caller IS NOT NULL AND receiver IS NOT NULL
 ),
 norm AS (  -- canonicalize direction so a-b and b-a collapse
@@ -30,15 +32,16 @@ norm AS (  -- canonicalize direction so a-b and b-a collapse
            CASE WHEN a <= b THEN b ELSE a END AS hi
     FROM pair
 )
-SELECT lo, hi, COUNT(*) AS weight FROM norm GROUP BY lo, hi
+SELECT lo, hi, COUNT(*) AS weight FROM norm GROUP BY lo, hi ORDER BY lo, hi
 """
 
 
 @dataclass
 class GraphNode:
     id: str
-    label: str  # contact name if known, else the raw identifier
-    degree: int
+    label: str            # contact name if known, else the raw identifier
+    degree: int           # weighted interaction count (edges incident on node)
+    hops: int | None = None  # distance from seed, set only by neighborhood()
 
 
 @dataclass
@@ -71,8 +74,10 @@ class EntityService:
         return self.session.execute(stmt, params)
 
     def _contact_labels(self, run_id) -> dict[str, str]:
+        # ORDER BY name makes label resolution deterministic when a number has
+        # multiple contact rows (last writer wins, but in a fixed order).
         rows = self._bind(
-            "SELECT number, name FROM contact WHERE run_id = :run_id",
+            'SELECT number, name FROM "contact" WHERE run_id = :run_id ORDER BY name',
             run_id=run_id,
         ).mappings()
         return {r["number"]: r["name"] for r in rows if r["number"]}
@@ -89,7 +94,7 @@ class EntityService:
             degree[hi] = degree.get(hi, 0) + w
         nodes = [
             GraphNode(id=ident, label=labels.get(ident, ident), degree=deg)
-            for ident, deg in sorted(degree.items(), key=lambda kv: -kv[1])
+            for ident, deg in sorted(degree.items(), key=lambda kv: (-kv[1], kv[0]))
         ]
         return EntityGraph(nodes=nodes, edges=edges)
 
@@ -99,16 +104,16 @@ class EntityService:
             raise ValueError("max_hops must be >= 0")
         sql = """
         WITH RECURSIVE adj(a, b) AS (
-            SELECT sender, receiver FROM message
+            SELECT sender, receiver FROM "message"
                 WHERE run_id = :run_id AND sender IS NOT NULL AND receiver IS NOT NULL
             UNION ALL
-            SELECT receiver, sender FROM message
+            SELECT receiver, sender FROM "message"
                 WHERE run_id = :run_id AND sender IS NOT NULL AND receiver IS NOT NULL
             UNION ALL
-            SELECT caller, receiver FROM call
+            SELECT caller, receiver FROM "call"
                 WHERE run_id = :run_id AND caller IS NOT NULL AND receiver IS NOT NULL
             UNION ALL
-            SELECT receiver, caller FROM call
+            SELECT receiver, caller FROM "call"
                 WHERE run_id = :run_id AND caller IS NOT NULL AND receiver IS NOT NULL
         ),
         reach(node, hops) AS (
@@ -130,12 +135,15 @@ class EntityService:
         if not reached:
             return EntityGraph(nodes=[], edges=[])
 
-        # Restrict the full graph to the reached node set.
+        # Restrict the full graph to the reached node set. `degree` keeps its
+        # meaning (weighted interaction count); `hops` carries the distance.
         full = self.build_graph(run_id)
         labels = {n.id: n.label for n in full.nodes}
+        degrees = {n.id: n.degree for n in full.nodes}
         nodes = [
-            GraphNode(id=ident, label=labels.get(ident, ident), degree=hops)
-            for ident, hops in sorted(reached.items(), key=lambda kv: kv[1])
+            GraphNode(id=ident, label=labels.get(ident, ident),
+                      degree=degrees.get(ident, 0), hops=hops)
+            for ident, hops in sorted(reached.items(), key=lambda kv: (kv[1], kv[0]))
         ]
         edges = [
             e for e in full.edges
