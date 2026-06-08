@@ -31,6 +31,57 @@ def get_audit(session: Session = Depends(get_session)) -> dict:
     return audit_service.export(session)
 
 
+@router.post("/timestamp")
+def timestamp_chain(session: Session = Depends(get_session)) -> dict:
+    """Anchor the current audit-chain head to an RFC 3161 TSA token.
+
+    The custody root (chain head hash) is sent to an external Time-Stamp
+    Authority; its token independently attests the head existed at a UTC instant.
+    On any TSA failure we record the exact reason in the chain and raise — we
+    never return an unstamped result dressed up as stamped.
+    """
+    from ingest.services.timestamp_service import (
+        DEFAULT_TSA_URL, TimestampError, request_timestamp,
+    )
+
+    head_hash = audit_service.export(session)["head_hash"]
+    tsa_url = os.getenv("TSA_URL", DEFAULT_TSA_URL)
+    try:
+        digest = bytes.fromhex(head_hash)
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=f"invalid chain head hash: {e}")
+
+    try:
+        token = request_timestamp(digest, tsa_url=tsa_url)
+    except TimestampError as e:
+        # Record the failure (exact reason) in the tamper-evident chain, then fail.
+        audit_service.record(
+            session, "timestamp_failed",
+            payload={"tsa_url": tsa_url, "head_hash": head_hash, "reason": str(e)},
+        )
+        raise HTTPException(status_code=502, detail=str(e))
+
+    event = audit_service.record(
+        session, "timestamp",
+        payload={
+            "tsa_url": token.tsa_url,
+            "head_hash": head_hash,
+            "gen_time": token.gen_time,
+            "serial_number": token.serial_number,
+            "policy": token.policy,
+            "token_b64": token.token_b64(),
+        },
+    )
+    return {
+        "stamped_head_hash": head_hash,
+        "tsa_url": token.tsa_url,
+        "gen_time": token.gen_time,
+        "serial_number": token.serial_number,
+        "policy": token.policy,
+        "audit_event_seq": event.seq,
+    }
+
+
 @router.get("/verify")
 def verify_audit(session: Session = Depends(get_session)) -> dict:
     status = audit_service.verify_chain(session)

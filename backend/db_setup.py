@@ -158,6 +158,25 @@ class EntityIndex(SQLModel, table=True):
     occurrence_count: int = 0
 
 
+class Transcript(SQLModel, table=True):
+    """Transcription of an audio media item (voice note) from a UFDR.
+
+    Audio messages are invisible to a text query layer until transcribed. Each
+    transcript links back to its source audio (`media_id`) and carries a content
+    hash so the transcription is itself auditable (an audit event records
+    audio_file_id + model + timestamp + transcript_hash).
+    """
+    id: Optional[uuid.UUID] = Field(
+        default_factory=uuid.uuid4, primary_key=True)
+    run_id: uuid.UUID = Field(index=True)
+    media_id: uuid.UUID = Field(index=True)  # the source audio Media.id
+    model: str  # e.g. "faster-whisper/base"
+    language: Optional[str] = None
+    text: str = Field(sa_column=Column(TEXT))
+    transcript_hash: str = Field(index=True)  # sha256 of the transcript text
+    created_at: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
+
+
 class Message(SQLModel, table=True):
     """Represents a message from UFDR data."""
     id: Optional[uuid.UUID] = Field(
