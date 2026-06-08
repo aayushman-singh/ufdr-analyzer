@@ -141,8 +141,14 @@ services:
     networks:
       - ufdr_network
 
-  # Background Worker
+  # Background Worker (Celery)
+  # GATED: the task module `app.workers.celery_app` referenced by
+  # Dockerfile.worker does not exist yet — ingestion currently runs inline in
+  # the API process (see docker-compose.demo.yml + the SSE ingest endpoint).
+  # This service only starts under `--profile full` so a default `up` does not
+  # crash-loop on the missing module. Implement the task module before enabling.
   worker:
+    profiles: ["full"]
     build:
       context: .
       dockerfile: docker/services/Dockerfile.worker
