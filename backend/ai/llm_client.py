@@ -19,13 +19,13 @@ class LLMClient:
     Handles query understanding and converts NL → structured parameters.
     """
 
-    def __init__(self, provider: str = "openai", model: Optional[str] = None):
+    def __init__(self, provider: str = "gemini", model: Optional[str] = None):
         """
         Initialize LLM client.
 
         Args:
-            provider: "openai", "openrouter", or "anthropic" (default is openai)
-            model: Model name (uses defaults if not specified) (default is gpt-4o-mini)
+            provider: "gemini", "openai", "openrouter", or "anthropic" (default is gemini)
+            model: Model name (uses defaults if not specified)
         """
         self.provider = provider.lower()
         self.logger = logging.getLogger(__name__)
@@ -33,10 +33,12 @@ class LLMClient:
         # Set default models
         if model:
             self.model = model
+        elif self.provider == "gemini":
+            self.model = "gemini-2.5-flash"  # Fast, cheap, good for structured output (default)
         elif self.provider == "openai":
-            self.model = "gpt-4o-mini"  # Fast, cheap, good for structured output (default is openai)
+            self.model = "gpt-4o-mini"
         elif self.provider == "openrouter":
-            self.model = "deepseek/deepseek-chat-v3.1"  # Default OpenRouter model
+            self.model = "deepseek/deepseek-chat-v3.1"
         elif self.provider == "anthropic":
             self.model = "claude-3-5-sonnet-20241022"
         else:
@@ -50,6 +52,11 @@ class LLMClient:
 
     def _get_api_key(self) -> str:
         """Fetch API key from environment."""
+        if self.provider == "gemini":
+            key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+            if not key:
+                raise ValueError("GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable not set")
+            return key
         if self.provider == "openai" or self.provider == "openrouter":
             key = os.getenv("OPENAI_API_KEY")
             if not key:
@@ -66,6 +73,10 @@ class LLMClient:
     def _initialize_client(self):
         """Initialize provider-specific SDK client."""
         try:
+            if self.provider == "gemini":
+                import google.generativeai as genai
+                genai.configure(api_key=self.api_key)
+                return genai.GenerativeModel(self.model)
             if self.provider == "openai":
                 from openai import OpenAI
                 return OpenAI(api_key=self.api_key)
@@ -80,10 +91,13 @@ class LLMClient:
                 return Anthropic(api_key=self.api_key)
         except ImportError as e:
             self.logger.error(f"Failed to import {self.provider} SDK: {e}")
-            raise ImportError(
-                f"Please install the {self.provider} SDK: "
-                f"pip install {'openai' if self.provider in ['openai', 'openrouter'] else 'anthropic'}"
-            )
+            install_pkg = {
+                "gemini": "google-generativeai",
+                "openai": "openai",
+                "openrouter": "openai",
+                "anthropic": "anthropic",
+            }.get(self.provider, self.provider)
+            raise ImportError(f"Please install the {self.provider} SDK: pip install {install_pkg}")
 
     def parse_query(self, query: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
@@ -100,6 +114,8 @@ class LLMClient:
         user_message = self._build_user_message(query)
 
         try:
+            if self.provider == "gemini":
+                return self._query_gemini(system_prompt, user_message)
             if self.provider == "openai" or self.provider == "openrouter":
                 return self._query_openai(system_prompt, user_message)
             elif self.provider == "anthropic":
@@ -205,6 +221,26 @@ Be conversational, intelligent, and USE ALEAPP ARTIFACTS for app queries!"""
     def _build_user_message(self, query: str) -> str:
         """Format user query message."""
         return f"Convert this query to structured search parameters:\n\n\"{query}\""
+
+    def _query_gemini(self, system_prompt: str, user_message: str) -> Dict[str, Any]:
+        """Execute query using Google Gemini API (forced JSON output)."""
+        import google.generativeai as genai  # local import; configured in _initialize_client
+        prompt = f"{system_prompt}\n\nUser query: {user_message}"
+        response = self.client.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                response_mime_type="application/json",
+                temperature=0.1,
+                max_output_tokens=1000,
+            ),
+        )
+        content = response.text
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Failed to parse Gemini JSON response: {e}")
+            self.logger.error(f"Raw response: {content}")
+            raise
 
     def _query_openai(self, system_prompt: str, user_message: str) -> Dict[str, Any]:
         """Execute query using OpenAI API with JSON mode."""
