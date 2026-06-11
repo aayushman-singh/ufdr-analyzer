@@ -217,3 +217,11 @@
     linear-gradient(to bottom, oklch(1 0 0 / 0.035) 1px, transparent 1px);
   background-size: 64px 64px;
 }
+
+/* react-d3-tree link strokes (replaces the removed `styles.links` prop in
+   heirarchial-tree.tsx). Applied via pathClassFunc. */
+.ufdr-tree-link {
+  stroke: oklch(1 0 0 / 0.085);
+  stroke-width: 2;
+  fill: none;
+}

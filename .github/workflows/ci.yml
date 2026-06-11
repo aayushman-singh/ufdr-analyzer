@@ -21,7 +21,7 @@ jobs:
           cache: pip
 
       - name: Install test dependencies
-        run: pip install pytest sqlmodel sqlalchemy fastapi pydantic reportlab httpx python-dotenv asn1crypto requests
+        run: pip install pytest sqlmodel sqlalchemy fastapi pydantic reportlab httpx python-dotenv asn1crypto requests PyJWT
 
       - name: Run query/IR test suite
         env:
