@@ -1,14 +1,21 @@
-import pytest
-from fastapi.testclient import TestClient
-from main import app
 from io import BytesIO
+
+import pytest
 
 
 @pytest.fixture
 def client():
     """
     Returns a TestClient instance for FastAPI app.
+
+    `main` pulls in the full app (meilisearch, routers, etc.). Importing it
+    lazily here keeps test *collection* from erroring when those heavy deps
+    are not installed; the test modules using this fixture skip-guard them.
     """
+    from fastapi.testclient import TestClient
+
+    from main import app
+
     return TestClient(app)
 
 

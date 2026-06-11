@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    name: Backend (pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install test dependencies
+        run: pip install pytest sqlmodel sqlalchemy fastapi pydantic reportlab httpx python-dotenv asn1crypto requests
+
+      - name: Run query/IR test suite
+        env:
+          DATABASE_URL: sqlite://
+        run: python -m pytest tests/ -q
+
+      - name: Verify ingest/tests collect (heavy deps absent -> skip, not error)
+        env:
+          DATABASE_URL: sqlite://
+        run: python -m pytest ingest/tests --collect-only -q
+
+  frontend:
+    name: Frontend (type-check)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+  rust:
+    name: Rust extractor (cargo build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend/ufdr2dir-rs
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            backend/ufdr2dir-rs/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('backend/ufdr2dir-rs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release

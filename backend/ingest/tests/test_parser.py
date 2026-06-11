@@ -1,6 +1,12 @@
 import unittest
 from pathlib import Path
-from services.parser_service import UFDRParser
+
+import pytest
+
+# parser_service imports xmltodict at module load; skip cleanly if absent.
+pytest.importorskip("xmltodict")
+
+from ingest.services.parser_service import UFDRParser
 
 
 class TestUFDRParser(unittest.TestCase):

@@ -1,0 +1,112 @@
+# Slim DEMO profile — the only stack meant to run on free-tier hosting.
+#
+# Included:  Postgres + Meilisearch + MinIO + FastAPI + Next.js
+# Excluded:  Neo4j (graph reads use Postgres recursive CTE — GRAPH_BACKEND=postgres),
+#            Celery + Redis (ingest runs inline in the API), nginx.
+#
+# Secrets come from a local `.env` (gitignored). `docker compose --env-file .env
+# -f docker-compose.demo.yml up` boots the whole demo. config.py rejects template
+# placeholder secrets, so fill `.env` from env.example first.
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: ufdr_demo_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ufdr_analyzer}
+      POSTGRES_USER: ${POSTGRES_USER:-ufdr_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - demo_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ufdr_user} -d ${POSTGRES_DB:-ufdr_analyzer}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [ufdr_demo]
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.5
+    container_name: ufdr_demo_meili
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:?set MEILI_MASTER_KEY in .env}
+      MEILI_ENV: production
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - demo_meili_data:/meili_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [ufdr_demo]
+
+  minio:
+    image: minio/minio:latest
+    container_name: ufdr_demo_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?set MINIO_ACCESS_KEY in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY in .env}
+    volumes:
+      - demo_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [ufdr_demo]
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/services/Dockerfile.backend
+    container_name: ufdr_demo_backend
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ufdr_user}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ufdr_analyzer}
+      MEILI_URL: http://meilisearch:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET:-ufdr-files}
+      # Slim profile: Postgres CTE graph, no Neo4j.
+      GRAPH_BACKEND: postgres
+      DEMO_MODE: ${DEMO_MODE:-1}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+      # LLM optional: blank key + DEMO_MODE=1 -> deterministic stub planner.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://openrouter.ai/api/v1}
+      LLM_MODEL: ${LLM_MODEL:-anthropic/claude-3.5-sonnet}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks: [ufdr_demo]
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/services/Dockerfile.frontend
+    container_name: ufdr_demo_frontend
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks: [ufdr_demo]
+
+volumes:
+  demo_postgres_data:
+  demo_meili_data:
+  demo_minio_data:
+
+networks:
+  ufdr_demo:
+    driver: bridge

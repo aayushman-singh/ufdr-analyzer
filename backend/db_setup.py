@@ -5,7 +5,7 @@ import json
 from typing import List, Optional
 
 from sqlmodel import Field, SQLModel, Relationship, create_engine, Session
-from sqlalchemy import Column, TEXT
+from sqlalchemy import Column, TEXT, UniqueConstraint
 # Vector extension will be handled at runtime
 VECTOR_AVAILABLE = False
 Vector = None
@@ -107,14 +107,74 @@ class Backup(SQLModel, table=True):
     id: Optional[uuid.UUID] = Field(
         default_factory=uuid.uuid4, primary_key=True)
     user_id: uuid.UUID = Field(foreign_key="user.id")
-    event_type: str  # e.g., "database_snapshot", "user_login",
-    "security_event"
+    event_type: str  # e.g. "database_snapshot", "user_login", "security_event"
     timestamp: datetime.datetime = Field(default_factory=datetime.datetime.now)
     description: str
     snapshot_path: Optional[str] = None  # Path to the actual snapshot file
 
     # Relationship
     user: User = Relationship(back_populates="backups")
+
+
+class AuditEvent(SQLModel, table=True):
+    """Tamper-evident audit trail entry (chain-of-custody).
+
+    Every query / ingest / export is recorded here. Each row carries the hash
+    of the previous row, forming an append-only hash chain: altering or deleting
+    any past event breaks every subsequent `entry_hash`, so tampering is
+    detectable by recomputing the chain (`AuditService.verify_chain`).
+    """
+    id: Optional[uuid.UUID] = Field(
+        default_factory=uuid.uuid4, primary_key=True)
+    seq: Optional[int] = Field(default=None, primary_key=False, index=True)  # monotonic order
+    event_type: str = Field(index=True)  # "query" | "ingest" | "export"
+    run_id: Optional[uuid.UUID] = Field(default=None, index=True)
+    user_id: Optional[uuid.UUID] = Field(default=None, index=True)
+    timestamp: datetime.datetime = Field(default_factory=datetime.datetime.utcnow, index=True)
+    payload: Optional[str] = Field(default=None, sa_column=Column(TEXT))  # canonical JSON
+    prev_hash: str = Field(default="")          # entry_hash of the previous event ("" for genesis)
+    entry_hash: str = Field(default="", index=True)  # sha256 over prev_hash + canonical fields
+
+
+class EntityIndex(SQLModel, table=True):
+    """Cross-case identifier index — PII-minimized.
+
+    One row per (run, identifier) recording only a SALTED HASH of the normalized
+    identifier (phone/email), never the raw value. This lets us answer "does this
+    number appear in other cases?" by matching hashes across runs, without
+    duplicating raw personal data into a shared index. The matching identifier is
+    always supplied by the querying case, so no other case's PII is revealed.
+    """
+    __table_args__ = (
+        UniqueConstraint("run_id", "identifier_hash", name="uq_entityindex_run_hash"),
+    )
+    id: Optional[uuid.UUID] = Field(
+        default_factory=uuid.uuid4, primary_key=True)
+    run_id: uuid.UUID = Field(index=True)
+    identifier_hash: str = Field(index=True)  # HMAC of the canonical identifier
+    identifier_type: str  # "phone" | "email"
+    first_seen: Optional[datetime.datetime] = Field(default=None)
+    last_seen: Optional[datetime.datetime] = Field(default=None)
+    occurrence_count: int = 0
+
+
+class Transcript(SQLModel, table=True):
+    """Transcription of an audio media item (voice note) from a UFDR.
+
+    Audio messages are invisible to a text query layer until transcribed. Each
+    transcript links back to its source audio (`media_id`) and carries a content
+    hash so the transcription is itself auditable (an audit event records
+    audio_file_id + model + timestamp + transcript_hash).
+    """
+    id: Optional[uuid.UUID] = Field(
+        default_factory=uuid.uuid4, primary_key=True)
+    run_id: uuid.UUID = Field(index=True)
+    media_id: uuid.UUID = Field(index=True)  # the source audio Media.id
+    model: str  # e.g. "faster-whisper/base"
+    language: Optional[str] = None
+    text: str = Field(sa_column=Column(TEXT))
+    transcript_hash: str = Field(index=True)  # sha256 of the transcript text
+    created_at: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
 
 
 class Message(SQLModel, table=True):

@@ -2,6 +2,95 @@
 
 **Project ID:** SIH25198
 
+> Demo URL: _(pending deploy — see [DEPLOY.md](DEPLOY.md))_
+>
+> ![NL→cited results](docs/demo.gif) _(screencast pending)_
+
+---
+
+## What it actually is today
+
+A FastAPI backend that ingests a UFDR (forensic device extraction) into
+PostgreSQL + Meilisearch + MinIO, plus a Next.js frontend, and a headline
+**auditable natural-language query** path: an LLM turns an investigator's question
+into a *typed query plan* (not raw SQL), the plan is deterministically lowered to
+parameter-bound SQL, and every returned row carries a citation back to the exact
+evidence span that matched. The full prod ambition (Neo4j graph DB, Celery/Redis
+workers, nginx — eight containers) does not run on free hosting, so the **shipped,
+deployable target is a slimmed demo profile**: Postgres + Meilisearch + MinIO +
+FastAPI + Next.js, with graph reads served by a Postgres recursive CTE, inline
+ingest, one canonical synthetic UFDR pre-loaded, and upload disabled in hosted
+mode (`DEMO_MODE=1`, "Reset to sample" as the only mutation). Boot has been
+configured and statically validated but not yet verified on Docker/hosted infra —
+see [DEPLOY.md](DEPLOY.md) and [STATE.md](STATE.md).
+
+## Architecture (slim demo profile)
+
+```mermaid
+flowchart LR
+    User([Investigator])
+    subgraph Vercel
+        FE["Next.js frontend<br/>(static export)"]
+    end
+    subgraph Fly.io
+        API["FastAPI<br/>(uvicorn main:app)"]
+        PG[("PostgreSQL<br/>evidence + graph CTE")]
+        MEILI[("Meilisearch<br/>full-text")]
+        MINIO[("MinIO<br/>media objects")]
+    end
+    LLM["LLM provider<br/>(OpenRouter / OpenAI-compatible)"]
+
+    User --> FE
+    FE -->|"NEXT_PUBLIC_API_URL<br/>HTTPS + CORS"| API
+    API --> PG
+    API --> MEILI
+    API --> MINIO
+    API -->|"NL → QueryPlan IR"| LLM
+```
+
+## Headline feature: auditable NL → IR → cited results
+
+`POST /query/plan` (and `POST /query/plan/preview`, which plans without executing)
+make every step of a natural-language query inspectable — the property a forensic
+reviewer or a court actually needs. The LLM never writes SQL; it emits a typed
+`QueryPlan` (a strict Pydantic IR: targets, predicates, time range, sort, limit).
+That plan is **deterministically** lowered to per-table, parameter-bound SQL — same
+plan in, byte-identical SQL out — so the SQL shown in the UI is provably the SQL
+that ran. Because the IR cannot express raw SQL and every value becomes a bound
+parameter, prompt-injection cannot reach the database as code. Each result row is
+hydrated with a citation: the source table, row id, column, matched value, and the
+exact character span that explains the match.
+
+```mermaid
+flowchart TD
+    Q["NL question<br/>(investigator)"]
+    P["Planner<br/>(LLM, validated • or DEMO stub)"]
+    IR["QueryPlan IR<br/>(typed Pydantic — no raw SQL)"]
+    C["Compiler<br/>(deterministic lowering)"]
+    SQL["Parameter-bound SQL<br/>(injection-proof)"]
+    EX["Executor<br/>(per-table SELECT)"]
+    R["Cited results<br/>(row → table, column, span)"]
+
+    Q --> P --> IR --> C --> SQL --> EX --> R
+    IR -. "shown in audit panel" .-> R
+    SQL -. "shown in audit panel" .-> R
+```
+
+Pipeline modules: `backend/ai/query_plan.py` (IR) ·
+`backend/ai/query_compiler.py` (lowering) · `backend/ai/query_pipeline.py`
+(execution + citations) · `backend/ai/planner.py` (NL→IR) ·
+`backend/ingest/routers/query_plan_router.py` (routes).
+
+## ⚠️ Security note — rotate committed credentials before any public push
+
+A `.env` containing a **live OpenRouter API key** and a **live Neo4j Aura
+password** was committed to this repository's git history (the commits exist).
+These credentials are compromised and **must be rotated**, and the history
+**must be purged** (e.g. `git filter-repo` or BFG) before this repo is pushed
+anywhere public. See [DECISIONS.md](DECISIONS.md) for the full record.
+
+---
+
 ## 🎯 Problem Statement
 
 ### Background

@@ -16,7 +16,7 @@ from pathlib import Path
 env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
-from ingest.routers import health, upload, report, query, graph_router, sync_router, aleapp_structure
+from ingest.routers import health, upload, report, query, graph_router, sync_router, aleapp_structure, query_plan_router, audit_router, entity_router, analytics_router, cross_case_router, transcription_router
 from database import create_db_and_tables, get_session
 from ingest.services.ingest_service import IngestService
 from ingest.utils.logger import get_logger
@@ -94,24 +94,19 @@ def get_meili_client():
 # ------------------------
 
 
+# Credentialed CORS requires an explicit origin allow-list — the wildcard
+# "*" + allow_credentials=True combo is rejected by the Fetch spec and was a
+# real bug here. Origins come from config (CORS_ALLOWED_ORIGINS env var).
+from config import CORS_ALLOWED_ORIGINS  # noqa: E402
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=CORS_ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all HTTP methods
-    allow_headers=["*"],  # Allow all headers
-    expose_headers=["*"],  # Expose all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
 )
-
-# Additional CORS headers for maximum compatibility
-@app.middleware("http")
-async def add_cors_headers(request, call_next):
-    response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    response.headers["Access-Control-Allow-Credentials"] = "true"
-    return response
 
 # ------------------------
 # Request Logging Middleware
@@ -219,6 +214,12 @@ app.include_router(health.router)
 app.include_router(upload.router)
 app.include_router(report.router)
 app.include_router(query.router)
+app.include_router(query_plan_router.router)  # auditable NL -> IR -> cited results
+app.include_router(audit_router.router)  # tamper-evident audit trail + signed PDF
+app.include_router(entity_router.router)  # Postgres-CTE entity graph (slim profile)
+app.include_router(analytics_router.router)  # temporal patterns / anomaly detection
+app.include_router(cross_case_router.router)  # cross-case entity linking
+app.include_router(transcription_router.router)  # voice-note transcription
 app.include_router(graph_router.router)
 app.include_router(sync_router.router)
 app.include_router(aleapp_structure.router)

@@ -10,7 +10,7 @@ services:
     environment:
       - DEBUG=true
       - LOG_LEVEL=debug
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
   # Frontend development overrides
   frontend:
@@ -22,15 +22,10 @@ services:
       - NODE_ENV=development
     command: npm run dev
 
-  # Worker development overrides
-  worker:
-    volumes:
-      - ./backend:/app
-      - /app/__pycache__
-    environment:
-      - DEBUG=true
-      - LOG_LEVEL=debug
-    command: celery -A app.workers.celery_app worker --loglevel=debug --reload
+  # NOTE: the `worker` override was removed — there is no `app.workers.celery_app`
+  # module in this codebase. Ingestion runs inline in the API process (see the
+  # slim demo profile). If a Celery worker is reintroduced, restore an override
+  # here pointing at the real task module.
 
   # Add development tools
   pgadmin:

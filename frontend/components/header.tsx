@@ -27,6 +27,24 @@ export default function Header() {
           >
             Global Search
           </Link>
+          <Link
+            href="/query-plan"
+            className="text-slate-600 hover:text-slate-900 transition-colors"
+          >
+            Query Plan
+          </Link>
+          <Link
+            href="/patterns"
+            className="text-slate-600 hover:text-slate-900 transition-colors"
+          >
+            Patterns
+          </Link>
+          <Link
+            href="/cross-case"
+            className="text-slate-600 hover:text-slate-900 transition-colors"
+          >
+            Cross-case
+          </Link>
           <a
             href="#features"
             className="text-slate-600 hover:text-slate-900 transition-colors"
