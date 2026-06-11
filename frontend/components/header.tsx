@@ -45,6 +45,12 @@ export default function Header() {
           >
             Cross-case
           </Link>
+          <Link
+            href="/link-graph"
+            className="text-slate-600 hover:text-slate-900 transition-colors"
+          >
+            Link Graph
+          </Link>
           <a
             href="#features"
             className="text-slate-600 hover:text-slate-900 transition-colors"
