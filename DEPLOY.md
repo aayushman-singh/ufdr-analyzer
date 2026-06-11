@@ -106,7 +106,16 @@ flyctl secrets set -a ufdr-analyzer-api \
   POSTGRES_PASSWORD='<REAL_PASSWORD>' \
   MEILI_MASTER_KEY='<REAL_MASTER_KEY>' \
   MINIO_ACCESS_KEY='<ACCESS_KEY>' \
-  MINIO_SECRET_KEY='<SECRET_KEY>'
+  MINIO_SECRET_KEY='<SECRET_KEY>' \
+  SECRET_KEY='<STRONG_RANDOM>' \
+  CROSS_CASE_SALT='<STRONG_SHARED_SECRET>'
+
+# SECRET_KEY     — HMAC key that signs evidence + link-graph exports. Required for
+#                  any signed export; the export endpoints fail loud without it.
+# CROSS_CASE_SALT — HMAC key for cross-case identifier hashing AND link-graph node
+#                  identity. Required; a missing/default key makes phone/email
+#                  hashes brute-forceable, so the service refuses to start the
+#                  cross-case / link-graph paths without it.
 
 # Optional — real LLM planner. Omit to use the DEMO stub planner.
 flyctl secrets set -a ufdr-analyzer-api OPENAI_API_KEY='<ROTATED_KEY>'
@@ -197,9 +206,24 @@ curl -fsS -X POST https://ufdr-analyzer-api.fly.dev/query/plan/preview \
   -d '{"question": "whatsapp calls to +15551234567", "run_id": "x"}'
 ```
 
+**Cross-case link graph** — `GET /link-graph` (expect `nodes`/`edges`, every edge
+carrying `citations`; identifiers in 2+ cases come back `redacted:true`):
+```sh
+curl -fsS "https://ufdr-analyzer-api.fly.dev/link-graph?run_ids=<RUN_ID>&seed=%2B15551234567&hops=2"
+```
+
+**Signed graph export** — `POST /link-graph/export` (expect a signed artifact with
+`content_hash` + `signature`; requires `SECRET_KEY` + `CROSS_CASE_SALT`):
+```sh
+curl -fsS -X POST https://ufdr-analyzer-api.fly.dev/link-graph/export \
+  -H 'Content-Type: application/json' \
+  -d '{"run_ids": ["<RUN_ID>"], "seed": "+15551234567", "format": "json"}'
+```
+
 **Frontend**: open the Vercel URL, confirm the NL query box returns results with
-visible citations, and that the upload control is hidden / disabled while
-"Reset to sample" is present (because `DEMO_MODE=1`).
+visible citations, that the **Link Graph** page renders a force-directed network
+whose edges expose source-row provenance on click, and that the upload control is
+hidden / disabled while "Reset to sample" is present (because `DEMO_MODE=1`).
 
 If `/query/plan` 500s with a planner error, you either set no `OPENAI_API_KEY`
 without `DEMO_MODE=1`, or the key is invalid — both fail loudly by design.
