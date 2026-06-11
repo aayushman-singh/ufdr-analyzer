@@ -79,3 +79,4 @@ backend/ingest/database.db
 
 # Orchestration scratch
 orchestrator.log
+.venv-test/

@@ -16,7 +16,7 @@ from pathlib import Path
 env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
-from ingest.routers import health, upload, report, query, graph_router, sync_router, aleapp_structure, query_plan_router, audit_router, entity_router, analytics_router, cross_case_router, transcription_router, link_graph_router
+from ingest.routers import health, upload, report, query, graph_router, sync_router, aleapp_structure, query_plan_router, audit_router, entity_router, analytics_router, cross_case_router, transcription_router, link_graph_router, auth_router
 from database import create_db_and_tables, get_session
 from ingest.services.ingest_service import IngestService
 from ingest.utils.logger import get_logger
@@ -211,6 +211,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 # Include Routers
 # ------------------------
 app.include_router(health.router)
+app.include_router(auth_router.router)  # signup/login -> bearer token for owner-scoped routes
 app.include_router(upload.router)
 app.include_router(report.router)
 app.include_router(query.router)

@@ -7,11 +7,12 @@
 Every edge in the response cites the source rows that prove it. Identifiers seen
 across 2+ cases are returned salted-hash (redacted) unless they are the seed.
 
-Auth note: the repo has no session layer yet (see DECISIONS.md / DECISIONS_V4.md
-D8). `owner_id` is accepted so a caller can scope to one user's cases, and a graph
-may never span two owners — but wiring `owner_id` to an authenticated identity is a
-pre-deployment requirement. Without it the cross-case membership signal (seed_found,
-case_count) is an oracle to an unauthenticated caller.
+Auth: both endpoints REQUIRE an authenticated user (Bearer token, see
+`auth_service.require_user`). The graph is scoped to that user's own cases —
+`owner_id` is bound to the authenticated identity, never accepted from the client.
+This closes the prior membership/PII oracle: an unauthenticated caller is rejected
+with 401, and a caller asking for runs they do not own is rejected with 403 — they
+cannot learn whether an entity appears across someone else's cases.
 """
 
 import logging
@@ -27,7 +28,9 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session
 
 from database import get_session
+from db_setup import User
 from ingest.services.audit_service import audit_service
+from ingest.services.auth_service import require_user
 from ingest.services.graph_export import (
     build_graph_pdf,
     content_hash,
@@ -75,13 +78,14 @@ def get_link_graph(
     end: Optional[datetime] = Query(
         None, description="inclusive ISO end of time window"
     ),
-    owner_id: Optional[uuid.UUID] = Query(
-        None, description="restrict to this user's cases"
-    ),
     session: Session = Depends(get_session),
+    user: User = Depends(require_user),
 ) -> dict:
     """The entity link graph over the given cases, optionally centered on a seed
-    and/or time-filtered. Every edge carries its source-row citations."""
+    and/or time-filtered. Every edge carries its source-row citations.
+
+    Scoped to the authenticated user's own cases — a run not owned by the caller
+    is refused (403), so the cross-case membership signal is not an oracle."""
     graph = _build(
         session,
         run_ids=run_ids,
@@ -89,7 +93,7 @@ def get_link_graph(
         hops=hops,
         start=start,
         end=end,
-        owner_id=owner_id,
+        owner_id=user.id,
     )
     return graph.to_dict()
 
@@ -100,12 +104,16 @@ class GraphExportRequest(BaseModel):
     hops: int = Field(2, ge=0, le=6)  # same bound as GET — no validation bypass
     start: Optional[datetime] = None
     end: Optional[datetime] = None
-    owner_id: Optional[uuid.UUID] = None
+    # No owner_id here: scope is bound to the authenticated caller, not the client.
     format: str = "json"  # "json" (signed artifact) | "pdf" (signed summary)
 
 
 @router.post("/export")
-def export_link_graph(req: GraphExportRequest, session: Session = Depends(get_session)):
+def export_link_graph(
+    req: GraphExportRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_user),
+):
     """Build the graph, record an `export` audit event, and return a signed,
     court-defensible artifact (JSON by default, or a PDF summary).
 
@@ -132,13 +140,14 @@ def export_link_graph(req: GraphExportRequest, session: Session = Depends(get_se
         hops=req.hops,
         start=req.start,
         end=req.end,
-        owner_id=req.owner_id,
+        owner_id=user.id,
     ).to_dict()
     chash = content_hash(graph)
 
     event = audit_service.record(
         session,
         "export",
+        user_id=user.id,  # record WHO exported — chain-of-custody actor
         payload={
             "artifact": "link-graph",
             "content_hash": chash,
@@ -165,6 +174,7 @@ def export_link_graph(req: GraphExportRequest, session: Session = Depends(get_se
         audit_service.record(
             session,
             "export_failed",
+            user_id=user.id,
             payload={"artifact": "link-graph", "content_hash": chash, "reason": str(e)},
         )
         raise HTTPException(status_code=500, detail=f"export artifact failed: {e}")

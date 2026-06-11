@@ -5,7 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
-import { Bot, ChevronDown, ChevronUp, Database, Send, User } from "lucide-react"
+import { Bot, ChevronDown, ChevronUp, Database, Send } from "lucide-react"
 import { ChatMessage, predefinedQuestions } from "../data"
 
 interface AiAssistantViewProps {
@@ -105,7 +105,7 @@ export function AiAssistantView({
 
                     {/* Expandable Detailed Results Section */}
                     {expandedResultsId === msg.id && msg.results && (
-                      <div className="mt-2 rounded-lg border bg-white p-4">
+                      <div className="mt-2 rounded-lg border bg-card p-4">
                         <h4 className="mb-2 flex items-center gap-2 text-base font-semibold text-foreground">
                           <Database className="h-4 w-4 text-muted-foreground" /> Detailed Evidence
                         </h4>

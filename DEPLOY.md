@@ -206,17 +206,31 @@ curl -fsS -X POST https://ufdr-analyzer-api.fly.dev/query/plan/preview \
   -d '{"question": "whatsapp calls to +15551234567", "run_id": "x"}'
 ```
 
-**Cross-case link graph** — `GET /link-graph` (expect `nodes`/`edges`, every edge
-carrying `citations`; identifiers in 2+ cases come back `redacted:true`):
+**Authenticate first** — the link-graph endpoints are owner-scoped and require a
+bearer token. Register (or log in) to obtain one; the graph only ever covers the
+authenticated user's own cases:
 ```sh
-curl -fsS "https://ufdr-analyzer-api.fly.dev/link-graph?run_ids=<RUN_ID>&seed=%2B15551234567&hops=2"
+TOKEN=$(curl -fsS -X POST https://ufdr-analyzer-api.fly.dev/auth/signup \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"IO","email":"io@example.gov","password":"<STRONG_PW>"}' \
+  | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+```
+
+**Cross-case link graph** — `GET /link-graph` (expect `nodes`/`edges`, every edge
+carrying `citations`; identifiers in 2+ cases come back `redacted:true`). Without
+the token this returns **401**; a `<RUN_ID>` you do not own returns **403** — by
+design, so it is not a membership oracle:
+```sh
+curl -fsS -H "Authorization: Bearer $TOKEN" \
+  "https://ufdr-analyzer-api.fly.dev/link-graph?run_ids=<RUN_ID>&seed=%2B15551234567&hops=2"
 ```
 
 **Signed graph export** — `POST /link-graph/export` (expect a signed artifact with
-`content_hash` + `signature`; requires `SECRET_KEY` + `CROSS_CASE_SALT`):
+`content_hash` + `signature`; requires `SECRET_KEY` + `CROSS_CASE_SALT`; same
+bearer token; the `export` event records the exporting user):
 ```sh
 curl -fsS -X POST https://ufdr-analyzer-api.fly.dev/link-graph/export \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"run_ids": ["<RUN_ID>"], "seed": "+15551234567", "format": "json"}'
 ```
 

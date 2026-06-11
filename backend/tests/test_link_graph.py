@@ -368,7 +368,13 @@ def test_citation_cap_keeps_true_weight(session, monkeypatch):
 
 
 # -- HTTP route contract (TestClient) ----------------------------------------
-def _client(session):
+def _client(session, *, token: str | None = None):
+    """Test client for the link-graph router.
+
+    `require_user` (a dependency of both endpoints) itself depends on
+    `get_session`, so overriding it routes auth lookups at the same in-memory DB.
+    Pass `token` to authenticate every request with a Bearer header.
+    """
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -378,12 +384,22 @@ def _client(session):
     app = FastAPI()
     app.include_router(link_graph_router.router)
     app.dependency_overrides[get_session] = lambda: session
-    return TestClient(app, raise_server_exceptions=False)
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+    return TestClient(app, raise_server_exceptions=False, headers=headers)
+
+
+def _owner_token(session, run_id):
+    """Mint a bearer token for the user who owns `run_id`."""
+    from db_setup import Run
+    from ingest.services.auth_service import create_access_token
+
+    owner_id = session.get(Run, run_id).user_id
+    return create_access_token(owner_id)
 
 
 def test_route_get_returns_cited_graph(session, runs):
     a, _ = runs
-    c = _client(session)
+    c = _client(session, token=_owner_token(session, a))
     res = c.get("/link-graph", params={"run_ids": [str(a)]})
     assert res.status_code == 200
     body = res.json()
@@ -394,14 +410,22 @@ def test_route_get_returns_cited_graph(session, runs):
 
 
 def test_route_get_nonexistent_run_is_404(session):
-    c = _client(session)
+    # An authenticated user is required even to get a 404 — auth precedes scoping.
+    from db_setup import User
+    from ingest.services.auth_service import create_access_token
+
+    u = User(username="IO", email="io@x.gov", password_hash="x")
+    session.add(u)
+    session.commit()
+    session.refresh(u)
+    c = _client(session, token=create_access_token(u.id))
     res = c.get("/link-graph", params={"run_ids": [str(uuid.uuid4())]})
     assert res.status_code == 404
 
 
 def test_route_export_json_is_signed_and_audited(session, runs):
     a, b = runs
-    c = _client(session)
+    c = _client(session, token=_owner_token(session, a))
     res = c.post(
         "/link-graph/export",
         json={"run_ids": [str(a), str(b)], "seed": P1, "format": "json"},
@@ -425,12 +449,82 @@ def test_route_export_json_is_signed_and_audited(session, runs):
         export_events
         and export_events[-1]["payload"]["content_hash"] == art["content_hash"]
     )
+    # the export event records WHO exported (chain-of-custody actor)
+    assert export_events[-1]["user_id"] == str(session.get(Run, a).user_id)
 
 
 def test_route_export_hops_out_of_range_is_422(session, runs):
     a, _ = runs
-    c = _client(session)
+    c = _client(session, token=_owner_token(session, a))
     res = c.post(
         "/link-graph/export", json={"run_ids": [str(a)], "hops": 99, "format": "json"}
     )
     assert res.status_code == 422  # pydantic bound matches the GET cap
+
+
+# -- auth / owner-scoping (the membership-oracle fix) ------------------------
+def test_route_get_without_token_is_401(session, runs):
+    a, _ = runs
+    c = _client(session)  # no Authorization header
+    res = c.get("/link-graph", params={"run_ids": [str(a)]})
+    assert res.status_code == 401, "unauthenticated caller must be rejected"
+
+
+def test_route_export_without_token_is_401(session, runs):
+    a, _ = runs
+    c = _client(session)
+    res = c.post(
+        "/link-graph/export", json={"run_ids": [str(a)], "format": "json"}
+    )
+    assert res.status_code == 401
+
+
+def test_route_get_with_garbage_token_is_401(session, runs):
+    a, _ = runs
+    c = _client(session, token="not-a-real-jwt")
+    res = c.get("/link-graph", params={"run_ids": [str(a)]})
+    assert res.status_code == 401
+
+
+def test_route_get_token_for_unknown_user_is_401(session, runs):
+    """A well-signed token whose subject is no longer a user is rejected — a
+    deleted user's token must not keep working."""
+    from ingest.services.auth_service import create_access_token
+
+    a, _ = runs
+    c = _client(session, token=create_access_token(uuid.uuid4()))
+    res = c.get("/link-graph", params={"run_ids": [str(a)]})
+    assert res.status_code == 401
+
+
+def test_route_non_owner_is_403_not_empty(session, runs):
+    """A different authenticated user asking for someone else's run is REFUSED
+    (403), not handed an empty-but-revealing graph — no membership oracle."""
+    from db_setup import User
+    from ingest.services.auth_service import create_access_token
+
+    a, _ = runs
+    attacker = User(username="Mallory", email="m@x.gov", password_hash="x")
+    session.add(attacker)
+    session.commit()
+    session.refresh(attacker)
+    c = _client(session, token=create_access_token(attacker.id))
+    res = c.get("/link-graph", params={"run_ids": [str(a)]})
+    assert res.status_code == 403, "non-owner must be refused, not given a result"
+
+
+def test_route_export_non_owner_is_403(session, runs):
+    from db_setup import User
+    from ingest.services.auth_service import create_access_token
+
+    a, b = runs
+    attacker = User(username="Mallory", email="m@x.gov", password_hash="x")
+    session.add(attacker)
+    session.commit()
+    session.refresh(attacker)
+    c = _client(session, token=create_access_token(attacker.id))
+    res = c.post(
+        "/link-graph/export",
+        json={"run_ids": [str(a), str(b)], "format": "json"},
+    )
+    assert res.status_code == 403

@@ -1,8 +1,43 @@
+"use client"
+
 import { Mail, Lock, User } from "lucide-react"
 import { Seal } from "@/components/brand/Seal"
 import Link from "next/link"
+import { useRouter } from "next/navigation"
+import { useState } from "react"
+import { signup } from "@/lib/auth"
 
 export default function SignupPage() {
+  const router = useRouter()
+  const [name, setName] = useState("")
+  const [email, setEmail] = useState("")
+  const [password, setPassword] = useState("")
+  const [confirmPassword, setConfirmPassword] = useState("")
+  const [error, setError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault()
+    setError(null)
+    if (password !== confirmPassword) {
+      setError("Passwords do not match.")
+      return
+    }
+    if (password.length < 8) {
+      setError("Password must be at least 8 characters.")
+      return
+    }
+    setLoading(true)
+    try {
+      await signup(name, email, password)
+      router.push("/link-graph")
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not create account.")
+    } finally {
+      setLoading(false)
+    }
+  }
+
   return (
     <div className="theme-light min-h-screen w-full bg-background relative overflow-hidden">
       {/* Background grid + signal radial */}
@@ -43,7 +78,7 @@ export default function SignupPage() {
             </div>
 
             {/* Signup Form */}
-            <form className="space-y-6">
+            <form className="space-y-6" onSubmit={handleSubmit}>
               {/* Full Name Field */}
               <div>
                 <label htmlFor="name" className="block text-sm font-medium text-foreground mb-2">
@@ -59,6 +94,8 @@ export default function SignupPage() {
                     type="text"
                     autoComplete="name"
                     required
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
                     className="block w-full pl-10 pr-3 py-3 border border-border rounded-lg bg-surface-1 text-foreground placeholder-muted-foreground focus:outline-none focus:ring-2 focus:ring-[var(--ring)] focus:border-transparent"
                     placeholder="John Doe"
                   />
@@ -80,6 +117,8 @@ export default function SignupPage() {
                     type="email"
                     autoComplete="email"
                     required
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
                     className="block w-full pl-10 pr-3 py-3 border border-border rounded-lg bg-surface-1 text-foreground placeholder-muted-foreground focus:outline-none focus:ring-2 focus:ring-[var(--ring)] focus:border-transparent"
                     placeholder="you@example.com"
                   />
@@ -101,6 +140,9 @@ export default function SignupPage() {
                     type="password"
                     autoComplete="new-password"
                     required
+                    minLength={8}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
                     className="block w-full pl-10 pr-3 py-3 border border-border rounded-lg bg-surface-1 text-foreground placeholder-muted-foreground focus:outline-none focus:ring-2 focus:ring-[var(--ring)] focus:border-transparent"
                     placeholder="••••••••"
                   />
@@ -122,6 +164,8 @@ export default function SignupPage() {
                     type="password"
                     autoComplete="new-password"
                     required
+                    value={confirmPassword}
+                    onChange={(e) => setConfirmPassword(e.target.value)}
                     className="block w-full pl-10 pr-3 py-3 border border-border rounded-lg bg-surface-1 text-foreground placeholder-muted-foreground focus:outline-none focus:ring-2 focus:ring-[var(--ring)] focus:border-transparent"
                     placeholder="••••••••"
                   />
@@ -153,12 +197,19 @@ export default function SignupPage() {
                 </div>
               </div>
 
+              {error && (
+                <p role="alert" className="text-sm text-[var(--severity-high)]">
+                  {error}
+                </p>
+              )}
+
               {/* Create Account Button */}
               <button
                 type="submit"
-                className="w-full bg-signal text-signal-foreground py-3 px-4 rounded-lg font-medium hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-[var(--ring)] focus:ring-offset-2 transition-all"
+                disabled={loading}
+                className="w-full bg-signal text-signal-foreground py-3 px-4 rounded-lg font-medium hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-[var(--ring)] focus:ring-offset-2 transition-all disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                Create Account
+                {loading ? "Creating Account…" : "Create Account"}
               </button>
             </form>
 

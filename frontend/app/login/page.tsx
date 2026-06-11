@@ -1,8 +1,34 @@
+"use client"
+
 import { Mail, Lock } from "lucide-react"
 import { Seal } from "@/components/brand/Seal"
 import Link from "next/link"
+import { useRouter } from "next/navigation"
+import { useState } from "react"
+import { login } from "@/lib/auth"
 
 export default function LoginPage() {
+  const router = useRouter()
+  const [email, setEmail] = useState("")
+  const [password, setPassword] = useState("")
+  const [error, setError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault()
+    setError(null)
+    setLoading(true)
+    try {
+      await login(email, password)
+      router.push("/link-graph")
+    } catch (err) {
+      // Surface the failure loudly — no silent retry, no fake "success".
+      setError(err instanceof Error ? err.message : "Sign in failed.")
+    } finally {
+      setLoading(false)
+    }
+  }
+
   return (
     <div className="theme-light min-h-screen w-full bg-background relative overflow-hidden">
       {/* Background grid + signal radial */}
@@ -43,7 +69,7 @@ export default function LoginPage() {
             </div>
 
             {/* Login Form */}
-            <form className="space-y-6">
+            <form className="space-y-6" onSubmit={handleSubmit}>
               {/* Email Field */}
               <div>
                 <label htmlFor="email" className="block text-sm font-medium text-foreground mb-2">
@@ -59,6 +85,8 @@ export default function LoginPage() {
                     type="email"
                     autoComplete="email"
                     required
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
                     className="block w-full pl-10 pr-3 py-3 border border-border rounded-lg bg-surface-1 text-foreground placeholder-muted-foreground focus:outline-none focus:ring-2 focus:ring-[var(--ring)] focus:border-transparent"
                     placeholder="you@example.com"
                   />
@@ -80,18 +108,27 @@ export default function LoginPage() {
                     type="password"
                     autoComplete="current-password"
                     required
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
                     className="block w-full pl-10 pr-3 py-3 border border-border rounded-lg bg-surface-1 text-foreground placeholder-muted-foreground focus:outline-none focus:ring-2 focus:ring-[var(--ring)] focus:border-transparent"
                     placeholder="••••••••"
                   />
                 </div>
               </div>
 
+              {error && (
+                <p role="alert" className="text-sm text-[var(--severity-high)]">
+                  {error}
+                </p>
+              )}
+
               {/* Sign In Button */}
               <button
                 type="submit"
-                className="w-full bg-signal text-signal-foreground py-3 px-4 rounded-lg font-medium hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-[var(--ring)] focus:ring-offset-2 transition-all"
+                disabled={loading}
+                className="w-full bg-signal text-signal-foreground py-3 px-4 rounded-lg font-medium hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-[var(--ring)] focus:ring-offset-2 transition-all disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                Sign In
+                {loading ? "Signing In…" : "Sign In"}
               </button>
             </form>
 

@@ -60,7 +60,19 @@ content is what must be reproducible). A human-readable signed **PDF summary**
 content hash. `SECRET_KEY` required — fail loud if missing, before mutating the
 chain.
 
-## D8 — No auth (inherited limitation)
-Run ownership is not enforced (repo has no auth layer — see DECISIONS.md). The
-export and graph endpoints accept an explicit `run_ids` set; "all my cases" is the
-caller-supplied set. JWT + ownership checks remain a pre-deployment requirement.
+## D8 — Auth enforced on the link-graph surface (resolved post-review)
+*Superseded:* D8 originally shipped with no auth (repo had no session layer) and
+a caller-supplied `owner_id`, which made the cross-case graph/export a PII +
+membership oracle — flagged at merge review (`codex/v4-merge-gate.txt`).
+
+Now enforced. `ingest/services/auth_service.py` adds a real identity layer:
+PBKDF2-HMAC-SHA256 password hashing, HS256 JWTs signed with `SECRET_KEY`, and a
+`require_user` dependency. `POST /auth/signup` + `POST /auth/login` issue tokens.
+Both `GET /link-graph` and `POST /link-graph/export` now **require** a bearer
+token and bind `owner_id` to the *authenticated* identity — it is no longer
+accepted from the client. An unauthenticated caller gets **401**; a caller asking
+for runs they do not own gets **403** (never an empty-but-revealing graph). Proven
+by E2E tests in `backend/tests/test_link_graph.py` + `test_auth.py`.
+
+The rest of the repo's routes remain unauthenticated — adopting `require_user`
+across them is the next step, but the oracle on the cross-case surface is closed.

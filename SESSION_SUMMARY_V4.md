@@ -73,10 +73,13 @@ secrets step (both **required** for signed export / cross-case identity) and
 smoke-test curls for `/link-graph` + `/link-graph/export`. No deploy executed.
 
 ## Known limitations / next
-- **Auth**: repo-wide, no session layer. `owner_id` plumbing exists but is
-  caller-supplied; the cross-case membership signal is an oracle until `owner_id`
-  is bound to an authenticated identity + run-ownership enforced. Pre-deploy blocker
-  (shared with all other routes — see `DECISIONS.md`).
+- **Auth**: RESOLVED for the link-graph surface (post-review fix — see
+  `REVIEW_SUMMARY.md`, `codex/v4-merge-gate.txt`, DECISIONS_V4 D8). `auth_service`
+  adds PBKDF2 password hashing + HS256 JWTs + a `require_user` dependency;
+  `/auth/signup` + `/auth/login` issue tokens; `GET /link-graph` and
+  `POST /link-graph/export` now require a bearer token and bind `owner_id` to the
+  authenticated identity (401 unauthenticated, 403 non-owner). The membership
+  oracle is closed. Remaining: extend `require_user` to the other routes.
 - **Scale**: `_load_events` uses `.all()` (matches analytics service); `MAX_EVENTS`
   fails loud past 500k rows. Row streaming/pagination is the next scaling step.
 - **HMAC ≠ PKI**: signed exports prove server-side integrity, not third-party X.509
