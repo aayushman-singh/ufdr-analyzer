@@ -60,9 +60,20 @@ export function GraphVisualization({ className }: GraphVisualizationProps) {
     if (!networkRef.current) return
 
     const transformedData = graphUtils.transformForVisNetwork(data)
-    
+
     const nodes = new DataSet(transformedData.nodes)
     const edges = new DataSet(transformedData.edges)
+
+    // Read CSS custom properties at runtime so vis-network honours the dark theme
+    const style = getComputedStyle(document.documentElement)
+    const cssVar = (name: string, fallback: string) =>
+      style.getPropertyValue(name).trim() || fallback
+
+    const colorForeground = cssVar('--foreground', 'rgba(255,255,255,0.87)')
+    const colorBorder     = cssVar('--border-strong', 'rgba(255,255,255,0.16)')
+    const colorPerson     = cssVar('--chart-2',  '#60a5fa')
+    const colorMessage    = cssVar('--signal',   '#a3e635')
+    const colorCall       = cssVar('--chart-5',  '#c084fc')
 
     const options = {
       nodes: {
@@ -70,22 +81,27 @@ export function GraphVisualization({ className }: GraphVisualizationProps) {
         size: 16,
         font: {
           size: 14,
-          color: '#343434'
+          color: colorForeground,
         },
         borderWidth: 2,
         shadow: true,
         color: {
-          border: '#2B7CE9',
-          background: '#97C2FC',
+          border: colorBorder,
+          background: colorPerson,
           highlight: {
-            border: '#2B7CE9',
-            background: '#D2E5FF'
+            border: colorBorder,
+            background: colorPerson,
           }
         }
       },
+      groups: {
+        Person:  { color: { background: colorPerson,  border: colorBorder } },
+        Message: { color: { background: colorMessage, border: colorBorder } },
+        Call:    { color: { background: colorCall,    border: colorBorder } },
+      },
       edges: {
         width: 2,
-        color: { color: '#848484', highlight: '#848484' },
+        color: { color: colorBorder, highlight: colorForeground },
         smooth: {
           type: 'continuous'
         }
@@ -170,8 +186,8 @@ export function GraphVisualization({ className }: GraphVisualizationProps) {
       <Card className={className}>
         <CardContent className="flex items-center justify-center h-96">
           <div className="text-center">
-            <RefreshCw className="w-8 h-8 animate-spin mx-auto mb-4 text-slate-600" />
-            <p className="text-slate-600">Loading graph data...</p>
+            <RefreshCw className="w-8 h-8 animate-spin mx-auto mb-4 text-signal" />
+            <p className="text-muted-foreground">Loading graph data...</p>
           </div>
         </CardContent>
       </Card>
@@ -183,8 +199,8 @@ export function GraphVisualization({ className }: GraphVisualizationProps) {
       <Card className={className}>
         <CardContent className="flex items-center justify-center h-96">
           <div className="text-center">
-            <div className="text-red-500 mb-4">Failed to load graph</div>
-            <p className="text-slate-600 mb-4">{error}</p>
+            <div className="text-destructive mb-4">Failed to load graph</div>
+            <p className="text-muted-foreground mb-4">{error}</p>
             <Button onClick={loadGraphData} variant="outline">
               <RefreshCw className="w-4 h-4 mr-2" />
               Retry
@@ -200,8 +216,8 @@ export function GraphVisualization({ className }: GraphVisualizationProps) {
       {/* Header with controls */}
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h2 className="text-2xl font-semibold text-slate-900">Graph Network</h2>
-          <p className="text-slate-600">Interactive visualization of entity relationships</p>
+          <h2 className="text-2xl font-semibold text-foreground">Graph Network</h2>
+          <p className="text-muted-foreground">Interactive visualization of entity relationships</p>
         </div>
         <div className="flex items-center gap-2">
           <Button variant="outline" size="sm" onClick={loadGraphData}>
@@ -222,10 +238,10 @@ export function GraphVisualization({ className }: GraphVisualizationProps) {
             <CardContent className="p-4">
               <div className="flex items-center justify-between">
                 <div>
-                  <p className="text-sm text-slate-600">Total Nodes</p>
+                  <p className="text-sm text-muted-foreground">Total Nodes</p>
                   <p className="text-2xl font-semibold">{stats.totalNodes}</p>
                 </div>
-                <NetworkIcon className="w-8 h-8 text-blue-600" />
+                <NetworkIcon className="w-8 h-8 text-[var(--chart-2)]" />
               </div>
             </CardContent>
           </Card>
@@ -234,10 +250,10 @@ export function GraphVisualization({ className }: GraphVisualizationProps) {
             <CardContent className="p-4">
               <div className="flex items-center justify-between">
                 <div>
-                  <p className="text-sm text-slate-600">Connections</p>
+                  <p className="text-sm text-muted-foreground">Connections</p>
                   <p className="text-2xl font-semibold">{stats.totalEdges}</p>
                 </div>
-                <NetworkIcon className="w-8 h-8 text-green-600" />
+                <NetworkIcon className="w-8 h-8 text-signal" />
               </div>
             </CardContent>
           </Card>
@@ -246,10 +262,10 @@ export function GraphVisualization({ className }: GraphVisualizationProps) {
             <CardContent className="p-4">
               <div className="flex items-center justify-between">
                 <div>
-                  <p className="text-sm text-slate-600">Node Types</p>
+                  <p className="text-sm text-muted-foreground">Node Types</p>
                   <p className="text-2xl font-semibold">{Object.keys(stats.nodeTypes).length}</p>
                 </div>
-                <Filter className="w-8 h-8 text-purple-600" />
+                <Filter className="w-8 h-8 text-[var(--chart-5)]" />
               </div>
             </CardContent>
           </Card>
@@ -258,10 +274,10 @@ export function GraphVisualization({ className }: GraphVisualizationProps) {
             <CardContent className="p-4">
               <div className="flex items-center justify-between">
                 <div>
-                  <p className="text-sm text-slate-600">Filter</p>
+                  <p className="text-sm text-muted-foreground">Filter</p>
                   <p className="text-sm font-medium">{filterType}</p>
                 </div>
-                <Search className="w-8 h-8 text-orange-600" />
+                <Search className="w-8 h-8 text-[var(--severity-medium)]" />
               </div>
             </CardContent>
           </Card>
@@ -304,9 +320,9 @@ export function GraphVisualization({ className }: GraphVisualizationProps) {
               </CardDescription>
             </CardHeader>
             <CardContent>
-              <div 
-                ref={networkRef} 
-                className="w-full h-96 border rounded-lg"
+              <div
+                ref={networkRef}
+                className="w-full h-96 border rounded-lg bg-card"
                 style={{ minHeight: '400px' }}
               />
             </CardContent>
@@ -326,12 +342,12 @@ export function GraphVisualization({ className }: GraphVisualizationProps) {
               {selectedNode ? (
                 <div className="space-y-4">
                   <div>
-                    <label className="text-sm font-medium text-slate-600">ID</label>
+                    <label className="text-sm font-medium text-muted-foreground">ID</label>
                     <p className="text-sm">{selectedNode.id}</p>
                   </div>
-                  
+
                   <div>
-                    <label className="text-sm font-medium text-slate-600">Type</label>
+                    <label className="text-sm font-medium text-muted-foreground">Type</label>
                     <div className="flex items-center gap-2 mt-1">
                       {getNodeTypeIcon(selectedNode.group)}
                       <Badge variant="secondary">{selectedNode.group}</Badge>
@@ -339,13 +355,13 @@ export function GraphVisualization({ className }: GraphVisualizationProps) {
                   </div>
 
                   <div>
-                    <label className="text-sm font-medium text-slate-600">Name</label>
+                    <label className="text-sm font-medium text-muted-foreground">Name</label>
                     <p className="text-sm">{selectedNode.label}</p>
                   </div>
 
                   {selectedNode.properties && Object.keys(selectedNode.properties).length > 0 && (
                     <div>
-                      <label className="text-sm font-medium text-slate-600">Properties</label>
+                      <label className="text-sm font-medium text-muted-foreground">Properties</label>
                       <div className="mt-1 space-y-1">
                         {Object.entries(selectedNode.properties).map(([key, value]) => (
                           <div key={key} className="text-xs">
@@ -369,8 +385,8 @@ export function GraphVisualization({ className }: GraphVisualizationProps) {
                   </Button>
                 </div>
               ) : (
-                <div className="text-center text-slate-500 py-8">
-                  <NetworkIcon className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                <div className="text-center text-muted-foreground py-8">
+                  <NetworkIcon className="w-12 h-12 mx-auto mb-4 opacity-30" />
                   <p className="text-sm">Select a node to view details</p>
                 </div>
               )}

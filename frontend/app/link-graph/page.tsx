@@ -36,15 +36,16 @@ import {
   type LinkNode,
 } from "@/lib/linkGraphApi"
 
+// oklch-resolved values for vis-network (canvas — cannot use CSS vars)
 const TYPE_COLOR: Record<string, string> = {
-  phone: "#2563eb",
-  email: "#7c3aed",
-  other: "#64748b",
+  phone: "oklch(0.700 0.090 235)",   // info
+  email: "oklch(0.860 0.175 117)",   // signal
+  other: "oklch(0.705 0.018 252)",   // muted-foreground
 }
 
 function nodeColor(n: LinkNode, seedId: string | null) {
-  if (n.id === seedId) return { background: "#f59e0b", border: "#b45309" }
-  if (n.redacted) return { background: "#cbd5e1", border: "#475569" } // cross-case PII
+  if (n.id === seedId) return { background: "oklch(0.800 0.140 78)", border: "oklch(0.640 0.150 75)" }
+  if (n.redacted) return { background: "oklch(0.262 0.015 256)", border: "oklch(0.705 0.018 252)" } // cross-case PII
   const c = TYPE_COLOR[n.type] ?? TYPE_COLOR.other
   return { background: c, border: c }
 }
@@ -140,7 +141,7 @@ export default function LinkGraphPage() {
         color: nodeColor(n, seedId),
         value: n.degree + 1,
         shape: "dot",
-        font: { size: 13, color: "#0f172a" },
+        font: { size: 13, color: "oklch(0.967 0.004 247)" }, // foreground
       })),
     )
     const edges = new DataSet(
@@ -150,7 +151,7 @@ export default function LinkGraphPage() {
         to: e.target,
         value: e.weight,
         title: `${e.weight} interaction(s), ${e.citations_shown} shown`,
-        color: { color: "#94a3b8", highlight: "#0ea5e9" },
+        color: { color: "oklch(0.262 0.015 256)", highlight: "oklch(0.860 0.175 117)" }, // surface-3 / signal
       })),
     )
     const network = new Network(
@@ -191,11 +192,11 @@ export default function LinkGraphPage() {
   return (
     <div className="mx-auto max-w-7xl p-6">
       <header className="mb-6">
-        <h1 className="flex items-center gap-2 text-2xl font-semibold text-slate-900">
-          <NetworkIcon className="h-6 w-6 text-blue-600" />
+        <h1 className="flex items-center gap-2 text-2xl font-semibold text-foreground">
+          <NetworkIcon className="h-6 w-6 text-signal" />
           Cross-Case Entity Link Graph
         </h1>
-        <p className="text-slate-600">
+        <p className="text-muted-foreground">
           Provenance-cited network of entities across cases. Every edge traces to
           its source rows; identifiers seen in 2+ cases stay salted-hash.
         </p>
@@ -205,7 +206,7 @@ export default function LinkGraphPage() {
       <Card className="mb-6">
         <CardContent className="grid grid-cols-1 gap-4 p-4 md:grid-cols-2 lg:grid-cols-6">
           <div className="lg:col-span-2">
-            <label className="text-xs font-medium text-slate-600">
+            <label className="text-xs font-medium text-muted-foreground">
               Case run id(s) — comma/space separated
             </label>
             <Input
@@ -215,7 +216,7 @@ export default function LinkGraphPage() {
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-slate-600">
+            <label className="text-xs font-medium text-muted-foreground">
               Seed (optional)
             </label>
             <Input
@@ -225,7 +226,7 @@ export default function LinkGraphPage() {
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-slate-600">Hops</label>
+            <label className="text-xs font-medium text-muted-foreground">Hops</label>
             <Input
               type="number"
               min={0}
@@ -235,7 +236,7 @@ export default function LinkGraphPage() {
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-slate-600">From</label>
+            <label className="text-xs font-medium text-muted-foreground">From</label>
             <Input
               type="datetime-local"
               value={start}
@@ -243,7 +244,7 @@ export default function LinkGraphPage() {
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-slate-600">To</label>
+            <label className="text-xs font-medium text-muted-foreground">To</label>
             <Input
               type="datetime-local"
               value={end}
@@ -278,7 +279,7 @@ export default function LinkGraphPage() {
       </Card>
 
       {error && (
-        <div className="mb-6 flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800">
+        <div className="mb-6 flex items-start gap-3 rounded-xl border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <p className="whitespace-pre-wrap break-words font-mono text-xs">
             {error}
@@ -314,7 +315,7 @@ export default function LinkGraphPage() {
               <CardContent>
                 <div
                   ref={networkRef}
-                  className="w-full rounded-lg border"
+                  className="w-full rounded-lg border bg-surface-1"
                   style={{ height: 560 }}
                 />
               </CardContent>
@@ -336,7 +337,7 @@ export default function LinkGraphPage() {
                 )}
                 {selectedEdge && <EdgeDetails edge={selectedEdge} />}
                 {!selectedNode && !selectedEdge && (
-                  <p className="py-8 text-center text-slate-500">
+                  <p className="py-8 text-center text-muted-foreground">
                     Select a node or edge.
                   </p>
                 )}
@@ -360,9 +361,9 @@ function NodeDetails({
     <div className="space-y-2">
       <div className="flex items-center gap-2">
         {node.redacted ? (
-          <Lock className="h-4 w-4 text-slate-500" />
+          <Lock className="h-4 w-4 text-muted-foreground" />
         ) : (
-          <NetworkIcon className="h-4 w-4 text-blue-600" />
+          <NetworkIcon className="h-4 w-4 text-signal" />
         )}
         <span className="font-medium">
           {node.redacted ? "Cross-case (redacted)" : node.label || node.value}
@@ -371,7 +372,7 @@ function NodeDetails({
       </div>
       <Row k="Type" v={node.type} />
       {node.redacted ? (
-        <p className="text-xs text-slate-500">
+        <p className="text-xs text-muted-foreground">
           Appears in {node.case_count} cases — raw value withheld; referenced by
           salted hash.
         </p>
@@ -400,12 +401,12 @@ function EdgeDetails({ edge }: { edge: LinkEdge }) {
       />
       <div className="max-h-80 space-y-2 overflow-y-auto">
         {edge.citations.map((c, i) => (
-          <div key={i} className="rounded border bg-slate-50 p-2 text-xs">
+          <div key={i} className="rounded border bg-surface-1 p-2 text-xs">
             <div className="font-medium">{c.source_table}</div>
-            <div className="font-mono text-[10px] text-slate-500">
+            <div className="font-mono text-[10px] text-muted-foreground">
               run {c.run_id.slice(0, 8)} · row {c.row_id.slice(0, 12)}
             </div>
-            <div className="text-slate-600">{c.timestamp ?? "no timestamp"}</div>
+            <div className="text-muted-foreground">{c.timestamp ?? "no timestamp"}</div>
           </div>
         ))}
       </div>
@@ -416,7 +417,7 @@ function EdgeDetails({ edge }: { edge: LinkEdge }) {
 function Row({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
   return (
     <div>
-      <span className="text-xs font-medium text-slate-500">{k}</span>
+      <span className="text-xs font-medium text-muted-foreground">{k}</span>
       <p className={mono ? "break-all font-mono text-xs" : "text-sm"}>{v}</p>
     </div>
   )

@@ -3,7 +3,6 @@
 import { useState } from "react"
 import Link from "next/link"
 import {
-  Shield,
   Play,
   Eye,
   Loader2,
@@ -24,6 +23,7 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
+import { Seal } from "@/components/brand/Seal"
 import {
   previewQueryPlan,
   runQueryPlan,
@@ -64,7 +64,7 @@ function highlightSnippet(citation: ResultCitation) {
   return (
     <>
       <span>{snippet.slice(0, char_start)}</span>
-      <mark className="rounded bg-purple-200 px-0.5 text-purple-900">
+      <mark className="cite">
         {snippet.slice(char_start, char_end)}
       </mark>
       <span>{snippet.slice(char_end)}</span>
@@ -103,27 +103,23 @@ export default function QueryPlanPage() {
   const busy = loading !== null
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-purple-50 to-white">
-      <header className="w-full border-b border-slate-200 bg-white/80 px-4 py-5 backdrop-blur-sm sm:px-8">
+    <div className="min-h-screen bg-background">
+      <header className="w-full border-b bg-background/80 px-4 py-5 backdrop-blur-md sm:px-8">
         <div className="mx-auto flex max-w-5xl items-center justify-between">
           <Link href="/" className="flex items-center gap-2">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-purple-600 to-purple-800">
-              <Shield className="h-4 w-4 text-white" />
-            </div>
-            <span className="text-xl font-medium text-slate-900">ForensicAI</span>
+            <Seal size={28} />
+            <span className="text-xl font-medium text-foreground">ForensicAI</span>
           </Link>
-          <Badge variant="secondary" className="bg-purple-100 text-purple-700">
-            Auditable Query
-          </Badge>
+          <Badge variant="signal">Auditable Query</Badge>
         </div>
       </header>
 
       <main className="mx-auto max-w-5xl px-4 py-8 sm:px-8">
         <div className="mb-8">
-          <h1 className="text-2xl font-semibold text-slate-900">
+          <h1 className="text-2xl font-semibold text-foreground">
             Natural language to cited evidence
           </h1>
-          <p className="mt-1 max-w-2xl text-sm text-slate-600">
+          <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
             Ask a question in plain English. Every answer is traceable: the
             structured query plan, the compiled SQL, and the exact rows and
             character spans each result was matched on.
@@ -136,7 +132,7 @@ export default function QueryPlanPage() {
             <div className="flex flex-col gap-2">
               <label
                 htmlFor="question"
-                className="text-sm font-medium text-slate-800"
+                className="text-sm font-medium text-foreground"
               >
                 Question
               </label>
@@ -149,12 +145,11 @@ export default function QueryPlanPage() {
                 }}
                 placeholder="e.g. Show me all messages mentioning a bank transfer"
                 disabled={busy}
-                className="focus-visible:ring-purple-500"
               />
             </div>
 
             <div className="flex flex-col gap-2">
-              <label htmlFor="run-id" className="text-sm font-medium text-slate-800">
+              <label htmlFor="run-id" className="text-sm font-medium text-foreground">
                 Run ID
               </label>
               <Input
@@ -163,18 +158,18 @@ export default function QueryPlanPage() {
                 onChange={(e) => setRunId(e.target.value)}
                 placeholder="Optional — leave blank to query the default run"
                 disabled={busy}
-                className="font-mono focus-visible:ring-purple-500"
+                className="font-mono"
               />
-              <p className="text-xs text-slate-500">
+              <p className="text-xs text-muted-foreground">
                 Identifies which extraction run to query. Leave blank if unsure.
               </p>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
               <Button
+                variant="signal"
                 onClick={() => submit("run")}
                 disabled={busy}
-                className="bg-slate-900 hover:bg-slate-700"
               >
                 {loading === "run" ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -204,7 +199,7 @@ export default function QueryPlanPage() {
                   type="button"
                   onClick={() => setQuestion(q)}
                   disabled={busy}
-                  className="rounded-full bg-purple-50 px-3 py-1 text-xs text-purple-700 transition-colors hover:bg-purple-100 disabled:opacity-50"
+                  className="rounded-full bg-signal/10 border border-signal/25 px-3 py-1 text-xs text-signal transition-colors hover:bg-signal/20 disabled:opacity-50"
                 >
                   {q}
                 </button>
@@ -234,16 +229,11 @@ export default function QueryPlanPage() {
               <CardHeader>
                 <div className="flex items-center justify-between gap-2">
                   <CardTitle className="flex items-center gap-2">
-                    <ListTree className="h-4 w-4 text-purple-600" />
+                    <ListTree className="h-4 w-4 text-signal" />
                     Query Plan
                   </CardTitle>
                   <Badge
-                    variant={response.planner === "llm" ? "default" : "secondary"}
-                    className={
-                      response.planner === "llm"
-                        ? "bg-purple-600"
-                        : "bg-slate-200 text-slate-700"
-                    }
+                    variant={response.planner === "llm" ? "signal" : "secondary"}
                   >
                     planner: {response.planner}
                   </Badge>
@@ -255,11 +245,11 @@ export default function QueryPlanPage() {
               </CardHeader>
               <CardContent>
                 {response.plan.rationale && (
-                  <p className="mb-4 rounded-lg bg-purple-50 px-3 py-2 text-sm text-slate-700">
+                  <p className="mb-4 rounded-lg bg-signal/10 border border-signal/20 px-3 py-2 text-sm text-foreground">
                     {response.plan.rationale}
                   </p>
                 )}
-                <pre className="overflow-x-auto rounded-lg bg-slate-900 p-4 font-mono text-xs leading-relaxed text-slate-100">
+                <pre className="overflow-x-auto rounded-lg bg-[oklch(0.135_0.012_256)] p-4 font-mono text-xs leading-relaxed text-foreground">
                   {JSON.stringify(response.plan, null, 2)}
                 </pre>
               </CardContent>
@@ -269,7 +259,7 @@ export default function QueryPlanPage() {
             <Card>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
-                  <Database className="h-4 w-4 text-purple-600" />
+                  <Database className="h-4 w-4 text-signal" />
                   Compiled SQL
                 </CardTitle>
                 <CardDescription>
@@ -278,7 +268,7 @@ export default function QueryPlanPage() {
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <pre className="overflow-x-auto rounded-lg bg-slate-900 p-4 font-mono text-xs leading-relaxed text-emerald-200">
+                <pre className="overflow-x-auto rounded-lg bg-[oklch(0.135_0.012_256)] p-4 font-mono text-xs leading-relaxed text-signal">
                   {response.sql}
                 </pre>
               </CardContent>
@@ -290,10 +280,10 @@ export default function QueryPlanPage() {
                 <CardHeader>
                   <div className="flex items-center justify-between gap-2">
                     <CardTitle className="flex items-center gap-2">
-                      <FileText className="h-4 w-4 text-purple-600" />
+                      <FileText className="h-4 w-4 text-signal" />
                       Cited Results
                     </CardTitle>
-                    <Badge variant="outline" className="text-slate-600">
+                    <Badge variant="outline">
                       {response.total} match{response.total === 1 ? "" : "es"}
                     </Badge>
                   </div>
@@ -304,50 +294,50 @@ export default function QueryPlanPage() {
                 </CardHeader>
                 <CardContent className="space-y-4">
                   {response.rows.length === 0 ? (
-                    <p className="rounded-lg border border-dashed border-slate-200 px-4 py-8 text-center text-sm text-slate-500">
+                    <p className="rounded-lg border border-dashed px-4 py-8 text-center text-sm text-muted-foreground">
                       No rows matched this query.
                     </p>
                   ) : (
                     response.rows.map((row) => (
                       <div
                         key={`${row.source_table}:${row.row_id}`}
-                        className="rounded-xl border border-slate-200 bg-white p-4"
+                        className="rounded-xl border bg-card p-4"
                       >
                         <div className="flex flex-wrap items-center gap-2 text-xs">
                           <Badge
-                            variant="secondary"
-                            className="bg-purple-100 font-mono text-purple-700"
+                            variant="signal"
+                            className="font-mono"
                           >
                             {row.source_table}
                           </Badge>
-                          <span className="font-mono text-slate-400">
+                          <span className="font-mono text-muted-foreground">
                             #{row.row_id}
                           </span>
                           {row.event_time && (
-                            <span className="ml-auto text-slate-500">
+                            <span className="ml-auto text-muted-foreground">
                               {row.event_time}
                             </span>
                           )}
                         </div>
 
-                        <p className="mt-2 text-sm text-slate-800">
+                        <p className="mt-2 text-sm text-foreground">
                           {row.preview}
                         </p>
 
                         {row.citations.length > 0 && (
-                          <div className="mt-3 space-y-2 border-t border-slate-100 pt-3">
+                          <div className="mt-3 space-y-2 border-t pt-3">
                             {row.citations.map((c, i) => (
                               <div
                                 key={`${c.column}:${c.char_start}:${i}`}
-                                className="rounded-lg bg-slate-50 p-3 text-xs"
+                                className="rounded-lg bg-surface-1 p-3 text-xs"
                               >
-                                <div className="flex flex-wrap items-center gap-2 text-slate-500">
-                                  <Quote className="h-3 w-3 text-purple-500" />
-                                  <span className="font-mono font-medium text-slate-700">
+                                <div className="flex flex-wrap items-center gap-2 text-muted-foreground">
+                                  <Quote className="h-3 w-3 text-signal" />
+                                  <span className="font-mono font-medium text-foreground">
                                     {c.column}
                                   </span>
                                   <span aria-hidden>•</span>
-                                  <span className="font-mono text-purple-700">
+                                  <span className="font-mono text-signal">
                                     {c.matched_value}
                                   </span>
                                   <span aria-hidden>•</span>
@@ -355,7 +345,7 @@ export default function QueryPlanPage() {
                                     chars {c.char_start}–{c.char_end}
                                   </span>
                                 </div>
-                                <p className="mt-2 leading-relaxed text-slate-700">
+                                <p className="mt-2 leading-relaxed text-foreground">
                                   {highlightSnippet(c)}
                                 </p>
                               </div>
@@ -368,13 +358,13 @@ export default function QueryPlanPage() {
                 </CardContent>
               </Card>
             ) : (
-              <div className="rounded-xl border border-dashed border-purple-200 bg-purple-50/50 px-4 py-6 text-center text-sm text-slate-600">
+              <div className="rounded-xl border border-dashed border-signal/40 bg-signal/5 px-4 py-6 text-center text-sm text-signal">
                 Preview only — the query was not executed.{" "}
                 <button
                   type="button"
                   onClick={() => submit("run")}
                   disabled={busy}
-                  className="font-medium text-purple-700 underline underline-offset-2 disabled:opacity-50"
+                  className="font-medium underline underline-offset-2 disabled:opacity-50"
                 >
                   Run it
                 </button>{" "}

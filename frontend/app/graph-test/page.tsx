@@ -22,7 +22,7 @@ export default function GraphTestPage() {
     try {
       setConnectionStatus('checking')
       setError(null)
-      
+
       // Try to get full graph data
       const data = await graphApi.getFullGraph()
       setSampleData(data)
@@ -78,13 +78,13 @@ export default function GraphTestPage() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 p-6">
+    <div className="min-h-screen bg-background p-6">
       <div className="max-w-7xl mx-auto space-y-6">
         {/* Header */}
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-3xl font-bold text-slate-900">Graph Integration Test</h1>
-            <p className="text-slate-600">Testing Neo4j integration with frontend visualization</p>
+            <h1 className="text-3xl font-bold text-foreground">Graph Integration Test</h1>
+            <p className="text-muted-foreground">Testing Neo4j integration with frontend visualization</p>
           </div>
           <div className="flex items-center gap-4">
             <Button onClick={testConnection} variant="outline">
@@ -110,26 +110,26 @@ export default function GraphTestPage() {
             <div className="flex items-center gap-4">
               {connectionStatus === 'checking' && (
                 <>
-                  <RefreshCw className="w-5 h-5 animate-spin text-blue-600" />
-                  <span className="text-blue-600">Checking connection...</span>
+                  <RefreshCw className="w-5 h-5 animate-spin text-info" />
+                  <span className="text-info">Checking connection...</span>
                 </>
               )}
               {connectionStatus === 'connected' && (
                 <>
-                  <div className="w-5 h-5 bg-green-500 rounded-full"></div>
-                  <span className="text-green-600">Connected to Neo4j backend</span>
+                  <div className="w-5 h-5 bg-signal rounded-full"></div>
+                  <span className="text-signal">Connected to Neo4j backend</span>
                 </>
               )}
               {connectionStatus === 'error' && (
                 <>
-                  <div className="w-5 h-5 bg-red-500 rounded-full"></div>
-                  <span className="text-red-600">Connection failed</span>
+                  <div className="w-5 h-5 bg-destructive rounded-full"></div>
+                  <span className="text-destructive">Connection failed</span>
                 </>
               )}
             </div>
             {error && (
-              <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg">
-                <p className="text-red-800 text-sm">{error}</p>
+              <div className="mt-4 p-3 bg-destructive/10 border border-destructive/30 rounded-lg">
+                <p className="text-destructive text-sm">{error}</p>
               </div>
             )}
           </CardContent>
@@ -142,22 +142,10 @@ export default function GraphTestPage() {
               <CardContent className="p-4">
                 <div className="flex items-center justify-between">
                   <div>
-                    <p className="text-sm text-slate-600">Total Nodes</p>
+                    <p className="text-sm text-muted-foreground">Total Nodes</p>
                     <p className="text-2xl font-bold">{sampleData.nodes?.length || 0}</p>
                   </div>
-                  <Network className="w-8 h-8 text-blue-600" />
-                </div>
-              </CardContent>
-            </Card>
-            
-            <Card>
-              <CardContent className="p-4">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-sm text-slate-600">Connections</p>
-                    <p className="text-2xl font-bold">{sampleData.edges?.length || 0}</p>
-                  </div>
-                  <Network className="w-8 h-8 text-green-600" />
+                  <Network className="w-8 h-8 text-info" />
                 </div>
               </CardContent>
             </Card>
@@ -166,12 +154,24 @@ export default function GraphTestPage() {
               <CardContent className="p-4">
                 <div className="flex items-center justify-between">
                   <div>
-                    <p className="text-sm text-slate-600">People</p>
+                    <p className="text-sm text-muted-foreground">Connections</p>
+                    <p className="text-2xl font-bold">{sampleData.edges?.length || 0}</p>
+                  </div>
+                  <Network className="w-8 h-8 text-signal" />
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardContent className="p-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm text-muted-foreground">People</p>
                     <p className="text-2xl font-bold">
                       {sampleData.nodes?.filter((n: any) => n.label === 'Person').length || 0}
                     </p>
                   </div>
-                  <Users className="w-8 h-8 text-purple-600" />
+                  <Users className="w-8 h-8 text-signal" />
                 </div>
               </CardContent>
             </Card>
@@ -180,12 +180,12 @@ export default function GraphTestPage() {
               <CardContent className="p-4">
                 <div className="flex items-center justify-between">
                   <div>
-                    <p className="text-sm text-slate-600">Messages</p>
+                    <p className="text-sm text-muted-foreground">Messages</p>
                     <p className="text-2xl font-bold">
                       {sampleData.nodes?.filter((n: any) => n.label === 'Message').length || 0}
                     </p>
                   </div>
-                  <MessageSquare className="w-8 h-8 text-orange-600" />
+                  <MessageSquare className="w-8 h-8 text-muted-foreground" />
                 </div>
               </CardContent>
             </Card>
@@ -207,10 +207,10 @@ export default function GraphTestPage() {
             <div className="space-y-4">
               <div>
                 <h4 className="font-medium mb-2">1. Backend Setup</h4>
-                <p className="text-sm text-slate-600 mb-2">
+                <p className="text-sm text-muted-foreground mb-2">
                   Make sure the backend is running with Neo4j integration:
                 </p>
-                <div className="bg-slate-100 p-3 rounded-lg font-mono text-sm">
+                <div className="bg-surface-3 p-3 rounded-lg font-mono text-sm">
                   cd backend<br/>
                   python server.py
                 </div>
@@ -218,14 +218,14 @@ export default function GraphTestPage() {
 
               <div>
                 <h4 className="font-medium mb-2">2. Neo4j Configuration</h4>
-                <p className="text-sm text-slate-600 mb-2">
+                <p className="text-sm text-muted-foreground mb-2">
                   Ensure your .env file has the correct Neo4j Aura credentials.
                 </p>
               </div>
 
               <div>
                 <h4 className="font-medium mb-2">3. Test Steps</h4>
-                <ul className="text-sm text-slate-600 space-y-1">
+                <ul className="text-sm text-muted-foreground space-y-1">
                   <li>• Click "Test Connection" to verify backend connectivity</li>
                   <li>• Click "Add Sample Data" to populate the graph with test data</li>
                   <li>• Use the interactive graph to explore relationships</li>

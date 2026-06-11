@@ -44,17 +44,17 @@ export function AiAssistantView({
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="mb-2 text-4xl font-light tracking-tight text-slate-900">AI Assistant</h2>
-        <p className="text-lg font-light text-slate-600">
+        <h2 className="mb-2 text-4xl font-light tracking-tight text-foreground">AI Assistant</h2>
+        <p className="text-lg font-light text-muted-foreground">
           Ask questions about your forensic data in natural language
         </p>
       </div>
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         <div className="lg:col-span-2">
           <Card className="flex h-[600px] flex-col">
-            <CardHeader className="border-b bg-gradient-to-r from-purple-50 to-purple-100">
-              <CardTitle className="flex items-center gap-2 font-medium text-slate-900">
-                <Bot className="h-5 w-5 text-purple-600" />
+            <CardHeader className="border-b bg-card">
+              <CardTitle className="flex items-center gap-2 font-medium text-foreground">
+                <Bot className="h-5 w-5 text-signal" />
                 Forensic AI Chat
               </CardTitle>
             </CardHeader>
@@ -67,15 +67,15 @@ export function AiAssistantView({
                       <div
                         className={`max-w-full break-words rounded-2xl px-4 py-3 md:max-w-[80%] ${
                           msg.type === "user"
-                            ? "bg-slate-900 text-white"
-                            : "bg-gradient-to-br from-purple-50 to-purple-100 text-slate-900"
+                            ? "bg-primary text-primary-foreground"
+                            : "bg-surface-1 border text-foreground"
                         }`}
                       >
                         {msg.isLoading ? (
                           <div className="flex items-center space-x-1 py-1">
-                            <span className="h-2 w-2 animate-bounce rounded-full bg-slate-500 [animation-delay:-0.3s]"></span>
-                            <span className="h-2 w-2 animate-bounce rounded-full bg-slate-500 [animation-delay:-0.15s]"></span>
-                            <span className="h-2 w-2 animate-bounce rounded-full bg-slate-500"></span>
+                            <span className="h-2 w-2 animate-bounce rounded-full bg-muted-foreground [animation-delay:-0.3s]"></span>
+                            <span className="h-2 w-2 animate-bounce rounded-full bg-muted-foreground [animation-delay:-0.15s]"></span>
+                            <span className="h-2 w-2 animate-bounce rounded-full bg-muted-foreground"></span>
                           </div>
                         ) : (
                           <>
@@ -84,7 +84,7 @@ export function AiAssistantView({
                               <Button
                                 variant="outline"
                                 size="sm"
-                                className="mt-3 flex items-center gap-2 border-purple-200 bg-white text-purple-700 hover:bg-purple-50 hover:text-purple-800"
+                                className="mt-3 flex items-center gap-2"
                                 onClick={() => handleToggleResults(msg.id)}
                               >
                                 {expandedResultsId === msg.id ? (
@@ -106,12 +106,12 @@ export function AiAssistantView({
                     {/* Expandable Detailed Results Section */}
                     {expandedResultsId === msg.id && msg.results && (
                       <div className="mt-2 rounded-lg border bg-white p-4">
-                        <h4 className="mb-2 flex items-center gap-2 text-base font-semibold text-slate-800">
-                          <Database className="h-4 w-4 text-slate-500" /> Detailed Evidence
+                        <h4 className="mb-2 flex items-center gap-2 text-base font-semibold text-foreground">
+                          <Database className="h-4 w-4 text-muted-foreground" /> Detailed Evidence
                         </h4>
                         <div className="max-h-64 space-y-3 overflow-y-auto text-xs">
                           {msg.results.map((res, index) => (
-                            <div key={res.id || index} className="rounded-md border bg-slate-50 p-2 text-slate-700">
+                            <div key={res.id || index} className="rounded-md border bg-surface-1 p-2 text-foreground">
                               <p className="break-all font-mono">
                                 <strong>Path:</strong> {res.original_path}
                               </p>
@@ -146,7 +146,7 @@ export function AiAssistantView({
                   <Button
                     onClick={handleSendMessage}
                     disabled={isSending}
-                    className="bg-slate-900 hover:bg-slate-700"
+                    variant="signal"
                   >
                     <Send className="h-4 w-4" />
                   </Button>
@@ -159,14 +159,14 @@ export function AiAssistantView({
         <div className="space-y-4">
           <Card>
             <CardHeader>
-              <CardTitle className="text-lg font-medium text-slate-900">Quick Questions</CardTitle>
+              <CardTitle className="text-lg font-medium text-foreground">Quick Questions</CardTitle>
             </CardHeader>
             <CardContent className="space-y-2">
               {predefinedQuestions.map((question, index) => (
                 <button
                   key={index}
                   onClick={() => !isSending && setChatInput(question)}
-                  className="w-full rounded-lg bg-gradient-to-r from-purple-50 to-purple-100 p-3 text-left text-sm hover:from-purple-100 hover:to-purple-200"
+                  className="w-full rounded-lg bg-surface-1 border p-3 text-left text-sm hover:bg-surface-3"
                 >
                   {question}
                 </button>
@@ -175,16 +175,16 @@ export function AiAssistantView({
           </Card>
           <Card>
             <CardHeader>
-              <CardTitle className="text-lg font-medium text-slate-900">Current Case Stats</CardTitle>
+              <CardTitle className="text-lg font-medium text-foreground">Current Case Stats</CardTitle>
             </CardHeader>
             <CardContent className="space-y-3">
               <div className="flex items-center justify-between">
-                <span className="text-sm text-slate-600">Total Messages</span>
+                <span className="text-sm text-muted-foreground">Total Messages</span>
                 <Badge variant="secondary">2,847</Badge>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-sm text-slate-600">Deleted Items</span>
-                <Badge variant="secondary">156</Badge>
+                <span className="text-sm text-muted-foreground">Deleted Items</span>
+                <Badge variant="high">156</Badge>
               </div>
             </CardContent>
           </Card>

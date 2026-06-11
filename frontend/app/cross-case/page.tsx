@@ -3,7 +3,6 @@
 import { useState } from "react"
 import Link from "next/link"
 import {
-  Shield,
   Link2,
   Search,
   Loader2,
@@ -23,6 +22,7 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
+import { Seal } from "@/components/brand/Seal"
 import {
   getCrossCaseLinks,
   lookupIdentifier,
@@ -33,9 +33,9 @@ import {
 
 function IdentifierIcon({ type }: { type: IdentifierType }) {
   return type === "email" ? (
-    <Mail className="h-4 w-4 text-purple-600" />
+    <Mail className="h-4 w-4 text-signal" />
   ) : (
-    <Phone className="h-4 w-4 text-purple-600" />
+    <Phone className="h-4 w-4 text-signal" />
   )
 }
 
@@ -56,7 +56,7 @@ function ErrorBanner({ message }: { message: string }) {
 function RunIdList({ runs }: { runs: string[] }) {
   if (runs.length === 0) {
     return (
-      <span className="text-xs italic text-slate-400">no other runs</span>
+      <span className="text-xs italic text-muted-foreground">no other runs</span>
     )
   }
   return (
@@ -64,7 +64,7 @@ function RunIdList({ runs }: { runs: string[] }) {
       {runs.map((r) => (
         <span
           key={r}
-          className="rounded bg-slate-50 px-1.5 py-0.5 font-mono text-xs text-slate-600"
+          className="rounded bg-surface-1 px-1.5 py-0.5 font-mono text-xs text-muted-foreground"
         >
           {r}
         </span>
@@ -123,27 +123,23 @@ export default function CrossCasePage() {
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-purple-50 to-white">
-      <header className="w-full border-b border-slate-200 bg-white/80 px-4 py-5 backdrop-blur-sm sm:px-8">
+    <div className="min-h-screen bg-background">
+      <header className="w-full border-b bg-background/80 px-4 py-5 backdrop-blur-md sm:px-8">
         <div className="mx-auto flex max-w-5xl items-center justify-between">
           <Link href="/" className="flex items-center gap-2">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-purple-600 to-purple-800">
-              <Shield className="h-4 w-4 text-white" />
-            </div>
-            <span className="text-xl font-medium text-slate-900">ForensicAI</span>
+            <Seal size={28} />
+            <span className="text-xl font-medium text-foreground">ForensicAI</span>
           </Link>
-          <Badge variant="secondary" className="bg-purple-100 text-purple-700">
-            Cross-case Correlation
-          </Badge>
+          <Badge variant="signal">Cross-case Correlation</Badge>
         </div>
       </header>
 
       <main className="mx-auto max-w-5xl px-4 py-8 sm:px-8">
         <div className="mb-8">
-          <h1 className="text-2xl font-semibold text-slate-900">
+          <h1 className="text-2xl font-semibold text-foreground">
             Cross-case correlation
           </h1>
-          <p className="mt-1 max-w-2xl text-sm text-slate-600">
+          <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
             Find identifiers that bridge multiple investigations. Identifiers are
             matched on a privacy-preserving salted hash, so cases can be linked
             without exposing the raw phone numbers or emails.
@@ -154,7 +150,7 @@ export default function CrossCasePage() {
         <Card className="mb-8">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <Link2 className="h-4 w-4 text-purple-600" />
+              <Link2 className="h-4 w-4 text-signal" />
               Links for a run
             </CardTitle>
             <CardDescription>
@@ -166,7 +162,7 @@ export default function CrossCasePage() {
               <div className="flex flex-1 flex-col gap-2">
                 <label
                   htmlFor="run-id"
-                  className="text-sm font-medium text-slate-800"
+                  className="text-sm font-medium text-foreground"
                 >
                   Run ID
                 </label>
@@ -179,13 +175,13 @@ export default function CrossCasePage() {
                   }}
                   placeholder="Extraction run UUID"
                   disabled={linksLoading}
-                  className="font-mono focus-visible:ring-purple-500"
+                  className="font-mono"
                 />
               </div>
               <Button
+                variant="signal"
                 onClick={findLinks}
                 disabled={linksLoading}
-                className="bg-slate-900 hover:bg-slate-700"
               >
                 {linksLoading ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -200,35 +196,32 @@ export default function CrossCasePage() {
 
             {links && (
               <div className="space-y-3">
-                <p className="text-sm text-slate-600">
+                <p className="text-sm text-muted-foreground">
                   {links.link_count} cross-case link
                   {links.link_count === 1 ? "" : "s"} found.
                 </p>
                 {links.links.length === 0 ? (
-                  <p className="rounded-lg border border-dashed border-slate-200 px-4 py-8 text-center text-sm text-slate-500">
+                  <p className="rounded-lg border border-dashed px-4 py-8 text-center text-sm text-muted-foreground">
                     No identifiers in this run appear in other cases.
                   </p>
                 ) : (
                   links.links.map((l) => (
                     <div
                       key={`${l.identifier_type}:${l.identifier}`}
-                      className="rounded-xl border border-slate-200 bg-white p-4"
+                      className="rounded-xl border bg-card p-4"
                     >
                       <div className="flex flex-wrap items-center gap-2">
                         <IdentifierIcon type={l.identifier_type} />
-                        <span className="font-mono text-sm font-medium text-slate-900">
+                        <span className="font-mono text-sm font-medium text-foreground">
                           {l.identifier}
                         </span>
-                        <Badge
-                          variant="secondary"
-                          className="ml-auto bg-purple-100 text-purple-700"
-                        >
+                        <Badge variant="signal" className="ml-auto">
                           appears in {l.case_count} case
                           {l.case_count === 1 ? "" : "s"}
                         </Badge>
                       </div>
-                      <div className="mt-3 border-t border-slate-100 pt-3">
-                        <p className="mb-1.5 text-xs font-medium text-slate-500">
+                      <div className="mt-3 border-t pt-3">
+                        <p className="mb-1.5 text-xs font-medium text-muted-foreground">
                           Also in runs
                         </p>
                         <RunIdList runs={l.also_in_runs} />
@@ -245,7 +238,7 @@ export default function CrossCasePage() {
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <Search className="h-4 w-4 text-purple-600" />
+              <Search className="h-4 w-4 text-signal" />
               Identifier lookup
             </CardTitle>
             <CardDescription>
@@ -257,7 +250,7 @@ export default function CrossCasePage() {
               <div className="flex flex-1 flex-col gap-2">
                 <label
                   htmlFor="identifier"
-                  className="text-sm font-medium text-slate-800"
+                  className="text-sm font-medium text-foreground"
                 >
                   Identifier
                 </label>
@@ -270,13 +263,13 @@ export default function CrossCasePage() {
                   }}
                   placeholder="+15551234567 or name@example.com"
                   disabled={lookupLoading}
-                  className="font-mono focus-visible:ring-purple-500"
+                  className="font-mono"
                 />
               </div>
               <Button
+                variant="signal"
                 onClick={runLookup}
                 disabled={lookupLoading}
-                className="bg-slate-900 hover:bg-slate-700"
               >
                 {lookupLoading ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -290,33 +283,30 @@ export default function CrossCasePage() {
             {lookupError && <ErrorBanner message={lookupError} />}
 
             {lookup && (
-              <div className="rounded-xl border border-slate-200 bg-white p-4">
+              <div className="rounded-xl border bg-card p-4">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-mono text-sm font-medium text-slate-900">
+                  <span className="font-mono text-sm font-medium text-foreground">
                     {lookup.identifier}
                   </span>
-                  <Badge
-                    variant="secondary"
-                    className="ml-auto bg-purple-100 text-purple-700"
-                  >
+                  <Badge variant="signal" className="ml-auto">
                     {lookup.count} case{lookup.count === 1 ? "" : "s"}
                   </Badge>
                 </div>
 
-                <div className="mt-3 border-t border-slate-100 pt-3">
-                  <p className="mb-1.5 text-xs font-medium text-slate-500">
+                <div className="mt-3 border-t pt-3">
+                  <p className="mb-1.5 text-xs font-medium text-muted-foreground">
                     Appears in runs
                   </p>
                   <RunIdList runs={lookup.runs} />
                 </div>
 
-                <div className="mt-3 flex items-start gap-2 rounded-lg bg-slate-50 p-3">
-                  <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-400" />
+                <div className="mt-3 flex items-start gap-2 rounded-lg bg-surface-1 p-3">
+                  <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-signal" />
                   <div className="min-w-0">
-                    <p className="text-xs font-medium text-slate-600">
+                    <p className="text-xs font-medium text-foreground">
                       Salted hash (privacy-preserving)
                     </p>
-                    <p className="mt-0.5 break-all font-mono text-xs text-slate-500">
+                    <p className="mt-0.5 break-all font-mono text-xs text-muted-foreground">
                       {lookup.identifier_hash}
                     </p>
                   </div>

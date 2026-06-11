@@ -82,13 +82,13 @@ export function GraphAnalysisView() {
   const getNodeTypeColor = (nodeType: string) => {
     switch (nodeType.toLowerCase()) {
       case 'person':
-        return 'bg-blue-100 text-blue-800'
+        return 'text-[var(--chart-2)] bg-[var(--chart-2)]/15'
       case 'message':
-        return 'bg-green-100 text-green-800'
+        return 'text-signal bg-signal/15'
       case 'call':
-        return 'bg-purple-100 text-purple-800'
+        return 'text-[var(--chart-5)] bg-[var(--chart-5)]/15'
       default:
-        return 'bg-gray-100 text-gray-800'
+        return 'text-muted-foreground bg-muted/15'
     }
   }
 
@@ -96,17 +96,17 @@ export function GraphAnalysisView() {
     return (
       <div className="space-y-6">
         <div>
-          <h2 className="text-4xl font-light text-slate-900 tracking-tight mb-2">
+          <h2 className="text-4xl font-light text-foreground tracking-tight mb-2">
             Graph Analysis
           </h2>
-          <p className="text-lg text-slate-600 font-light">
+          <p className="text-lg text-muted-foreground font-light">
             Loading network data and analytics...
           </p>
         </div>
         <div className="flex items-center justify-center h-96">
           <div className="text-center">
-            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-slate-900 mx-auto mb-4"></div>
-            <p className="text-slate-600">Loading graph data...</p>
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-signal mx-auto mb-4"></div>
+            <p className="text-muted-foreground">Loading graph data...</p>
           </div>
         </div>
       </div>
@@ -117,18 +117,18 @@ export function GraphAnalysisView() {
     return (
       <div className="space-y-6">
         <div>
-          <h2 className="text-4xl font-light text-slate-900 tracking-tight mb-2">
+          <h2 className="text-4xl font-light text-foreground tracking-tight mb-2">
             Graph Analysis
           </h2>
-          <p className="text-lg text-slate-600 font-light">
+          <p className="text-lg text-muted-foreground font-light">
             Failed to load graph data
           </p>
         </div>
         <Card>
           <CardContent className="flex items-center justify-center h-96">
             <div className="text-center">
-              <div className="text-red-500 mb-4">Error loading graph</div>
-              <p className="text-slate-600 mb-4">{error}</p>
+              <div className="text-destructive mb-4">Error loading graph</div>
+              <p className="text-muted-foreground mb-4">{error}</p>
               <Button onClick={loadGraphData} variant="outline">
                 Retry
               </Button>
@@ -142,16 +142,16 @@ export function GraphAnalysisView() {
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-4xl font-light text-slate-900 tracking-tight mb-2">
+        <h2 className="text-4xl font-light text-foreground tracking-tight mb-2">
           Graph Analysis
         </h2>
-        <p className="text-lg text-slate-600 font-light">
+        <p className="text-lg text-muted-foreground font-light">
           Network visualization and relationship analysis
         </p>
       </div>
 
       {/* Tab navigation */}
-      <div className="flex space-x-1 bg-slate-100 p-1 rounded-lg w-fit">
+      <div className="flex space-x-1 bg-surface-1 border p-1 rounded-lg w-fit">
         <Button
           variant={activeTab === 'network' ? 'default' : 'ghost'}
           size="sm"
@@ -196,10 +196,10 @@ export function GraphAnalysisView() {
                 <CardContent className="p-6">
                   <div className="flex items-center justify-between">
                     <div>
-                      <p className="text-sm text-slate-600">Total Nodes</p>
+                      <p className="text-sm text-muted-foreground">Total Nodes</p>
                       <p className="text-3xl font-bold">{stats.totalNodes}</p>
                     </div>
-                    <Network className="w-8 h-8 text-blue-600" />
+                    <Network className="w-8 h-8 text-[var(--chart-2)]" />
                   </div>
                 </CardContent>
               </Card>
@@ -208,10 +208,10 @@ export function GraphAnalysisView() {
                 <CardContent className="p-6">
                   <div className="flex items-center justify-between">
                     <div>
-                      <p className="text-sm text-slate-600">Connections</p>
+                      <p className="text-sm text-muted-foreground">Connections</p>
                       <p className="text-3xl font-bold">{stats.totalEdges}</p>
                     </div>
-                    <Network className="w-8 h-8 text-green-600" />
+                    <Network className="w-8 h-8 text-signal" />
                   </div>
                 </CardContent>
               </Card>
@@ -220,10 +220,10 @@ export function GraphAnalysisView() {
                 <CardContent className="p-6">
                   <div className="flex items-center justify-between">
                     <div>
-                      <p className="text-sm text-slate-600">Node Types</p>
+                      <p className="text-sm text-muted-foreground">Node Types</p>
                       <p className="text-3xl font-bold">{Object.keys(stats.nodeTypes).length}</p>
                     </div>
-                    <Filter className="w-8 h-8 text-purple-600" />
+                    <Filter className="w-8 h-8 text-[var(--chart-5)]" />
                   </div>
                 </CardContent>
               </Card>
@@ -232,12 +232,12 @@ export function GraphAnalysisView() {
                 <CardContent className="p-6">
                   <div className="flex items-center justify-between">
                     <div>
-                      <p className="text-sm text-slate-600">Density</p>
+                      <p className="text-sm text-muted-foreground">Density</p>
                       <p className="text-3xl font-bold">
                         {stats.totalNodes > 0 ? ((stats.totalEdges / (stats.totalNodes * (stats.totalNodes - 1))) * 100).toFixed(1) : 0}%
                       </p>
                     </div>
-                    <TrendingUp className="w-8 h-8 text-orange-600" />
+                    <TrendingUp className="w-8 h-8 text-[var(--severity-medium)]" />
                   </div>
                 </CardContent>
               </Card>
@@ -259,7 +259,7 @@ export function GraphAnalysisView() {
                         {getNodeTypeIcon(type)}
                         <div>
                           <p className="font-medium">{type}</p>
-                          <p className="text-sm text-slate-600">{count as number} nodes</p>
+                          <p className="text-sm text-muted-foreground">{count as number} nodes</p>
                         </div>
                       </div>
                       <Badge className={getNodeTypeColor(type)}>
@@ -284,12 +284,12 @@ export function GraphAnalysisView() {
                   {centralityData.slice(0, 10).map((item, index) => (
                     <div key={item.id} className="flex items-center justify-between p-3 border rounded-lg">
                       <div className="flex items-center gap-3">
-                        <div className="w-8 h-8 bg-blue-100 text-blue-800 rounded-full flex items-center justify-center text-sm font-medium">
+                        <div className="w-8 h-8 text-[var(--chart-2)] bg-[var(--chart-2)]/15 rounded-full flex items-center justify-center text-sm font-medium">
                           {index + 1}
                         </div>
                         <div>
                           <p className="font-medium">{item.id}</p>
-                          <p className="text-sm text-slate-600">Degree: {item.degree}</p>
+                          <p className="text-sm text-muted-foreground">Degree: {item.degree}</p>
                         </div>
                       </div>
                       <Badge variant="secondary">
@@ -314,27 +314,27 @@ export function GraphAnalysisView() {
             </CardHeader>
             <CardContent>
               <div className="space-y-4">
-                <div className="p-4 bg-blue-50 rounded-lg">
-                  <h4 className="font-medium text-blue-900 mb-2">Key Findings</h4>
-                  <ul className="text-sm text-blue-800 space-y-1">
+                <div className="p-4 bg-signal/10 rounded-lg">
+                  <h4 className="font-medium text-foreground mb-2">Key Findings</h4>
+                  <ul className="text-sm text-muted-foreground space-y-1">
                     <li>• Network shows {stats?.totalNodes || 0} entities with {stats?.totalEdges || 0} connections</li>
                     <li>• Most active entity type: {stats ? Object.entries(stats.nodeTypes).sort(([,a], [,b]) => (b as number) - (a as number))[0]?.[0] : 'N/A'}</li>
                     <li>• Network density: {stats?.totalNodes > 0 ? ((stats.totalEdges / (stats.totalNodes * (stats.totalNodes - 1))) * 100).toFixed(1) : 0}%</li>
                   </ul>
                 </div>
 
-                <div className="p-4 bg-green-50 rounded-lg">
-                  <h4 className="font-medium text-green-900 mb-2">Recommendations</h4>
-                  <ul className="text-sm text-green-800 space-y-1">
+                <div className="p-4 bg-info/10 rounded-lg">
+                  <h4 className="font-medium text-foreground mb-2">Recommendations</h4>
+                  <ul className="text-sm text-muted-foreground space-y-1">
                     <li>• Focus investigation on highly connected nodes</li>
                     <li>• Analyze communication patterns between key entities</li>
                     <li>• Look for isolated nodes that might indicate hidden connections</li>
                   </ul>
                 </div>
 
-                <div className="p-4 bg-orange-50 rounded-lg">
-                  <h4 className="font-medium text-orange-900 mb-2">Next Steps</h4>
-                  <ul className="text-sm text-orange-800 space-y-1">
+                <div className="p-4 bg-[var(--severity-medium)]/10 rounded-lg">
+                  <h4 className="font-medium text-foreground mb-2">Next Steps</h4>
+                  <ul className="text-sm text-muted-foreground space-y-1">
                     <li>• Run timeline analysis on key communication channels</li>
                     <li>• Investigate nodes with unusual connection patterns</li>
                     <li>• Export network data for further analysis</li>

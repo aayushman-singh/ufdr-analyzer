@@ -1,7 +1,7 @@
 "use client"
 import { Plus, FileText, Clock, MoreHorizontal } from 'lucide-react';
 import Link from 'next/link';
-import Header from '@/components/header'; // Assuming your pre-built header is here
+import Header from '@/components/header';
 
 // Mock data for the analysis cases
 const analysisCases = [
@@ -22,21 +22,21 @@ const analysisCases = [
 const CaseCard = ({ caseData }: { caseData: typeof analysisCases[0] }) => {
   const isCompleted = caseData.status === 'Completed';
   return (
-    <div className="bg-white/60 backdrop-blur-sm border border-gray-200/80 rounded-2xl p-6 shadow-sm hover:shadow-md transition-shadow duration-300">
+    <div className="bg-card/60 backdrop-blur-sm border border-border rounded-2xl p-6 shadow-sm hover:shadow-md transition-shadow duration-300">
       <div className="flex justify-between items-start">
         <div className="flex items-start space-x-4">
-          <div className="bg-gray-100 rounded-lg p-3 flex-shrink-0">
-            <FileText className="w-5 h-5 text-gray-600" />
+          <div className="bg-surface-2 rounded-lg p-3 flex-shrink-0">
+            <FileText className="w-5 h-5 text-muted-foreground" />
           </div>
           <div>
-            <h3 className="font-semibold text-gray-800">{caseData.title}</h3>
-            <div className="flex items-center space-x-2 text-sm text-gray-500 mt-1">
+            <h3 className="font-semibold text-foreground">{caseData.title}</h3>
+            <div className="flex items-center space-x-2 text-sm text-muted-foreground mt-1">
               <Clock className="w-4 h-4" />
               <span>{caseData.date}</span>
             </div>
           </div>
         </div>
-        <button className="text-gray-400 hover:text-gray-700">
+        <button className="text-muted-foreground hover:text-foreground">
           <MoreHorizontal className="w-5 h-5" />
         </button>
       </div>
@@ -44,8 +44,8 @@ const CaseCard = ({ caseData }: { caseData: typeof analysisCases[0] }) => {
         <span
           className={`px-3 py-1 text-xs font-medium rounded-full ${
             isCompleted
-              ? 'bg-green-100 text-green-700'
-              : 'bg-blue-100 text-blue-700'
+              ? 'bg-[color-mix(in_oklch,var(--signal)_15%,transparent)] text-signal'
+              : 'bg-[color-mix(in_oklch,var(--info)_15%,transparent)] text-info'
           }`}
         >
           {caseData.status}
@@ -57,39 +57,41 @@ const CaseCard = ({ caseData }: { caseData: typeof analysisCases[0] }) => {
 
 export default function AnalysisDashboardPage() {
   return (
-    <div className="min-h-screen w-full relative bg-white">
-      {/* Purple Glow Top Background */}
+    <div className="theme-light min-h-screen w-full relative bg-background">
+      {/* Signal radial background */}
       <div
-        className="absolute inset-0 z-0"
+        className="absolute inset-0 z-0 bg-grid"
         style={{
-          background: "#ffffff",
           backgroundImage: `
-            radial-gradient(
-              circle at top center,
-              rgba(173, 109, 244, 0.5),
-              transparent 70%
-            )
+            linear-gradient(to right, oklch(0.205 0.012 256 / 0.04) 1px, transparent 1px),
+            linear-gradient(to bottom, oklch(0.205 0.012 256 / 0.04) 1px, transparent 1px)
           `,
-          filter: "blur(80px)",
-          backgroundRepeat: "no-repeat",
+          backgroundSize: "64px 64px",
         }}
-      />
+      >
+        <div
+          className="absolute inset-0"
+          style={{
+            background:
+              "radial-gradient(circle at top center, color-mix(in oklch, var(--signal) 10%, transparent), transparent 70%)",
+          }}
+        />
+      </div>
 
-   
       <div className="relative z-10">
         <Header />
 
         <main className="max-w-7xl mx-auto px-8 py-10">
-       
+
           <div className="flex justify-between items-center mb-16">
             <div>
-              <h1 className="text-5xl font-light text-slate-900 mb-2">Analysis Dashboard</h1>
-              <p className="text-lg text-slate-600 font-light">
+              <h1 className="text-5xl font-light text-foreground mb-2">Analysis Dashboard</h1>
+              <p className="text-lg text-muted-foreground font-light">
                 Manage and review your forensic analysis cases.
               </p>
             </div>
             <Link href="/upload" passHref>
-              <button className="bg-slate-900 text-white font-light py-3 px-6 rounded-lg flex items-center space-x-2 hover:bg-slate-700 transition-colors shadow-sm">
+              <button className="bg-signal text-signal-foreground font-medium py-3 px-6 rounded-lg flex items-center space-x-2 hover:brightness-110 transition-all shadow-sm">
                 <Plus className="w-5 h-5" />
                 <span>Upload UFDR File</span>
               </button>

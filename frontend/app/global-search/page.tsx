@@ -17,7 +17,8 @@ import {
   SidebarMenuItem,
   SidebarMenuButton,
 } from "@/components/ui/sidebar"
-import { Bot, User, Send, Plus, Shield, Files, ChevronsRightLeft } from "lucide-react"
+import { Seal } from "@/components/brand/Seal"
+import { Send, Plus, Files, ChevronsRightLeft } from "lucide-react"
 import Link from "next/link"
 
 const mockChatHistory = [
@@ -84,24 +85,22 @@ export default function GlobalSearchPage() {
     <div className="flex flex-col h-screen">
       <div className="flex-1 flex overflow-hidden">
         <SidebarProvider>
-          <Sidebar className="pt-4 bg-gradient-to-b from-purple-50 to-white">
+          <Sidebar className="pt-4 bg-sidebar">
             <SidebarHeader className="flex flex-col items-center gap-3 mb-4">
               <div className="flex items-center gap-2">
-                <div className="w-9 h-9 bg-gradient-to-br from-purple-600 to-purple-800 rounded-lg flex items-center justify-center">
-                  <Shield className="w-4 h-4 text-white" />
-                </div>
-                <Link href="/"><span className="text-lg font-medium text-slate-900">ForensicAI</span>
+                <Seal size={28} />
+                <Link href="/"><span className="text-lg font-medium text-foreground">ForensicAI</span>
               </Link>
                 </div>
               <Button
                 variant="outline"
-                className="w-full justify-start text-slate-800 bg-transparent"
+                className="w-full justify-start bg-transparent"
               >
                 <Plus className="w-4 h-4 mr-2" /> New Investigation
               </Button>
             </SidebarHeader>
             <SidebarContent className="p-2">
-              <p className="text-sm font-semibold text-slate-800 px-3 mb-2">History</p>
+              <p className="text-sm font-semibold text-foreground px-3 mb-2">History</p>
               <SidebarMenu>
                 {mockChatHistory.map((chat) => (
                   <SidebarMenuItem key={chat.id}>
@@ -120,9 +119,9 @@ export default function GlobalSearchPage() {
 
           <SidebarInset>
             <div className="flex flex-col h-full">
-              <header className="flex h-16 shrink-0 items-center gap-4 border-b px-4 bg-white/80 backdrop-blur-sm">
+              <header className="flex h-16 shrink-0 items-center gap-4 border-b px-4 bg-card/80 backdrop-blur-sm">
                 <SidebarTrigger className="-ml-1" />
-                <h2 className="text-lg font-semibold text-slate-900">
+                <h2 className="text-lg font-semibold text-foreground">
                   {mockChatHistory.find((c) => c.id === activeChatId)?.title ||
                     "Master Investigation"}
                 </h2>
@@ -148,14 +147,14 @@ export default function GlobalSearchPage() {
                               <label
                                 key={c.id}
                                 htmlFor={c.id}
-                                className="flex items-center gap-3 p-2 rounded-md hover:bg-purple-50 cursor-pointer"
+                                className="flex items-center gap-3 p-2 rounded-md hover:bg-surface-3 cursor-pointer"
                               >
                                 <Checkbox
                                   id={c.id}
                                   checked={selectedCases.includes(c.id)}
                                   onCheckedChange={() => handleCaseSelection(c.id)}
                                 />
-                                <span className="text-sm font-medium text-slate-700">
+                                <span className="text-sm font-medium text-foreground">
                                   {c.name}
                                 </span>
                               </label>
@@ -182,8 +181,8 @@ export default function GlobalSearchPage() {
                         <div
                           className={`max-w-[80%] rounded-2xl px-4 py-3 ${
                             msg.type === "ai"
-                              ? "bg-gradient-to-br from-purple-50 to-purple-100 text-slate-900"
-                              : "bg-slate-900 text-white"
+                              ? "bg-surface-1 border text-foreground"
+                              : "bg-primary text-primary-foreground"
                           }`}
                         >
                           <p className="text-sm leading-relaxed whitespace-pre-wrap">
@@ -196,16 +195,16 @@ export default function GlobalSearchPage() {
                 </div>
 
                 {/* predefined Q&A */}
-                <div className="p-4 bg-white/80 backdrop-blur-sm border-t">
+                <div className="p-4 bg-card/80 backdrop-blur-sm border-t">
                   <div className="max-w-3xl mx-auto">
                     <div className="grid grid-cols-2 gap-2 mb-2">
                       {suggestedPrompts.map((prompt, i) => (
                         <button
                           key={i}
                           onClick={() => setInput(prompt)}
-                          className="text-xs text-left bg-gradient-to-r from-purple-50 to-purple-100 text-gray-600 p-2.5 rounded-lg hover:from-purple-100 hover:to-purple-200 transition-colors"
+                          className="text-xs text-left bg-surface-2 text-muted-foreground p-2.5 rounded-lg hover:bg-surface-3 transition-colors"
                         >
-                          <ChevronsRightLeft className="w-3 h-3 inline-block mr-2 text-purple-600" />
+                          <ChevronsRightLeft className="w-3 h-3 inline-block mr-2 text-signal" />
                           {prompt}
                         </button>
                       ))}
@@ -216,12 +215,13 @@ export default function GlobalSearchPage() {
                         onChange={(e) => setInput(e.target.value)}
                         onKeyPress={(e) => e.key === "Enter" && handleSendMessage()}
                         placeholder="Ask a question across all cases..."
-                        className="w-full py-6 pl-4 pr-14 text-base rounded-lg border-gray-300 focus-visible:ring-purple-500"
+                        className="w-full py-6 pl-4 pr-14 text-base rounded-lg focus-visible:ring-signal/50"
                       />
                       <Button
                         onClick={handleSendMessage}
                         size="icon"
-                        className="absolute right-2 top-1/2 -translate-y-1/2 rounded-full bg-slate-900 hover:bg-slate-700"
+                        variant="signal"
+                        className="absolute right-2 top-1/2 -translate-y-1/2 rounded-full"
                       >
                         <Send className="w-5 h-5" />
                       </Button>

@@ -1,3 +1,17 @@
+/* =============================================================================
+   ForensicAI — globals.css  (Evidence Terminal restyle)
+   Drop-in replacement for frontend/app/globals.css
+
+   Strategy: the shadcn primitives already reference semantic tokens
+   (bg-primary, bg-card, border, text-muted-foreground, …), so swapping the
+   VALUES below restyles ~90% of the app with zero component edits. Only two
+   primitives gain NEW variants (signal / severity) — see components/ui/*.
+
+   Dark-first: the workbench palette lives in :root AND .dark. Add
+   class="dark" to <html> in layout.tsx so shadcn's `dark:` utilities also
+   fire. Marketing + printable report surfaces get class="theme-light".
+   ============================================================================= */
+
 @import "tailwindcss";
 @import "tw-animate-css";
 
@@ -37,86 +51,166 @@
   --color-popover: var(--popover);
   --color-card-foreground: var(--card-foreground);
   --color-card: var(--card);
+
+  /* ---- NEW tokens (additive) — enable bg-signal / text-signal / etc. ----- */
+  --color-signal: var(--signal);
+  --color-signal-foreground: var(--signal-foreground);
+  --color-info: var(--info);
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-severity-high: var(--severity-high);
+  --color-severity-medium: var(--severity-medium);
+  --color-severity-low: var(--severity-low);
+
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
   --radius-xl: calc(var(--radius) + 4px);
 }
 
+/* ============================ WORKBENCH (dark-first) ======================== */
 :root {
   --radius: 0.625rem;
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
-  --chart-1: oklch(0.646 0.222 41.116);
-  --chart-2: oklch(0.6 0.118 184.704);
-  --chart-3: oklch(0.398 0.07 227.392);
-  --chart-4: oklch(0.828 0.189 84.429);
-  --chart-5: oklch(0.769 0.188 70.08);
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
+
+  --background:            oklch(0.165 0.012 256);
+  --foreground:            oklch(0.967 0.004 247);
+  --card:                  oklch(0.205 0.014 256);
+  --card-foreground:       oklch(0.967 0.004 247);
+  --popover:               oklch(0.225 0.015 256);
+  --popover-foreground:    oklch(0.967 0.004 247);
+
+  --surface-1:             oklch(0.190 0.013 256);
+  --surface-2:             oklch(0.205 0.014 256);
+  --surface-3:             oklch(0.245 0.016 256);
+
+  --primary:               oklch(0.955 0.004 247);
+  --primary-foreground:    oklch(0.205 0.012 256);
+  --secondary:             oklch(0.262 0.015 256);
+  --secondary-foreground:  oklch(0.967 0.004 247);
+  --muted:                 oklch(0.262 0.015 256);
+  --muted-foreground:      oklch(0.705 0.018 252);
+  --accent:                oklch(0.262 0.015 256);
+  --accent-foreground:     oklch(0.967 0.004 247);
+
+  /* signal — the one hero accent ("Lumen" chartreuse). Swap hue 117 to retheme. */
+  --signal:                oklch(0.860 0.175 117);
+  --signal-foreground:     oklch(0.190 0.040 120);
+
+  --destructive:           oklch(0.640 0.205 18);
+  --severity-high:         oklch(0.640 0.205 18);
+  --severity-medium:       oklch(0.800 0.140 78);
+  --severity-low:          oklch(0.705 0.018 252);
+  --info:                  oklch(0.700 0.090 235);
+
+  --border:                oklch(1 0 0 / 0.085);
+  --input:                 oklch(1 0 0 / 0.12);
+  --ring:                  oklch(0.860 0.175 117 / 0.55);
+
+  --chart-1:               oklch(0.860 0.175 117);
+  --chart-2:               oklch(0.700 0.090 235);
+  --chart-3:               oklch(0.640 0.205 18);
+  --chart-4:               oklch(0.800 0.140 78);
+  --chart-5:               oklch(0.620 0.110 285);
+
+  --sidebar:               oklch(0.185 0.013 256);
+  --sidebar-foreground:    oklch(0.880 0.010 250);
+  --sidebar-primary:       oklch(0.860 0.175 117);
+  --sidebar-primary-foreground: oklch(0.190 0.040 120);
+  --sidebar-accent:        oklch(0.245 0.016 256);
+  --sidebar-accent-foreground:  oklch(0.967 0.004 247);
+  --sidebar-border:        oklch(1 0 0 / 0.07);
+  --sidebar-ring:          oklch(0.860 0.175 117 / 0.55);
 }
 
+/* Mirror onto .dark so shadcn `dark:` variant utilities engage. */
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.205 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.704 0.191 22.216);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
-  --chart-1: oklch(0.488 0.243 264.376);
-  --chart-2: oklch(0.696 0.17 162.48);
-  --chart-3: oklch(0.769 0.188 70.08);
-  --chart-4: oklch(0.627 0.265 303.9);
-  --chart-5: oklch(0.645 0.246 16.439);
-  --sidebar: oklch(0.205 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.556 0 0);
+  --background:            oklch(0.165 0.012 256);
+  --foreground:            oklch(0.967 0.004 247);
+  --card:                  oklch(0.205 0.014 256);
+  --card-foreground:       oklch(0.967 0.004 247);
+  --popover:               oklch(0.225 0.015 256);
+  --popover-foreground:    oklch(0.967 0.004 247);
+  --surface-1:             oklch(0.190 0.013 256);
+  --surface-2:             oklch(0.205 0.014 256);
+  --surface-3:             oklch(0.245 0.016 256);
+  --primary:               oklch(0.955 0.004 247);
+  --primary-foreground:    oklch(0.205 0.012 256);
+  --secondary:             oklch(0.262 0.015 256);
+  --secondary-foreground:  oklch(0.967 0.004 247);
+  --muted:                 oklch(0.262 0.015 256);
+  --muted-foreground:      oklch(0.705 0.018 252);
+  --accent:                oklch(0.262 0.015 256);
+  --accent-foreground:     oklch(0.967 0.004 247);
+  --signal:                oklch(0.860 0.175 117);
+  --signal-foreground:     oklch(0.190 0.040 120);
+  --destructive:           oklch(0.640 0.205 18);
+  --severity-high:         oklch(0.640 0.205 18);
+  --severity-medium:       oklch(0.800 0.140 78);
+  --severity-low:          oklch(0.705 0.018 252);
+  --info:                  oklch(0.700 0.090 235);
+  --border:                oklch(1 0 0 / 0.085);
+  --input:                 oklch(1 0 0 / 0.12);
+  --ring:                  oklch(0.860 0.175 117 / 0.55);
+  --chart-1:               oklch(0.860 0.175 117);
+  --chart-2:               oklch(0.700 0.090 235);
+  --chart-3:               oklch(0.640 0.205 18);
+  --chart-4:               oklch(0.800 0.140 78);
+  --chart-5:               oklch(0.620 0.110 285);
+  --sidebar:               oklch(0.185 0.013 256);
+  --sidebar-foreground:    oklch(0.880 0.010 250);
+  --sidebar-primary:       oklch(0.860 0.175 117);
+  --sidebar-primary-foreground: oklch(0.190 0.040 120);
+  --sidebar-accent:        oklch(0.245 0.016 256);
+  --sidebar-accent-foreground:  oklch(0.967 0.004 247);
+  --sidebar-border:        oklch(1 0 0 / 0.07);
+  --sidebar-ring:          oklch(0.860 0.175 117 / 0.55);
+}
+
+/* ============================ LIGHT "LAB" (marketing / print) =============== */
+.theme-light {
+  --background:            oklch(0.985 0.003 250);
+  --foreground:            oklch(0.205 0.012 256);
+  --card:                  oklch(1 0 0);
+  --card-foreground:       oklch(0.205 0.012 256);
+  --popover:               oklch(1 0 0);
+  --popover-foreground:    oklch(0.205 0.012 256);
+  --surface-1:             oklch(0.965 0.004 250);
+  --surface-2:             oklch(1 0 0);
+  --surface-3:             oklch(0.955 0.005 250);
+  --primary:               oklch(0.205 0.012 256);
+  --primary-foreground:    oklch(0.985 0.003 250);
+  --secondary:             oklch(0.955 0.005 250);
+  --secondary-foreground:  oklch(0.205 0.012 256);
+  --muted:                 oklch(0.955 0.005 250);
+  --muted-foreground:      oklch(0.500 0.015 252);
+  --accent:                oklch(0.955 0.005 250);
+  --accent-foreground:     oklch(0.205 0.012 256);
+  --signal:                oklch(0.760 0.165 118);
+  --signal-foreground:     oklch(0.200 0.045 120);
+  --border:                oklch(0.205 0.012 256 / 0.12);
+  --input:                 oklch(0.205 0.012 256 / 0.16);
 }
 
 @layer base {
-  * {
-    @apply border-border outline-ring/50;
+  * { @apply border-border outline-ring/50; }
+  body { @apply bg-background text-foreground; }
+
+  /* Citation highlight — court-defensible matched span. Replaces the old
+     `bg-purple-200 text-purple-900` mark in query-plan/page.tsx. */
+  mark.cite {
+    background: color-mix(in oklch, var(--signal) 16%, transparent);
+    color: var(--signal);
+    border-radius: 3px;
+    padding: 0 2px;
+    box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--signal) 35%, transparent);
   }
-  body {
-    @apply bg-background text-foreground;
-  }
+}
+
+/* Optional decorative helper used on landing / empty states. */
+.bg-grid {
+  background-image:
+    linear-gradient(to right, oklch(1 0 0 / 0.035) 1px, transparent 1px),
+    linear-gradient(to bottom, oklch(1 0 0 / 0.035) 1px, transparent 1px);
+  background-size: 64px 64px;
 }

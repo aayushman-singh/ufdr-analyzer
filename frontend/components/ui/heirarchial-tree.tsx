@@ -61,8 +61,8 @@ const transformDataForD3Tree = (data: any[]): TreeNode => {
 
 const renderCustomNodeElement = ({ nodeDatum, toggleNode }: any) => {
   const isFolder = nodeDatum.children && nodeDatum.children.length > 0
-  const nodeColor = isFolder ? "#8b5cf6" : "#6366f1"
-  const textColor = "#1f2937"
+  const nodeColor = isFolder ? "oklch(0.860 0.175 117)" : "oklch(0.700 0.090 235)"
+  const textColor = "oklch(0.967 0.004 247)"
 
   return (
     <g>
@@ -103,7 +103,7 @@ const renderCustomNodeElement = ({ nodeDatum, toggleNode }: any) => {
       {/* Additional info */}
       {nodeDatum.attributes?.count && (
         <text
-          fill="#6b7280"
+          fill="oklch(0.705 0.018 252)"
           strokeWidth="0"
           x={25}
           y={18}
@@ -116,7 +116,7 @@ const renderCustomNodeElement = ({ nodeDatum, toggleNode }: any) => {
 
       {nodeDatum.attributes?.size && (
         <text
-          fill="#6b7280"
+          fill="oklch(0.705 0.018 252)"
           strokeWidth="0"
           x={25}
           y={18}
@@ -134,7 +134,7 @@ export function HierarchicalTree({ data, className = "" }: HierarchicalTreeProps
   const treeData = transformDataForD3Tree(data)
 
   return (
-    <div className={`w-full h-96 bg-white rounded-lg border border-gray-200 ${className}`}>
+    <div className={`w-full h-96 bg-card rounded-lg border border-border ${className}`}>
       <Tree
         data={treeData}
         orientation="vertical"
@@ -145,7 +145,7 @@ export function HierarchicalTree({ data, className = "" }: HierarchicalTreeProps
         pathFunc="diagonal"
         styles={{
           links: {
-            stroke: "#d1d5db",
+            stroke: "oklch(1 0 0 / 0.085)",
             strokeWidth: 2,
           },
         }}

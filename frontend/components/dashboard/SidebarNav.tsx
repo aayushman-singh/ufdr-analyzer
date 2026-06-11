@@ -25,7 +25,7 @@ export function SidebarNav({ menuItems, activeContent, setActiveContent }: Sideb
             <item.icon className="w-4 h-4" />
             <span className="font-light">{item.title}</span>
             {item.badge && (
-              <Badge variant="secondary" className="ml-auto text-xs bg-purple-100 text-purple-700">
+              <Badge variant="secondary" className="ml-auto text-xs">
                 {item.badge}
               </Badge>
             )}

@@ -2,7 +2,7 @@
 
 import { useState } from "react"
 import Link from "next/link"
-import { Shield } from "lucide-react"
+import { Seal } from "@/components/brand/Seal"
 
 import {
   Sidebar,
@@ -141,13 +141,11 @@ export function DashboardLayout() {
 
   return (
     <SidebarProvider>
-      <div className="flex h-screen w-full bg-white">
+      <div className="flex h-screen w-full bg-background">
         <Sidebar>
           <SidebarHeader>
             <div className="flex items-center gap-2 p-2">
-              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-purple-600 to-purple-800">
-                <Shield className="h-4 w-4 text-white" />
-              </div>
+              <Seal size={28} />
               <Link href="/">
                 <span className="text-sm font-medium">ForensicAI</span>
               </Link>
@@ -164,7 +162,7 @@ export function DashboardLayout() {
         </Sidebar>
 
         <SidebarInset>
-          <header className="flex h-16 shrink-0 items-center gap-2 border-b bg-white px-4">
+          <header className="flex h-16 shrink-0 items-center gap-2 border-b bg-background px-4">
             <SidebarTrigger className="-ml-1" />
           </header>
           <main className="flex-1 overflow-auto p-6">{renderContent()}</main>

@@ -3,6 +3,7 @@ import { useState, useEffect, useCallback } from "react"
 import { FileTree } from "@/components/ui/file-tree"
 import { HierarchicalTree } from "@/components/ui/heirarchial-tree"
 import { BackendDataDisplay } from "@/components/ui/backend-data-display"
+import { Button } from "@/components/ui/button"
 import { Database, Maximize2, Minimize2, FileText, HardDrive, Network, Clock, Hash, Settings } from "lucide-react"
 import { useRouter } from "next/navigation"
 import Header from "@/components/header"
@@ -86,42 +87,42 @@ const transformAleappToTree = (aleappData: AleappStructure | null) => {
     {
       id: "aleapp-reports",
       name: "ALEAPP Analysis Reports",
-      icon: <FileText className="w-4 h-4 text-purple-500" />,
+      icon: <FileText className="w-4 h-4 text-signal" />,
       data: categories.html_reports,
       limit: 10
     },
     {
       id: "aleapp-exports", 
       name: "TSV Exports",
-      icon: <Database className="w-4 h-4 text-blue-500" />,
+      icon: <Database className="w-4 h-4 text-info" />,
       data: categories.tsv_exports,
       limit: 10
     },
     {
       id: "aleapp-databases",
       name: "Analysis Databases", 
-      icon: <HardDrive className="w-4 h-4 text-green-500" />,
+      icon: <HardDrive className="w-4 h-4 text-signal" />,
       data: categories.databases,
       limit: null
     },
     {
       id: "aleapp-timeline",
       name: "Timeline Data",
-      icon: <Clock className="w-4 h-4 text-indigo-500" />,
+      icon: <Clock className="w-4 h-4 text-muted-foreground" />,
       data: categories.timeline,
       limit: null
     },
     {
       id: "aleapp-data",
       name: "Extracted Data",
-      icon: <Settings className="w-4 h-4 text-orange-500" />,
+      icon: <Settings className="w-4 h-4 text-muted-foreground" />,
       data: categories.data_extraction,
       limit: 10
     },
     {
       id: "aleapp-scripts",
       name: "Script Logs",
-      icon: <Network className="w-4 h-4 text-cyan-500" />,
+      icon: <Network className="w-4 h-4 text-info" />,
       data: categories.scripts,
       limit: null
     }
@@ -152,7 +153,7 @@ const ufdrStructure = [
     id: "case-info",
     name: "Case Information",
     type: "folder" as const,
-    icon: <FileText className="w-4 h-4 text-purple-500" />,
+    icon: <FileText className="w-4 h-4 text-signal" />,
     children: [
       { id: "case-details", name: "Case-004-Details.xml", type: "file" as const, size: "2.4 KB" },
       { id: "investigator", name: "Investigator-Profile.json", type: "file" as const, size: "1.2 KB" },
@@ -163,7 +164,7 @@ const ufdrStructure = [
     id: "evidence",
     name: "Evidence Items",
     type: "folder" as const,
-    icon: <Database className="w-4 h-4 text-blue-500" />,
+    icon: <Database className="w-4 h-4 text-info" />,
     count: 3,
     children: [
       {
@@ -222,7 +223,7 @@ const ufdrStructure = [
     id: "filesystem",
     name: "File System Analysis",
     type: "folder" as const,
-    icon: <HardDrive className="w-4 h-4 text-green-500" />,
+    icon: <HardDrive className="w-4 h-4 text-signal" />,
     count: 1247892,
     children: [
       { id: "deleted-files", name: "Deleted Files", type: "folder" as const, count: 15847 },
@@ -234,7 +235,7 @@ const ufdrStructure = [
     id: "registry",
     name: "Registry Analysis",
     type: "folder" as const,
-    icon: <Settings className="w-4 h-4 text-orange-500" />,
+    icon: <Settings className="w-4 h-4 text-muted-foreground" />,
     children: [
       { id: "system-hive", name: "SYSTEM.hiv", type: "file" as const, size: "12.5 MB" },
       { id: "software-hive", name: "SOFTWARE.hiv", type: "file" as const, size: "45.2 MB" },
@@ -245,7 +246,7 @@ const ufdrStructure = [
     id: "network",
     name: "Network Analysis",
     type: "folder" as const,
-    icon: <Network className="w-4 h-4 text-cyan-500" />,
+    icon: <Network className="w-4 h-4 text-info" />,
     children: [
       { id: "connections", name: "Network-Connections.log", type: "file" as const, size: "2.1 MB" },
       { id: "dns-cache", name: "DNS-Cache.txt", type: "file" as const, size: "456 KB" },
@@ -256,7 +257,7 @@ const ufdrStructure = [
     id: "timeline",
     name: "Timeline Data",
     type: "folder" as const,
-    icon: <Clock className="w-4 h-4 text-indigo-500" />,
+    icon: <Clock className="w-4 h-4 text-muted-foreground" />,
     count: 89234,
     children: [
       { id: "file-activity", name: "File-Activity-Timeline.csv", type: "file" as const, size: "125 MB" },
@@ -268,7 +269,7 @@ const ufdrStructure = [
     id: "hashes",
     name: "Hash Analysis",
     type: "folder" as const,
-    icon: <Hash className="w-4 h-4 text-red-500" />,
+    icon: <Hash className="w-4 h-4 text-[var(--severity-high)]" />,
     children: [
       { id: "md5-hashes", name: "MD5-Hashes.txt", type: "file" as const, size: "45 MB" },
       { id: "sha256-hashes", name: "SHA256-Hashes.txt", type: "file" as const, size: "89 MB" },
@@ -279,7 +280,7 @@ const ufdrStructure = [
     id: "reports",
     name: "Generated Reports",
     type: "folder" as const,
-    icon: <FileText className="w-4 h-4 text-purple-500" />,
+    icon: <FileText className="w-4 h-4 text-signal" />,
     children: [
       { id: "executive-summary", name: "Executive-Summary.pdf", type: "file" as const, size: "2.1 MB" },
       { id: "technical-report", name: "Technical-Analysis.html", type: "file" as const, size: "15.6 MB" },
@@ -441,16 +442,16 @@ export default function UploadPage() {
   };
 
   return (
-    <div className="min-h-screen w-full relative bg-white">
-      {/* Purple Glow Top */}
+    <div className="min-h-screen w-full relative bg-background">
+      {/* Signal Glow Top */}
       <div
         className="fixed inset-0 z-0"
         style={{
-          background: "#ffffff",
+          background: "var(--background)",
           backgroundImage: `
             radial-gradient(
               circle at top center,
-              rgba(173, 109, 244, 0.5),
+              color-mix(in oklch, var(--signal) 14%, transparent),
               transparent 70%
             )
           `,
@@ -467,19 +468,19 @@ export default function UploadPage() {
           {!showStructure ? (
             <>
               <div className="text-center mb-12">
-                <h1 className="text-4xl font-light text-gray-900 mb-4">
+                <h1 className="text-4xl font-light text-foreground mb-4">
                   Process UFDR File
                 </h1>
-                <p className="text-lg text-gray-600 font-light">
+                <p className="text-lg text-muted-foreground font-light">
                   Enter the server file path to begin AI-powered analysis
                 </p>
               </div>
 
               <div className="mb-12 max-w-3xl mx-auto">
-                <div className="bg-white rounded-xl border border-gray-200 p-6">
+                <div className="bg-card rounded-xl border border-border p-6">
                   <div className="space-y-4">
                     <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-2">
+                      <label className="block text-sm font-medium text-foreground mb-2">
                         Server File Path
                       </label>
                       <div className="flex space-x-2">
@@ -488,36 +489,37 @@ export default function UploadPage() {
                           value={filePath}
                           onChange={(e) => handleFilePathChange(e.target.value)}
                           placeholder="/data/ufdr/case-001.ufdr"
-                          className="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+                          className="flex-1 px-4 py-3 border border-border bg-background text-foreground rounded-lg focus:ring-2 focus:ring-ring focus:border-transparent"
                         />
-                        <button
+                        <Button
+                          variant="outline"
                           onClick={handleSelectFile}
-                          className="px-4 py-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors"
+                          className="px-4 py-3"
                         >
                           Browse
-                        </button>
+                        </Button>
                       </div>
-                      <p className="text-sm text-gray-500 mt-1">
+                      <p className="text-sm text-muted-foreground mt-1">
                         Enter the full path to your UFDR file on the server (validation happens automatically)
                       </p>
                     </div>
 
                     {isValidating && (
-                      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-                        <div className="flex items-center space-x-2 text-blue-800">
-                          <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600"></div>
+                      <div className="bg-info/10 border border-info/30 rounded-lg p-4">
+                        <div className="flex items-center space-x-2 text-info">
+                          <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-info"></div>
                           <span className="font-medium">Validating file path...</span>
                         </div>
                       </div>
                     )}
 
                     {fileInfo && (
-                      <div className="bg-green-50 border border-green-200 rounded-lg p-4">
-                        <div className="flex items-center space-x-2 text-green-800 mb-2">
-                          <div className="w-2 h-2 bg-green-500 rounded-full"></div>
+                      <div className="bg-signal/10 border border-signal/30 rounded-lg p-4">
+                        <div className="flex items-center space-x-2 text-signal mb-2">
+                          <div className="w-2 h-2 bg-signal rounded-full"></div>
                           <span className="font-medium">File Validated</span>
                         </div>
-                        <div className="text-sm text-green-700 space-y-1">
+                        <div className="text-sm text-signal space-y-1">
                           <div>File Size: {fileInfo.file_size_gb} GB</div>
                           <div>Path: {fileInfo.file_path}</div>
                           <div>
@@ -528,13 +530,14 @@ export default function UploadPage() {
                     )}
 
                     <div className="flex justify-center">
-                      <button
+                      <Button
+                        variant="signal"
+                        size="lg"
                         onClick={handleStartAnalysis}
                         disabled={isAnalyzing || (fileInfo?.valid === false)}
-                        className="bg-slate-900 text-white font-medium py-3 px-8 rounded-lg hover:bg-slate-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         {isAnalyzing ? "Processing..." : "Start Analysis"}
-                      </button>
+                      </Button>
                     </div>
                   </div>
                 </div>
@@ -542,14 +545,14 @@ export default function UploadPage() {
 
               {isAnalyzing && (
                 <div className="mt-8 text-center">
-                  <div className="inline-flex items-center space-x-2 text-purple-600">
-                    <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-purple-600"></div>
+                  <div className="inline-flex items-center space-x-2 text-signal">
+                    <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-signal"></div>
                     <span>
                       Processing large UFDR file... This may take several
                       minutes.
                     </span>
                   </div>
-                  <p className="text-sm text-gray-500 mt-2">
+                  <p className="text-sm text-muted-foreground mt-2">
                     Large files (30-150GB) require significant processing time
                   </p>
                 </div>
@@ -558,21 +561,21 @@ export default function UploadPage() {
           ) : (
             <div>
               <div className="text-center mb-8">
-                <div className="inline-flex items-center space-x-2 text-green-600 mb-4">
-                  <div className="w-5 h-5 bg-green-100 rounded-full flex items-center justify-center">
-                    <div className="w-2 h-2 bg-green-600 rounded-full"></div>
+                <div className="inline-flex items-center space-x-2 text-signal mb-4">
+                  <div className="w-5 h-5 bg-signal/20 rounded-full flex items-center justify-center">
+                    <div className="w-2 h-2 bg-signal rounded-full"></div>
                   </div>
                   <span className="font-medium">Analysis Complete</span>
                 </div>
-                <h1 className="text-3xl font-light text-gray-900 mb-2">
+                <h1 className="text-3xl font-light text-foreground mb-2">
                   UFDR File Structure
                 </h1>
-                <p className="text-lg text-gray-600 font-light">
+                <p className="text-lg text-muted-foreground font-light">
                   Your forensic data has been processed and indexed. Explore the
                   structure below.
                 </p>
                 {backendData && (
-                  <div className="text-sm text-gray-500 mt-2">
+                  <div className="text-sm text-muted-foreground mt-2">
                     Processed {backendData.filename} in {backendData.processing_time}
                   </div>
                 )}
@@ -585,8 +588,8 @@ export default function UploadPage() {
                   
                   {/* Debug: Manual ALEAPP structure loading */}
                   {backendData.aleapp_processed && backendData.aleapp_report_path && !aleappStructure && (
-                    <div className="mt-4 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
-                      <p className="text-sm text-yellow-800 mb-2">
+                    <div className="mt-4 p-4 bg-[var(--severity-medium)]/10 border border-[var(--severity-medium)]/30 rounded-lg">
+                      <p className="text-sm text-[var(--severity-medium)] mb-2">
                         ALEAPP structure not loaded. Click to load manually:
                       </p>
                       <button
@@ -603,7 +606,7 @@ export default function UploadPage() {
                             setIsLoadingStructure(false);
                           }
                         }}
-                        className="bg-yellow-600 text-white px-3 py-1 rounded text-sm hover:bg-yellow-700"
+                        className="bg-[var(--severity-medium)] text-background px-3 py-1 rounded text-sm hover:brightness-110"
                       >
                         Load ALEAPP Structure
                       </button>
@@ -614,18 +617,18 @@ export default function UploadPage() {
 
               {/* File Tree Structure */}
               {!maximizeHierarchical && (
-                <div className="bg-gray-50 rounded-xl p-6 mb-8">
-                  <h3 className="text-xl font-semibold text-gray-900 mb-4 text-center">
+                <div className="bg-surface-1 rounded-xl p-6 mb-8">
+                  <h3 className="text-xl font-semibold text-foreground mb-4 text-center">
                     Detailed File Structure
                   </h3>
                   {/* Debug info */}
-                  <div className="text-xs text-gray-500 mb-2 text-center">
+                  <div className="text-xs text-muted-foreground mb-2 text-center">
                     {aleappStructure ? `Using ALEAPP data (${aleappStructure.total_files} files)` : 'Using hardcoded data'}
                   </div>
                   {isLoadingStructure ? (
                     <div className="flex items-center justify-center py-8">
-                      <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-purple-600"></div>
-                      <span className="ml-2 text-gray-600">Loading ALEAPP structure...</span>
+                      <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-signal"></div>
+                      <span className="ml-2 text-muted-foreground">Loading ALEAPP structure...</span>
                     </div>
                   ) : (
                     <FileTree
@@ -645,14 +648,14 @@ export default function UploadPage() {
               <div className="mb-8">
                 {/* Full-screen Hierarchical Tree when maximized */}
                 {maximizeHierarchical && (
-                  <div className="fixed inset-0 bg-white z-50 flex flex-col">
-                    <div className="flex justify-between items-center p-4 border-b">
-                      <h3 className="text-xl font-semibold text-gray-900">
+                  <div className="fixed inset-0 bg-background z-50 flex flex-col">
+                    <div className="flex justify-between items-center p-4 border-b border-border">
+                      <h3 className="text-xl font-semibold text-foreground">
                         Hierarchical Overview
                       </h3>
                       <button
                         onClick={() => setMaximizeHierarchical(false)}
-                        className="text-gray-500 hover:text-gray-700"
+                        className="text-muted-foreground hover:text-foreground"
                       >
                         <Minimize2 className="w-5 h-5" />
                       </button>
@@ -673,14 +676,14 @@ export default function UploadPage() {
                 )}
 
                 {/* Hierarchical Tree Structure */}
-                <div className="bg-gray-50 rounded-xl p-6 relative mb-8">
+                <div className="bg-surface-1 rounded-xl p-6 relative mb-8">
                   <div className="flex justify-between items-center mb-4">
-                    <h3 className="text-xl font-semibold text-gray-900 text-center flex-1">
+                    <h3 className="text-xl font-semibold text-foreground text-center flex-1">
                       Hierarchical Overview
                     </h3>
                     <button
                       onClick={() => setMaximizeHierarchical(true)}
-                      className="text-gray-500 hover:text-gray-700"
+                      className="text-muted-foreground hover:text-foreground"
                     >
                       <Maximize2 className="w-5 h-5" />
                     </button>
@@ -698,18 +701,20 @@ export default function UploadPage() {
                 </div>
 
                 <div className="text-center space-x-4">
-                  <button
+                  <Button
+                    variant="signal"
+                    size="lg"
                     onClick={handleProceedToDashboard}
-                    className="bg-black text-white font-medium py-3 px-8 rounded-lg hover:bg-purple-700 transition-colors"
                   >
                     Start Investigation
-                  </button>
-                  <button
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="lg"
                     onClick={() => setShowStructure(false)}
-                    className="bg-gray-100 text-gray-700 font-medium py-3 px-8 rounded-lg hover:bg-gray-200 transition-colors"
                   >
                     Upload Another File
-                  </button>
+                  </Button>
                 </div>
               </div>
             </div>
