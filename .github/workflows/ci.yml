@@ -21,14 +21,14 @@ jobs:
           cache: pip
 
       - name: Install test dependencies
-        run: pip install pytest sqlmodel sqlalchemy fastapi pydantic reportlab httpx python-dotenv asn1crypto requests PyJWT
+        run: pip install pytest sqlmodel sqlalchemy fastapi pydantic reportlab httpx python-dotenv asn1crypto requests PyJWT==2.10.1 meilisearch==0.37.0 xmltodict==1.0.2 python-multipart==0.0.20
 
       - name: Run query/IR test suite
         env:
           DATABASE_URL: sqlite://
         run: python -m pytest tests/ -q
 
-      - name: Verify ingest/tests collect (heavy deps absent -> skip, not error)
+      - name: Verify ingest/tests collect
         env:
           DATABASE_URL: sqlite://
         run: python -m pytest ingest/tests --collect-only -q

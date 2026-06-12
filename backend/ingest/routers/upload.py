@@ -1,5 +1,4 @@
 from fastapi import APIRouter, HTTPException, Depends
-from ingest.services.parser_service import UFDRParser
 from ingest.services.ingest_service import IngestService
 from ingest.services.cache_service import cache_service
 from ingest.utils.logger import get_logger
@@ -9,20 +8,54 @@ from pydantic import BaseModel
 from sqlmodel import Session
 from meilisearch import Client as MeiliClient
 from database import get_session
-from db_setup import Run
-import sys
+from db_setup import Run, User
+from ingest.services.auth_service import require_user
+from ingest.services.case_access import authorize_run
 import os
 import re
 import time
 import uuid
 
+
 # Avoid circular import by getting meili_client directly
 def get_meili_client():
     """Get the Meilisearch client instance"""
     from meilisearch import Client as MeiliClient
+
     MEILI_URL = os.getenv("MEILI_URL", "http://localhost:7700")
     MEILI_KEY = os.getenv("MEILI_KEY", None)
     return MeiliClient(MEILI_URL, MEILI_KEY)
+
+
+def get_ufdr_parser():
+    from ingest.services.parser_service import UFDRParser
+
+    return UFDRParser
+
+
+def resolve_input_file(file_path: str) -> Path:
+    root_raw = os.getenv("UFDR_INPUT_ROOT")
+    if not root_raw:
+        raise HTTPException(
+            status_code=500,
+            detail="UFDR_INPUT_ROOT is not configured; refusing server-local file access",
+        )
+    root = Path(root_raw).expanduser().resolve(strict=False)
+    if not root.exists() or not root.is_dir():
+        raise HTTPException(
+            status_code=500,
+            detail=f"UFDR_INPUT_ROOT does not exist or is not a directory: {root}",
+        )
+    requested = Path(file_path).expanduser().resolve(strict=False)
+    try:
+        requested.relative_to(root)
+    except ValueError:
+        raise HTTPException(
+            status_code=403,
+            detail="file_path is outside the configured UFDR_INPUT_ROOT",
+        )
+    return requested
+
 
 logger = get_logger(__name__)
 
@@ -34,18 +67,21 @@ ingest_service = IngestService()
 class IngestRequest(BaseModel):
     file_path: str
 
+
 def create_slug_from_path(file_path: str) -> str:
     """Create a slug from file path for folder naming"""
     filename = Path(file_path).stem  # Get filename without extension
     # Replace spaces and special chars with underscores, convert to lowercase
-    slug = re.sub(r'[^\w\-_.]', '_', filename).lower()
-    slug = re.sub(r'_+', '_', slug).strip('_')  # Remove multiple underscores
+    slug = re.sub(r"[^\w\-_.]", "_", filename).lower()
+    slug = re.sub(r"_+", "_", slug).strip("_")  # Remove multiple underscores
     return slug
+
 
 def get_ufdr_cache_dir(file_path: str) -> Path:
     """Get the cache directory for a specific UFDR file"""
     slug = create_slug_from_path(file_path)
     return Path("UFDRConvert") / slug
+
 
 def get_aleapp_report_path(file_path: str) -> Path:
     """Get the ALEAPP report path for a given file"""
@@ -64,6 +100,7 @@ def get_aleapp_report_path(file_path: str) -> Path:
     else:
         return new_aleapp_path  # Return expected new location
 
+
 def is_already_processed(file_path: str) -> bool:
     """Check if UFDR file has already been processed"""
     cache_dir = get_ufdr_cache_dir(file_path)
@@ -71,65 +108,73 @@ def is_already_processed(file_path: str) -> bool:
     aleapp_output = get_aleapp_report_path(file_path)
     return cache_dir.exists() and report_xml.exists() and aleapp_output.exists()
 
+
 @router.get("/validate-path")
-async def validate_file_path(file_path: str):
+async def validate_file_path(
+    file_path: str,
+    auth_user: User = Depends(require_user),
+):
     """
     Validate if a file path exists and is accessible.
     """
     try:
-        path = Path(file_path)
-        
+        path = resolve_input_file(file_path)
+
         if not path.exists():
             return {
                 "valid": False,
                 "error": "File does not exist",
-                "file_path": file_path
+                "file_path": file_path,
             }
-        
+
         if not path.is_file():
             return {
                 "valid": False,
                 "error": "Path is not a file",
-                "file_path": file_path
+                "file_path": file_path,
             }
-        
+
         # Check file extension
         file_extension = path.suffix.lower()
-        supported_extensions = ['.ufdr', '.xml', '.json', '.csv']
-        
+        supported_extensions = [".ufdr", ".xml", ".json", ".csv"]
+
         if file_extension not in supported_extensions:
             return {
                 "valid": False,
                 "error": f"Unsupported file type: {file_extension}",
-                "file_path": file_path
+                "file_path": file_path,
             }
-        
+
         # Get file size
         file_size_bytes = path.stat().st_size
         file_size_gb = round(file_size_bytes / (1024**3), 2)
-        
+
         return {
             "valid": True,
             "file_path": file_path,
             "file_size_bytes": file_size_bytes,
             "file_size_gb": file_size_gb,
             "readable": True,
-            "file_extension": file_extension
+            "file_extension": file_extension,
         }
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"File validation error: {e}")
         return {
             "valid": False,
             "error": f"Validation error: {str(e)}",
-            "file_path": file_path
+            "file_path": file_path,
         }
+
 
 @router.post("/")
 async def ingest_ufdr(
     request: IngestRequest,
     session: Session = Depends(get_session),
-    meili_client: MeiliClient = Depends(get_meili_client)
+    auth_user: User = Depends(require_user),
+    meili_client: MeiliClient = Depends(get_meili_client),
 ):
     """
     Ingest a UFDR file by file path: parse and store in DB + search indexes.
@@ -138,39 +183,42 @@ async def ingest_ufdr(
     logger.info(f"Starting ingestion process for file: {request.file_path}")
 
     try:
-        file_path = Path(request.file_path)
+        file_path = resolve_input_file(request.file_path)
 
         # Validate file exists
         if not file_path.exists():
             raise HTTPException(
-                status_code=404,
-                detail=f"File not found: {request.file_path}"
+                status_code=404, detail=f"File not found: {request.file_path}"
             )
 
         # Validate file extension
         file_extension = file_path.suffix.lower()
-        supported_extensions = ['.ufdr', '.xml', '.json', '.csv']
+        supported_extensions = [".ufdr", ".xml", ".json", ".csv"]
         logger.info(f"File extension: {file_extension}")
 
         if file_extension not in supported_extensions:
             logger.warning(f"Unsupported file type: {file_extension}")
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported file type: {file_extension}. Supported types: {supported_extensions}"
+                detail=f"Unsupported file type: {file_extension}. Supported types: {supported_extensions}",
             )
 
         logger.info("File validation passed")
+        ufdr_parser = get_ufdr_parser()
 
         # OPTIMIZATION: Check for content-based deduplication first
         start_time = time.time()
         cached_result = cache_service.check_existing_processing(str(file_path), session)
-        
+
         # The cache service now validates that runs have actual data before returning them
         # So we can trust cached_result if it exists
 
         if cached_result:
+            authorize_run(session, auth_user, uuid.UUID(str(cached_result.run_id)))
             processing_time = time.time() - start_time
-            logger.info(f"Found cached result for file, returning in {processing_time:.2f}s")
+            logger.info(
+                f"Found cached result for file, returning in {processing_time:.2f}s"
+            )
 
             # Generate ALEAPP URLs for cached results
             aleapp_report_path = None
@@ -189,7 +237,7 @@ async def ingest_ufdr(
                     aleapp_web_url = f"http://localhost:8080/ALEAPP/output/{slug}/{report_dir.name}/_HTML/index.html"
 
                     # Update the processing stats to reflect ALEAPP was processed
-                    cached_result.processing_stats['aleapp_processed'] = True
+                    cached_result.processing_stats["aleapp_processed"] = True
 
             return {
                 "status": "success",
@@ -201,10 +249,12 @@ async def ingest_ufdr(
                 "processing_time": f"{processing_time:.2f}s",
                 "message": "Using cached results - file already processed",
                 "ingest_result": cached_result.processing_stats,
-                "aleapp_processed": cached_result.processing_stats.get('aleapp_processed', False),
+                "aleapp_processed": cached_result.processing_stats.get(
+                    "aleapp_processed", False
+                ),
                 "aleapp_report_path": aleapp_report_path,
                 "aleapp_web_url": aleapp_web_url,
-                "slug": slug
+                "slug": slug,
             }
 
         # Check if already processed (legacy cache check)
@@ -215,19 +265,23 @@ async def ingest_ufdr(
             # Parse from cached report.xml
             report_xml_path = cache_dir / "report.xml"
             try:
-                logger.info(f"Reading cached report.xml ({report_xml_path.stat().st_size / (1024*1024):.1f} MB)")
-                parsed_data = UFDRParser._parse_xml(report_xml_path)
+                logger.info(
+                    f"Reading cached report.xml ({report_xml_path.stat().st_size / (1024 * 1024):.1f} MB)"
+                )
+                parsed_data = ufdr_parser._parse_xml(report_xml_path)
                 logger.info("Cached XML parsing completed")
 
                 # Add extraction info from cache
                 logger.info("Getting cached files info...")
                 parsed_data["_extraction_info"] = {
                     "extracted_dir": str(cache_dir),
-                    "files_info": UFDRParser._get_files_info_from_cache(str(cache_dir))
+                    "files_info": ufdr_parser._get_files_info_from_cache(
+                        str(cache_dir)
+                    ),
                 }
                 logger.info("Normalizing cached data...")
-                parsed_data = UFDRParser._normalize(parsed_data, file_path.name)
-                
+                parsed_data = ufdr_parser._normalize(parsed_data, file_path.name)
+
                 # Add file path for hash calculation and deduplication
                 parsed_data["file_path"] = str(file_path)
                 parsed_data["filename"] = file_path.name
@@ -235,7 +289,9 @@ async def ingest_ufdr(
                 # Check for cached ALEAPP data
                 aleapp_output_dir = get_aleapp_report_path(str(file_path))
                 if aleapp_output_dir.exists():
-                    aleapp_output = UFDRParser._parse_aleapp_output(str(aleapp_output_dir))
+                    aleapp_output = ufdr_parser._parse_aleapp_output(
+                        str(aleapp_output_dir)
+                    )
                     if aleapp_output:
                         parsed_data["aleapp_data"] = aleapp_output
                         logger.info("Using cached ALEAPP data")
@@ -252,34 +308,42 @@ async def ingest_ufdr(
             logger.info("Starting file parsing...")
             try:
                 # Modify the parser to use organized folders
-                parsed_data = UFDRParser.parse_file(str(file_path), output_dir=str(get_ufdr_cache_dir(str(file_path))))
+                parsed_data = ufdr_parser.parse_file(
+                    str(file_path), output_dir=str(get_ufdr_cache_dir(str(file_path)))
+                )
                 parsed_data["filename"] = file_path.name
                 parsed_data["file_path"] = str(file_path)
-                logger.info(f"File parsing successful. Parsed {len(parsed_data)} fields")
+                logger.info(
+                    f"File parsing successful. Parsed {len(parsed_data)} fields"
+                )
             except Exception as parse_error:
                 logger.error(f"File parsing failed: {parse_error}")
                 logger.error(f"Parse error traceback: {traceback.format_exc()}")
                 raise HTTPException(
-                    status_code=400,
-                    detail=f"Failed to parse file: {str(parse_error)}"
+                    status_code=400, detail=f"Failed to parse file: {str(parse_error)}"
                 )
 
         # Ingest to Postgres + others
+        parsed_data["user_id"] = str(auth_user.id)
         logger.info("Starting data ingestion...")
-        logger.info(f"Data summary: {len(parsed_data.get('messages', []))} messages, {len(parsed_data.get('contacts', []))} contacts, {len(parsed_data.get('calls', []))} calls")
+        logger.info(
+            f"Data summary: {len(parsed_data.get('messages', []))} messages, {len(parsed_data.get('contacts', []))} contacts, {len(parsed_data.get('calls', []))} calls"
+        )
 
         # Get file hash for caching
         file_hash = cache_service.get_file_hash_with_cache(str(file_path))
         logger.info(f"File content hash: {file_hash[:12]}...")
 
         try:
-            ingest_result = ingest_service.ingest_to_all(parsed_data, session, meili_client)
+            ingest_result = ingest_service.ingest_to_all(
+                parsed_data, session, meili_client
+            )
             logger.info(f"Ingestion successful: {ingest_result}")
 
             # Update the run record with file hash and original path
-            if ingest_result and 'run_id' in ingest_result:
+            if ingest_result and "run_id" in ingest_result:
                 try:
-                    run = session.get(Run, ingest_result['run_id'])
+                    run = session.get(Run, ingest_result["run_id"])
                     if run:
                         run.file_content_hash = file_hash
                         run.original_file_path = str(file_path)
@@ -289,28 +353,31 @@ async def ingest_ufdr(
 
                         # Cache the processing results
                         processing_stats = {
-                            'file_path': str(file_path),
-                            'run_id': str(run.id),
-                            'message_count': len(parsed_data.get('messages', [])),
-                            'contact_count': len(parsed_data.get('contacts', [])),
-                            'call_count': len(parsed_data.get('calls', [])),
-                            'aleapp_processed': "aleapp_data" in parsed_data,
-                            'processing_time': time.time() - start_time,
-                            'status': 'completed'
+                            "file_path": str(file_path),
+                            "run_id": str(run.id),
+                            "message_count": len(parsed_data.get("messages", [])),
+                            "contact_count": len(parsed_data.get("contacts", [])),
+                            "call_count": len(parsed_data.get("calls", [])),
+                            "aleapp_processed": "aleapp_data" in parsed_data,
+                            "processing_time": time.time() - start_time,
+                            "status": "completed",
                         }
 
-                        cache_service.cache_ingestion_result(file_hash, str(run.id), processing_stats)
+                        cache_service.cache_ingestion_result(
+                            file_hash, str(run.id), processing_stats
+                        )
                         logger.info("Cached ingestion results for future lookups")
 
                 except Exception as cache_error:
-                    logger.warning(f"Failed to update run with hash or cache results: {cache_error}")
+                    logger.warning(
+                        f"Failed to update run with hash or cache results: {cache_error}"
+                    )
 
         except Exception as ingest_error:
             logger.error(f"Data ingestion failed: {ingest_error}")
             logger.error(f"Ingest error traceback: {traceback.format_exc()}")
             raise HTTPException(
-                status_code=500,
-                detail=f"Failed to ingest data: {str(ingest_error)}"
+                status_code=500, detail=f"Failed to ingest data: {str(ingest_error)}"
             )
 
         # Get ALEAPP report path for response
@@ -331,7 +398,9 @@ async def ingest_ufdr(
                     aleapp_web_url = f"http://localhost:8080/ALEAPP/output/{slug}/{report_dir.name}/_HTML/index.html"
 
         total_processing_time = time.time() - start_time
-        logger.info(f"Ingestion process completed successfully in {total_processing_time:.2f}s")
+        logger.info(
+            f"Ingestion process completed successfully in {total_processing_time:.2f}s"
+        )
 
         return {
             "status": "success",
@@ -344,7 +413,7 @@ async def ingest_ufdr(
             "aleapp_processed": "aleapp_data" in parsed_data,
             "aleapp_report_path": aleapp_report_path,
             "aleapp_web_url": aleapp_web_url,
-            "slug": create_slug_from_path(str(file_path))
+            "slug": create_slug_from_path(str(file_path)),
         }
 
     except HTTPException:

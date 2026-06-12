@@ -9,6 +9,7 @@ from meilisearch import Client as MeiliClient
 from .storage_service import save_media
 import sys
 import os
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from db_setup import Run, Message, Call, Contact, Media, AleappArtifact, AleappReport
 
@@ -21,10 +22,7 @@ logging.basicConfig(level=logging.INFO)
 
 class IngestService:
     def ingest_to_all(
-        self,
-        parsed_data: dict,
-        session: Session,
-        meili_client: MeiliClient
+        self, parsed_data: dict, session: Session, meili_client: MeiliClient
     ) -> dict:
         """
         Full ingestion flow:
@@ -35,22 +33,15 @@ class IngestService:
         """
         run_id = None
         try:
-            # Create a new Run entry
-            # Convert user_id to UUID if it's an integer
-            user_id = parsed_data.get("user_id", 1)
-            if isinstance(user_id, int):
-                # Get first user from database or create a default UUID
-                from sqlmodel import select
-                # Import User here to avoid circular imports
-                import sys
-                import os
-                sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-                from db_setup import User
-                first_user = session.exec(select(User)).first()
-                if first_user:
-                    user_id = first_user.id
-                else:
-                    user_id = uuid.uuid4()  # Fallback UUID
+            # Create a new Run entry. The route must bind this to the
+            # authenticated caller; no first-user/random-UUID fallback is allowed.
+            raw_user_id = parsed_data.get("user_id")
+            if not raw_user_id:
+                raise ValueError("parsed_data.user_id is required for ingestion")
+            try:
+                user_id = uuid.UUID(str(raw_user_id))
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"invalid ingestion user_id: {raw_user_id!r}") from e
 
             # Prepare metadata from UFDR extraction
             metadata = {}
@@ -58,10 +49,16 @@ class IngestService:
                 metadata["extraction_info"] = parsed_data["_extraction_info"]
             if "aleapp_data" in parsed_data:
                 metadata["aleapp_summary"] = {
-                    "output_directory": parsed_data["aleapp_data"].get("output_directory"),
-                    "artifact_count": len(parsed_data["aleapp_data"].get("artifacts", [])),
+                    "output_directory": parsed_data["aleapp_data"].get(
+                        "output_directory"
+                    ),
+                    "artifact_count": len(
+                        parsed_data["aleapp_data"].get("artifacts", [])
+                    ),
                     "report_count": len(parsed_data["aleapp_data"].get("reports", [])),
-                    "timeline_count": len(parsed_data["aleapp_data"].get("timeline", []))
+                    "timeline_count": len(
+                        parsed_data["aleapp_data"].get("timeline", [])
+                    ),
                 }
 
             # Get file hash for deduplication
@@ -70,11 +67,17 @@ class IngestService:
             if "file_path" in parsed_data:
                 original_file_path = parsed_data["file_path"]
                 from ingest.services.cache_service import cache_service
+
                 try:
-                    file_content_hash = cache_service.get_file_hash_with_cache(original_file_path)
+                    file_content_hash = cache_service.get_file_hash_with_cache(
+                        original_file_path
+                    )
                     logger.info(f"Calculated file hash: {file_content_hash[:12]}...")
                 except Exception as e:
-                    logger.warning(f"Could not calculate file hash: {e}")
+                    logger.exception("Could not calculate file hash")
+                    raise RuntimeError(
+                        f"could not calculate file hash for {original_file_path}"
+                    ) from e
 
             run = Run(
                 ufdr_file_name=parsed_data.get("filename"),
@@ -83,10 +86,10 @@ class IngestService:
                 user_id=user_id,
                 extraction_metadata=json.dumps(metadata) if metadata else None,
                 file_content_hash=file_content_hash,
-                original_file_path=original_file_path
+                original_file_path=original_file_path,
             )
             session.add(run)
-            session.commit()
+            session.flush()
             session.refresh(run)
             run_id = run.id
 
@@ -99,7 +102,8 @@ class IngestService:
                     receiver=msg.get("receiver"),
                     timestamp=msg.get("timestamp"),
                     content=msg.get("content"),
-                ) for msg in parsed_data.get("messages", [])
+                )
+                for msg in parsed_data.get("messages", [])
             ]
             session.add_all(messages_to_ingest)
 
@@ -111,7 +115,8 @@ class IngestService:
                     receiver=call.get("receiver"),
                     timestamp=call.get("timestamp"),
                     duration=call.get("duration"),
-                ) for call in parsed_data.get("calls", [])
+                )
+                for call in parsed_data.get("calls", [])
             ]
             session.add_all(calls_to_ingest)
 
@@ -121,11 +126,12 @@ class IngestService:
                     run_id=run_id,
                     name=contact.get("name"),
                     number=contact.get("number"),
-                ) for contact in parsed_data.get("contacts", [])
+                )
+                for contact in parsed_data.get("contacts", [])
             ]
             session.add_all(contacts_to_ingest)
 
-            session.commit()
+            session.flush()
 
             # --- Ingest to Meilisearch ---
             # 5. Indexing Messages for search
@@ -136,58 +142,70 @@ class IngestService:
                     "content": msg.get("content"),
                     "sender": msg.get("sender"),
                     "timestamp": msg.get("timestamp"),
-                } for msg in parsed_data.get("messages", [])
+                }
+                for msg in parsed_data.get("messages", [])
             ]
             if meili_messages:
                 meili_client.index("messages").add_documents(meili_messages)
 
             # --- Generate Embeddings for Semantic Search ---
             # 5b. Create embeddings for messages (enables semantic search)
-            logger.info(f"Generating embeddings for {len(parsed_data.get('messages', []))} messages...")
+            logger.info(
+                f"Generating embeddings for {len(parsed_data.get('messages', []))} messages..."
+            )
             try:
                 embeddings_service = EmbeddingsService()
-                
+
                 # Prepare texts and metadata for embedding
                 message_texts = []
                 message_metadata = []
-                
+
                 for i, msg in enumerate(parsed_data.get("messages", [])):
                     # Create rich text representation for better semantic search
                     content = msg.get("content", "")
                     sender = msg.get("sender", "unknown")
                     receiver = msg.get("receiver", "unknown")
-                    
+
                     # Text to embed (include context)
                     text_to_embed = f"From {sender} to {receiver}: {content}"
                     message_texts.append(text_to_embed)
-                    
+
                     # Metadata to store with embedding
-                    message_metadata.append({
-                        "id": str(messages_to_ingest[i].id) if i < len(messages_to_ingest) else str(uuid.uuid4()),
-                        "type": "message",
-                        "sender": sender,
-                        "receiver": receiver,
-                        "content": content[:200],  # Preview only
-                        "content_preview": content[:100] + "..." if len(content) > 100 else content,
-                        "timestamp": str(msg.get("timestamp", "")),
-                        "run_id": str(run_id)
-                    })
-                
+                    message_metadata.append(
+                        {
+                            "id": str(messages_to_ingest[i].id)
+                            if i < len(messages_to_ingest)
+                            else str(uuid.uuid4()),
+                            "type": "message",
+                            "sender": sender,
+                            "receiver": receiver,
+                            "content": content[:200],  # Preview only
+                            "content_preview": content[:100] + "..."
+                            if len(content) > 100
+                            else content,
+                            "timestamp": str(msg.get("timestamp", "")),
+                            "run_id": str(run_id),
+                        }
+                    )
+
                 # Generate and store embeddings
                 if message_texts:
                     embeddings_service.create_index(
                         run_id=str(run_id),
                         texts=message_texts,
-                        metadata=message_metadata
+                        metadata=message_metadata,
                     )
-                    logger.info(f"Successfully created embeddings index for run {run_id}")
+                    logger.info(
+                        f"Successfully created embeddings index for run {run_id}"
+                    )
                 else:
                     logger.info("No messages to embed")
-                    
+
             except Exception as e:
-                # Don't fail entire ingestion if embeddings fail
-                logger.error(f"Failed to generate embeddings: {e}")
-                logger.warning("Continuing ingestion without embeddings...")
+                logger.exception("Failed to generate embeddings")
+                raise RuntimeError(
+                    f"failed to generate embeddings for run {run_id}"
+                ) from e
 
             # --- Save Media to MinIO (via storage service) ---
             # 6. Save media files and get paths
@@ -196,15 +214,16 @@ class IngestService:
                 file_path = media_item.get("file_path")
                 if file_path:
                     stored_path = save_media(file_path, str(run_id))
-                    media_paths.append(Media(
-                        run_id=run_id,
-                        original_path=file_path,
-                        storage_path=stored_path,
-                        media_type=media_item.get("type")
-                    ))
+                    media_paths.append(
+                        Media(
+                            run_id=run_id,
+                            original_path=file_path,
+                            storage_path=stored_path,
+                            media_type=media_item.get("type"),
+                        )
+                    )
             if media_paths:
                 session.add_all(media_paths)
-                session.commit()
 
             # --- Save ALEAPP data to database ---
             # 7. Process ALEAPP artifacts and reports
@@ -220,7 +239,11 @@ class IngestService:
                         file_path=artifact.get("path"),
                         category=artifact.get("category"),
                         row_count=artifact.get("row_count"),
-                        data=json.dumps(artifact.get("sample_data") or artifact.get("data")) if artifact.get("sample_data") or artifact.get("data") else None
+                        data=json.dumps(
+                            artifact.get("sample_data") or artifact.get("data")
+                        )
+                        if artifact.get("sample_data") or artifact.get("data")
+                        else None,
                     )
                     aleapp_artifacts.append(aleapp_artifact)
 
@@ -234,15 +257,16 @@ class IngestService:
                         run_id=run_id,
                         report_type=report.get("type"),
                         filename=report.get("filename"),
-                        file_path=report.get("path")
+                        file_path=report.get("path"),
                     )
                     aleapp_reports.append(aleapp_report)
 
                 if aleapp_reports:
                     session.add_all(aleapp_reports)
 
-                session.commit()
-                logger.info(f"Saved {len(aleapp_artifacts)} ALEAPP artifacts and {len(aleapp_reports)} reports to database")
+                logger.info(
+                    f"Saved {len(aleapp_artifacts)} ALEAPP artifacts and {len(aleapp_reports)} reports to database"
+                )
 
             # --- Update Run status ---
             run.status = "complete"

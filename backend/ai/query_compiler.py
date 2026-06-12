@@ -14,6 +14,7 @@ Portability: text matching uses `LOWER(col) LIKE LOWER(:p)` which is
 case-insensitive on both PostgreSQL and SQLite, so the same compiled SQL is
 exercised by the SQLite test-suite and by the Postgres demo.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -92,6 +93,7 @@ SCHEMA: dict[Target, TableSchema] = {
 @dataclass
 class TableQuery:
     """One target table's compiled SELECT plus the metadata citations need."""
+
     target: Target
     sql: str
     params: dict[str, object]
@@ -213,14 +215,18 @@ def compile_plan(plan: QueryPlan) -> CompiledQuery:
         # Quote the table identifier: `call` and `user` are SQL reserved words
         # on PostgreSQL. Double quotes are portable to SQLite too.
         sql = (
-            f"SELECT {', '.join(select_cols)}\nFROM \"{schema.table}\"\nWHERE "
+            f'SELECT {", ".join(select_cols)}\nFROM "{schema.table}"\nWHERE '
             + "\n  AND ".join(where)
         )
 
         # Ordering + limit ------------------------------------------------
         if plan.sort.by_time and schema.time_column:
-            sql += f"\nORDER BY {schema.time_column} {plan.sort.direction.value.upper()}"
-        params["limit"] = plan.limit
+            sql += (
+                f"\nORDER BY {schema.time_column} {plan.sort.direction.value.upper()}"
+            )
+        # Fetch only the requested page window per target. The executor performs
+        # the final cross-table deterministic slice after merging/sorting rows.
+        params["limit"] = plan.limit + plan.offset
         sql += "\nLIMIT :limit"
 
         compiled.table_queries.append(

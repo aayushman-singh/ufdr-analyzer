@@ -1,11 +1,11 @@
 """
- LLM Client - Unified interface for OpenAI/OpenRouter/Anthropic APIs
+LLM Client - Unified interface for OpenAI/OpenRouter/Anthropic APIs
 
- Converts natural language queries into structured search parameters      
- using LLM's JSON mode for consistent parsing.
+Converts natural language queries into structured search parameters
+using LLM's JSON mode for consistent parsing.
 """
 
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any, Optional
 import logging
 import os
 import json
@@ -34,7 +34,9 @@ class LLMClient:
         if model:
             self.model = model
         elif self.provider == "gemini":
-            self.model = "gemini-2.5-flash"  # Fast, cheap, good for structured output (default)
+            self.model = (
+                "gemini-2.5-flash"  # Fast, cheap, good for structured output (default)
+            )
         elif self.provider == "openai":
             self.model = "gpt-4o-mini"
         elif self.provider == "openrouter":
@@ -55,7 +57,9 @@ class LLMClient:
         if self.provider == "gemini":
             key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
             if not key:
-                raise ValueError("GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable not set")
+                raise ValueError(
+                    "GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable not set"
+                )
             return key
         if self.provider == "openai" or self.provider == "openrouter":
             key = os.getenv("OPENAI_API_KEY")
@@ -75,19 +79,22 @@ class LLMClient:
         try:
             if self.provider == "gemini":
                 import google.generativeai as genai
+
                 genai.configure(api_key=self.api_key)
                 return genai.GenerativeModel(self.model)
             if self.provider == "openai":
                 from openai import OpenAI
+
                 return OpenAI(api_key=self.api_key)
             elif self.provider == "openrouter":
                 from openai import OpenAI
+
                 return OpenAI(
-                    base_url="https://openrouter.ai/api/v1",
-                    api_key=self.api_key
+                    base_url="https://openrouter.ai/api/v1", api_key=self.api_key
                 )
             elif self.provider == "anthropic":
                 from anthropic import Anthropic
+
                 return Anthropic(api_key=self.api_key)
         except ImportError as e:
             self.logger.error(f"Failed to import {self.provider} SDK: {e}")
@@ -97,9 +104,13 @@ class LLMClient:
                 "openrouter": "openai",
                 "anthropic": "anthropic",
             }.get(self.provider, self.provider)
-            raise ImportError(f"Please install the {self.provider} SDK: pip install {install_pkg}")
+            raise ImportError(
+                f"Please install the {self.provider} SDK: pip install {install_pkg}"
+            )
 
-    def parse_query(self, query: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def parse_query(
+        self, query: str, context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """
         Convert natural language query to structured search parameters.
 
@@ -120,19 +131,14 @@ class LLMClient:
                 return self._query_openai(system_prompt, user_message)
             elif self.provider == "anthropic":
                 return self._query_anthropic(system_prompt, user_message)
+            raise ValueError(f"Unsupported LLM provider: {self.provider}")
         except Exception as e:
-            self.logger.error(f"LLM query failed: {e}")
-            # Return fallback structure
-            return {
-                "intent": "unknown",
-                "search_type": "keyword",
-                "target_tables": ["messages"],
-                "filters": {},
-                "keywords": [query],
-                "entities": [],
-                "confidence": 0.0,
-                "error": str(e)
-            }
+            self.logger.exception(
+                "LLM query planning failed",
+                extra={"provider": self.provider, "query": query},
+            )
+            raise RuntimeError(f"LLM query planning failed: {e}") from e
+
     def _build_system_prompt(self, context: Optional[Dict[str, Any]]) -> str:
         """Build system prompt explaining UFDR schema and task."""
         prompt = """You are an intelligent forensic data query assistant. Your job is to understand conversational queries and convert them into structured search parameters for Android device forensic data.
@@ -220,11 +226,12 @@ Be conversational, intelligent, and USE ALEAPP ARTIFACTS for app queries!"""
 
     def _build_user_message(self, query: str) -> str:
         """Format user query message."""
-        return f"Convert this query to structured search parameters:\n\n\"{query}\""
+        return f'Convert this query to structured search parameters:\n\n"{query}"'
 
     def _query_gemini(self, system_prompt: str, user_message: str) -> Dict[str, Any]:
         """Execute query using Google Gemini API (forced JSON output)."""
         import google.generativeai as genai  # local import; configured in _initialize_client
+
         prompt = f"{system_prompt}\n\nUser query: {user_message}"
         response = self.client.generate_content(
             prompt,
@@ -249,18 +256,18 @@ Be conversational, intelligent, and USE ALEAPP ARTIFACTS for app queries!"""
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message}
+                {"role": "user", "content": user_message},
             ],
             "response_format": {"type": "json_object"},  # Force JSON output
             "temperature": 0.1,  # Low temp for consistent structured output
-            "max_tokens": 1000
+            "max_tokens": 1000,
         }
 
         # Add OpenRouter-specific headers if using OpenRouter
         if self.provider == "openrouter":
             request_params["extra_headers"] = {
                 "HTTP-Referer": "https://github.com/aayushman-singh/ufdr-analyzer",
-                "X-Title": "UFDR Analyzer"
+                "X-Title": "UFDR Analyzer",
             }
 
         response = self.client.chat.completions.create(**request_params)
@@ -279,11 +286,9 @@ Be conversational, intelligent, and USE ALEAPP ARTIFACTS for app queries!"""
         response = self.client.messages.create(
             model=self.model,
             system=system_prompt,
-            messages=[
-                {"role": "user", "content": user_message}
-            ],
+            messages=[{"role": "user", "content": user_message}],
             temperature=0.1,
-            max_tokens=1000
+            max_tokens=1000,
         )
 
         # Extract text content and parse JSON
@@ -295,7 +300,9 @@ Be conversational, intelligent, and USE ALEAPP ARTIFACTS for app queries!"""
             self.logger.error(f"Raw response: {content}")
             raise
 
-    def generate_insights(self, query_results: Dict[str, Any], original_query: str, max_results: int = 50) -> str:
+    def generate_insights(
+        self, query_results: Dict[str, Any], original_query: str, max_results: int = 50
+    ) -> str:
         """
         Generate natural language insights from query results.
         Token-efficient: No conversation history, only current results.
@@ -362,18 +369,22 @@ CRITICAL: If results are from ALEAPP artifacts:
                 elif result_type == "aleapp_artifact":
                     # ALEAPP artifacts - show filename, category, and row count
                     result_summary += f"{i}. [ALEAPP] {result.get('filename', 'N/A')} | Category: {result.get('category', 'N/A')} | {result.get('row_count', 0)} rows\n"
-                    if result.get('sample_data'):
-                        result_summary += f"   Sample: {str(result['sample_data'][0])[:100]}...\n"
+                    if result.get("sample_data"):
+                        result_summary += (
+                            f"   Sample: {str(result['sample_data'][0])[:100]}...\n"
+                        )
 
                 elif result_type == "device_info":
                     # Device info - show what type of info and key details
-                    info_type = result.get('info_type', 'unknown')
-                    if info_type == 'extraction_metadata':
+                    info_type = result.get("info_type", "unknown")
+                    if info_type == "extraction_metadata":
                         result_summary += f"{i}. [DEVICE INFO] Extraction: {result.get('file_name', 'N/A')} | Status: {result.get('status', 'N/A')}\n"
-                        if result.get('extraction_metadata'):
+                        if result.get("extraction_metadata"):
                             result_summary += f"   Metadata: {str(result['extraction_metadata'])[:100]}...\n"
-                    elif info_type == 'system_file':
-                        result_summary += f"{i}. [SYSTEM FILE] {result.get('original_path', 'N/A')}\n"
+                    elif info_type == "system_file":
+                        result_summary += (
+                            f"{i}. [SYSTEM FILE] {result.get('original_path', 'N/A')}\n"
+                        )
                     else:
                         result_summary += f"{i}. [DEVICE INFO] {result.get('filename', 'N/A')} | {result.get('category', 'N/A')}\n"
 
@@ -390,17 +401,17 @@ CRITICAL: If results are from ALEAPP artifacts:
                     "model": self.model,
                     "messages": [
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message}
+                        {"role": "user", "content": user_message},
                     ],
                     "temperature": 0.3,
-                    "max_tokens": 800  # Increased for more detailed insights
+                    "max_tokens": 800,  # Increased for more detailed insights
                 }
 
                 # Add OpenRouter-specific headers if using OpenRouter
                 if self.provider == "openrouter":
                     request_params["extra_headers"] = {
                         "HTTP-Referer": "https://github.com/aayushman-singh/ufdr-analyzer",
-                        "X-Title": "UFDR Analyzer"
+                        "X-Title": "UFDR Analyzer",
                     }
 
                 response = self.client.chat.completions.create(**request_params)
@@ -410,31 +421,31 @@ CRITICAL: If results are from ALEAPP artifacts:
                 response = self.client.messages.create(
                     model=self.model,
                     system=system_prompt,
-                    messages=[
-                        {"role": "user", "content": user_message}
-                    ],
+                    messages=[{"role": "user", "content": user_message}],
                     temperature=0.3,
-                    max_tokens=800
+                    max_tokens=800,
                 )
                 return response.content[0].text
 
         except Exception as e:
-            self.logger.error(f"Failed to generate insights: {e}")
-            return f"Found {result_count} results matching your query."
+            self.logger.exception(
+                "Failed to generate insights",
+                extra={"provider": self.provider, "result_count": result_count},
+            )
+            raise RuntimeError(f"Failed to generate insights: {e}") from e
 
-    def _generate_no_results_response(self, original_query: str, query_results: Dict[str, Any]) -> str:
+    def _generate_no_results_response(
+        self, original_query: str, query_results: Dict[str, Any]
+    ) -> str:
         """
         Generate a helpful response when no results are found.
         Analyzes what data IS available and suggests alternatives.
         """
-        # Check what data is actually available
-        available_data = []
-        
         # This would need to be passed from the query executor
         # For now, provide a generic helpful response
         query_lower = original_query.lower()
-        
-        if 'whatsapp' in query_lower or 'wa' in query_lower:
+
+        if "whatsapp" in query_lower or "wa" in query_lower:
             return """I searched for WhatsApp messages but didn't find any WhatsApp data in this device extraction. 
 
 This could mean:
@@ -449,8 +460,8 @@ This could mean:
 • Media files and documents
 
 Try asking: "What communication data is available?" or "Show me all messages and calls" to see what data exists."""
-        
-        elif 'message' in query_lower or 'chat' in query_lower:
+
+        elif "message" in query_lower or "chat" in query_lower:
             return """I searched for messages but didn't find any message data in this device extraction.
 
 This could mean:
@@ -465,8 +476,13 @@ This could mean:
 • System files and logs
 
 Try asking: "What data is available?" or "Show me all contacts and calls" to explore what exists."""
-        
-        elif 'android' in query_lower or 'version' in query_lower or 'device' in query_lower or 'system' in query_lower:
+
+        elif (
+            "android" in query_lower
+            or "version" in query_lower
+            or "device" in query_lower
+            or "system" in query_lower
+        ):
             return """I searched for device information but didn't find specific Android version or system details in this extraction.
 
 This could mean:
@@ -481,7 +497,7 @@ This could mean:
 • Extraction metadata and file information
 
 Try asking: "What apps were installed?" or "Show me all extracted data" to see what information is available."""
-        
+
         else:
             return f"""I searched for '{original_query}' but didn't find any matching data in this device extraction.
 

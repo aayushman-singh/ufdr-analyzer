@@ -106,6 +106,12 @@ def test_token_signed_with_other_key_is_rejected(monkeypatch):
     assert ei.value.status_code == 401
 
 
+def test_secret_key_placeholder_is_rejected(monkeypatch):
+    monkeypatch.setenv("SECRET_KEY", "CHANGE_ME")
+    with pytest.raises(RuntimeError, match="placeholder"):
+        create_access_token(uuid.uuid4())
+
+
 # -- require_user dependency -------------------------------------------------
 def test_require_user_resolves_known_user(session):
     u = User(username="IO", email="io@x.gov", password_hash="x")

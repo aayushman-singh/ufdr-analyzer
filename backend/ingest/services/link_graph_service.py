@@ -43,9 +43,9 @@ import hmac
 import uuid as _uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Iterator, Optional
 
-from sqlmodel import Session, select
+from sqlmodel import Session, or_, select
 
 from db_setup import Call, Contact, Message, Run
 
@@ -64,6 +64,14 @@ MAX_EDGE_CITATIONS = 50
 # silently building a partial graph or OOMing — a forensic surface must not lie by
 # omission. Tune per deployment; large cases should be windowed or seeded.
 MAX_EVENTS = 500_000
+
+# Initial graph responses are intentionally bounded. A client should use
+# seed+hops/time windows to expand a specific neighborhood instead of asking the
+# API to serialize an unbounded N-node graph.
+DEFAULT_NODE_LIMIT = 500
+DEFAULT_EDGE_LIMIT = 2_000
+MAX_NODE_LIMIT = 5_000
+MAX_EDGE_LIMIT = 20_000
 
 
 def _display_id(hmac_hex: str) -> str:
@@ -185,6 +193,11 @@ class LinkGraph:
     nodes: list[LinkNode]
     edges: list[LinkEdge]
     excluded_events: int  # rows skipped for missing timestamps (surfaced)
+    truncated: bool = False
+    truncation_reason: Optional[str] = None
+    node_limit: Optional[int] = None
+    edge_limit: Optional[int] = None
+    events_scanned: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -196,6 +209,11 @@ class LinkGraph:
             "window_start": self.window_start,
             "window_end": self.window_end,
             "excluded_events": self.excluded_events,
+            "truncated": self.truncated,
+            "truncation_reason": self.truncation_reason,
+            "node_limit": self.node_limit,
+            "edge_limit": self.edge_limit,
+            "events_scanned": self.events_scanned,
             "node_count": len(self.nodes),
             "edge_count": len(self.edges),
             "nodes": [n.to_dict() for n in self.nodes],
@@ -229,22 +247,35 @@ class LinkGraphService:
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
         owner_id: Optional[_uuid.UUID] = None,
+        authorized_run_ids: Optional[set[str]] = None,
+        node_limit: Optional[int] = DEFAULT_NODE_LIMIT,
+        edge_limit: Optional[int] = DEFAULT_EDGE_LIMIT,
     ) -> LinkGraph:
         """Build the link graph over `run_ids`.
 
         - `seed`: restrict to the seed entity's `max_hops` neighborhood. Matched by
           id, so it works whether the seed is local or recurs across cases.
         - `start`/`end`: inclusive time window over event timestamps (`start<=end`).
-        - `owner_id`: if given, every run must belong to this user (tenant guard).
-          Regardless, all runs in one graph must share a single owner — merging two
-          users' cases into one graph is refused, not silently allowed.
-        Fails loud on an empty run set, a nonexistent run, a cross-owner set, or a
+        - `owner_id`: legacy single-tenant guard — if given, every run must belong
+          to this user, and all runs in one graph must share one owner.
+        - `authorized_run_ids`: case-level RBAC allowlist (V5). When provided, the
+          caller has been vetted per-run by `case_access.authorize_runs`, so every
+          run must be in this set, and the legacy single-owner rule is intentionally
+          relaxed: a viewer legitimately granted access to two different owners'
+          cases may graph them together. Defense-in-depth — the route already
+          enforced this; the service refuses anything outside the allowlist too.
+        - `node_limit` / `edge_limit`: explicit response caps. If an unseeded graph
+          hits the cap, the response is marked `truncated` and clients must expand
+          by seed/time window rather than receiving a silently partial graph.
+        Fails loud on an empty run set, a nonexistent run, an unauthorized run, or a
         reversed window — an empty graph and a bad request must not look the same.
         """
         if not run_ids:
             raise ValueError("run_ids must not be empty")
         if max_hops is not None and max_hops < 0:
             raise ValueError("max_hops must be >= 0")
+        node_limit = self._validate_cap("node_limit", node_limit, MAX_NODE_LIMIT)
+        edge_limit = self._validate_cap("edge_limit", edge_limit, MAX_EDGE_LIMIT)
         if (
             start is not None
             and end is not None
@@ -264,64 +295,68 @@ class LinkGraphService:
                 raise PermissionError(
                     f"run {rid} does not belong to the requesting user"
                 )
-        if len(owners) > 1:
+            if authorized_run_ids is not None and rid not in authorized_run_ids:
+                raise PermissionError(f"run {rid} is not authorized for the caller")
+        # Legacy single-owner privacy guard. Under case-level RBAC the caller has
+        # already been authorized per-run, so cross-owner graphs are permitted;
+        # only enforce the single-owner rule on the legacy (non-allowlist) path.
+        if authorized_run_ids is None and len(owners) > 1:
             raise PermissionError(
                 "all runs in one graph must belong to the same owner "
                 f"(found {len(owners)} distinct owners)"
             )
 
         start_n, end_n = _to_utc_naive(start), _to_utc_naive(end)
-        events, excluded = self._load_events(uniq, start_n, end_n)
+        seed_meta = entity_key(seed) if seed else None
+        seed_id = seed_meta[0] if seed_meta else None
+        seed_presence: dict[str, tuple[set[str], tuple[str, str]]] = {}
+        hops_map: dict[str, int] = {}
 
-        # Accumulate nodes and edges from the raw event stream. Citations are capped
-        # DURING accumulation so a huge thread bounds memory, not just payload.
-        node_runs: dict[str, set[str]] = {}
-        node_meta: dict[str, tuple[str, str]] = {}  # id -> (canonical_value, type)
-        edge_acc: dict[tuple[str, str], LinkEdge] = {}
-        for ev in events:
-            ka, kb = _key_for(ev.a, ev.run_id), _key_for(ev.b, ev.run_id)
-            if ka is None or kb is None:
-                continue
-            (ia, va, ta), (ib, vb, tb) = ka, kb
-            if ia == ib:
-                continue  # self-loop (a contacting itself) carries no relation
-            node_runs.setdefault(ia, set()).add(ev.run_id)
-            node_runs.setdefault(ib, set()).add(ev.run_id)
-            node_meta.setdefault(ia, (va, ta))
-            node_meta.setdefault(ib, (vb, tb))
-            lo, hi = (ia, ib) if ia <= ib else (ib, ia)
-            edge = edge_acc.get((lo, hi))
-            if edge is None:
-                edge = LinkEdge(source=lo, target=hi, weight=0, citations=[])
-                edge_acc[(lo, hi)] = edge
-            edge.weight += 1
-            if len(edge.citations) < MAX_EDGE_CITATIONS:
-                edge.citations.append(
-                    EdgeCitation(
-                        run_id=ev.run_id,
-                        source_table=ev.table,
-                        row_id=ev.row_id,
-                        timestamp=ev.ts.isoformat() if ev.ts else None,
-                    )
-                )
+        if seed_id:
+            (
+                events,
+                excluded,
+                hops_map,
+                seed_presence,
+                source_events_scanned,
+            ) = self._load_seeded_events(
+                uniq, start_n, end_n, seed_id, seed, seed_meta[1], max_hops
+            )
+            (
+                node_runs,
+                node_meta,
+                edge_acc,
+                truncated,
+                truncation_reason,
+                events_scanned,
+            ) = self._accumulate_events(
+                events, node_limit=node_limit, edge_limit=edge_limit
+            )
+            events_scanned += source_events_scanned
+            if seed_id in seed_presence and seed_id not in node_runs:
+                runs, meta = seed_presence[seed_id]
+                node_runs[seed_id] = set(runs)
+                node_meta[seed_id] = meta
+        else:
+            (
+                node_runs,
+                node_meta,
+                edge_acc,
+                excluded,
+                truncated,
+                truncation_reason,
+                events_scanned,
+            ) = self._accumulate_stream(
+                self._iter_events(uniq, start_n, end_n),
+                node_limit=node_limit,
+                edge_limit=edge_limit,
+            )
 
         labels = self._contact_labels(uniq)
 
-        seed_meta = entity_key(seed) if seed else None
-        seed_id = seed_meta[0] if seed_meta else None
-        keep = self._neighborhood_ids(edge_acc, seed_id, max_hops) if seed_id else None
         seed_found = bool(seed_id and seed_id in node_runs)
 
-        # Filter to the seed neighborhood if requested.
-        if keep is not None:
-            edge_acc = {
-                k: e
-                for k, e in edge_acc.items()
-                if e.source in keep and e.target in keep
-            }
-            node_ids = set(keep) & set(node_runs)
-        else:
-            node_ids = set(node_runs)
+        node_ids = set(node_runs)
 
         # Degree is computed over the FINAL edge set so it matches what's returned.
         degree: dict[str, int] = {nid: 0 for nid in node_ids}
@@ -329,7 +364,6 @@ class LinkGraphService:
             degree[e.source] = degree.get(e.source, 0) + e.weight
             degree[e.target] = degree.get(e.target, 0) + e.weight
 
-        hops_map = keep if keep is not None else {}
         nodes = [
             self._make_node(
                 nid,
@@ -361,9 +395,396 @@ class LinkGraphService:
             nodes=nodes,
             edges=edges,
             excluded_events=excluded,
+            truncated=truncated,
+            truncation_reason=truncation_reason,
+            node_limit=node_limit,
+            edge_limit=edge_limit,
+            events_scanned=events_scanned,
         )
 
     # -- internals ---------------------------------------------------------
+    @staticmethod
+    def _validate_cap(name: str, value: Optional[int], max_value: int) -> Optional[int]:
+        if value is None:
+            return None
+        if value < 1:
+            raise ValueError(f"{name} must be >= 1")
+        if value > max_value:
+            raise ValueError(f"{name} must be <= {max_value}")
+        return value
+
+    def _iter_events(
+        self, run_ids: list[str], start: Optional[datetime], end: Optional[datetime]
+    ) -> Iterator[_Event | None]:
+        """Yield candidate events in a deterministic, bounded-memory order.
+
+        `None` means a row was excluded because its timestamp was missing. The
+        caller counts that explicitly, keeping "skipped" evidence visible without
+        forcing this generator to accumulate state.
+        """
+
+        def in_window(ts: Optional[datetime]) -> bool:
+            if ts is None:
+                return False
+            if start is not None and ts < start:
+                return False
+            if end is not None and ts > end:
+                return False
+            return True
+
+        for rid in run_ids:
+            ru = _uuid.UUID(rid)
+            message_stmt = (
+                select(Message)
+                .where(Message.run_id == ru)
+                .order_by(Message.timestamp, Message.id)
+            )
+            for m in self.session.exec(message_stmt):
+                ts = _to_utc_naive(m.timestamp)
+                if ts is None:
+                    yield None
+                    continue
+                if not in_window(ts):
+                    continue
+                yield _Event(rid, "message", str(m.id), ts, m.sender, m.receiver)
+
+            call_stmt = (
+                select(Call).where(Call.run_id == ru).order_by(Call.timestamp, Call.id)
+            )
+            for c in self.session.exec(call_stmt):
+                ts = _to_utc_naive(c.timestamp)
+                if ts is None:
+                    yield None
+                    continue
+                if not in_window(ts):
+                    continue
+                yield _Event(rid, "call", str(c.id), ts, c.caller, c.receiver)
+
+    def _iter_events_touching_values(
+        self,
+        run_ids: list[str],
+        start: Optional[datetime],
+        end: Optional[datetime],
+        values: set[str],
+    ) -> Iterator[_Event | None]:
+        """Yield deterministic events whose raw endpoints touch `values`.
+
+        Seed expansion uses this instead of scanning every event in the case on
+        each hop. Phone-number canonicalization still happens after loading the
+        matching rows; the SQL filter is a narrow raw-value frontier, not a new
+        identity rule.
+        """
+        if not values:
+            return
+
+        def in_window(ts: Optional[datetime]) -> bool:
+            if ts is None:
+                return False
+            if start is not None and ts < start:
+                return False
+            if end is not None and ts > end:
+                return False
+            return True
+
+        ordered_values = sorted(values)
+        phone_patterns = []
+        for value in ordered_values:
+            norm = normalize(value)
+            if norm and norm[1] == "phone":
+                phone_patterns.append("%" + "%".join(norm[0]) + "%")
+        for rid in run_ids:
+            ru = _uuid.UUID(rid)
+            message_filters = [
+                Message.sender.in_(ordered_values),
+                Message.receiver.in_(ordered_values),
+            ]
+            for pattern in phone_patterns:
+                message_filters.extend(
+                    [Message.sender.like(pattern), Message.receiver.like(pattern)]
+                )
+            message_stmt = (
+                select(Message)
+                .where(
+                    Message.run_id == ru,
+                    or_(*message_filters),
+                )
+                .order_by(Message.timestamp, Message.id)
+            )
+            for m in self.session.exec(message_stmt):
+                ts = _to_utc_naive(m.timestamp)
+                if ts is None:
+                    yield None
+                    continue
+                if not in_window(ts):
+                    continue
+                yield _Event(rid, "message", str(m.id), ts, m.sender, m.receiver)
+
+            call_filters = [
+                Call.caller.in_(ordered_values),
+                Call.receiver.in_(ordered_values),
+            ]
+            for pattern in phone_patterns:
+                call_filters.extend(
+                    [Call.caller.like(pattern), Call.receiver.like(pattern)]
+                )
+            call_stmt = (
+                select(Call)
+                .where(
+                    Call.run_id == ru,
+                    or_(*call_filters),
+                )
+                .order_by(Call.timestamp, Call.id)
+            )
+            for c in self.session.exec(call_stmt):
+                ts = _to_utc_naive(c.timestamp)
+                if ts is None:
+                    yield None
+                    continue
+                if not in_window(ts):
+                    continue
+                yield _Event(rid, "call", str(c.id), ts, c.caller, c.receiver)
+
+    @staticmethod
+    def _event_keys(
+        ev: _Event,
+    ) -> tuple[tuple[str, str, str], tuple[str, str, str]] | None:
+        ka, kb = _key_for(ev.a, ev.run_id), _key_for(ev.b, ev.run_id)
+        if ka is None or kb is None:
+            return None
+        if ka[0] == kb[0]:
+            return None
+        return ka, kb
+
+    @staticmethod
+    def _add_event(
+        ev: _Event,
+        node_runs: dict[str, set[str]],
+        node_meta: dict[str, tuple[str, str]],
+        edge_acc: dict[tuple[str, str], LinkEdge],
+        *,
+        node_limit: Optional[int],
+        edge_limit: Optional[int],
+    ) -> tuple[bool, Optional[str]]:
+        keys = LinkGraphService._event_keys(ev)
+        if keys is None:
+            return True, None
+        (ia, va, ta), (ib, vb, tb) = keys
+        lo, hi = (ia, ib) if ia <= ib else (ib, ia)
+
+        new_nodes = int(ia not in node_runs) + int(ib not in node_runs)
+        if node_limit is not None and len(node_runs) + new_nodes > node_limit:
+            return False, f"node_limit {node_limit} reached"
+        if (
+            edge_limit is not None
+            and (lo, hi) not in edge_acc
+            and len(edge_acc) >= edge_limit
+        ):
+            return False, f"edge_limit {edge_limit} reached"
+
+        node_runs.setdefault(ia, set()).add(ev.run_id)
+        node_runs.setdefault(ib, set()).add(ev.run_id)
+        node_meta.setdefault(ia, (va, ta))
+        node_meta.setdefault(ib, (vb, tb))
+        edge = edge_acc.get((lo, hi))
+        if edge is None:
+            edge = LinkEdge(source=lo, target=hi, weight=0, citations=[])
+            edge_acc[(lo, hi)] = edge
+        edge.weight += 1
+        if len(edge.citations) < MAX_EDGE_CITATIONS:
+            edge.citations.append(
+                EdgeCitation(
+                    run_id=ev.run_id,
+                    source_table=ev.table,
+                    row_id=ev.row_id,
+                    timestamp=ev.ts.isoformat() if ev.ts else None,
+                )
+            )
+        return True, None
+
+    def _accumulate_events(
+        self,
+        events: list[_Event],
+        *,
+        node_limit: Optional[int],
+        edge_limit: Optional[int],
+    ) -> tuple[
+        dict[str, set[str]],
+        dict[str, tuple[str, str]],
+        dict[tuple[str, str], LinkEdge],
+        bool,
+        Optional[str],
+        int,
+    ]:
+        node_runs: dict[str, set[str]] = {}
+        node_meta: dict[str, tuple[str, str]] = {}
+        edge_acc: dict[tuple[str, str], LinkEdge] = {}
+        truncated = False
+        reason: Optional[str] = None
+        events_scanned = 0
+        for ev in events:
+            events_scanned += 1
+            if events_scanned > MAX_EVENTS:
+                raise ValueError(
+                    f"graph exceeds MAX_EVENTS ({MAX_EVENTS}); narrow the time "
+                    "window or seed the query rather than building it whole"
+                )
+            ok, reason = self._add_event(
+                ev,
+                node_runs,
+                node_meta,
+                edge_acc,
+                node_limit=node_limit,
+                edge_limit=edge_limit,
+            )
+            if not ok:
+                truncated = True
+                break
+        return node_runs, node_meta, edge_acc, truncated, reason, events_scanned
+
+    def _accumulate_stream(
+        self,
+        stream: Iterator[_Event | None],
+        *,
+        node_limit: Optional[int],
+        edge_limit: Optional[int],
+    ) -> tuple[
+        dict[str, set[str]],
+        dict[str, tuple[str, str]],
+        dict[tuple[str, str], LinkEdge],
+        int,
+        bool,
+        Optional[str],
+        int,
+    ]:
+        node_runs: dict[str, set[str]] = {}
+        node_meta: dict[str, tuple[str, str]] = {}
+        edge_acc: dict[tuple[str, str], LinkEdge] = {}
+        excluded = 0
+        truncated = False
+        reason: Optional[str] = None
+        events_scanned = 0
+        for item in stream:
+            if item is None:
+                excluded += 1
+                continue
+            events_scanned += 1
+            if events_scanned > MAX_EVENTS:
+                raise ValueError(
+                    f"graph exceeds MAX_EVENTS ({MAX_EVENTS}); narrow the time "
+                    "window or seed the query rather than building it whole"
+                )
+            ok, reason = self._add_event(
+                item,
+                node_runs,
+                node_meta,
+                edge_acc,
+                node_limit=node_limit,
+                edge_limit=edge_limit,
+            )
+            if not ok:
+                truncated = True
+                break
+        return (
+            node_runs,
+            node_meta,
+            edge_acc,
+            excluded,
+            truncated,
+            reason,
+            events_scanned,
+        )
+
+    def _load_seeded_events(
+        self,
+        run_ids: list[str],
+        start: Optional[datetime],
+        end: Optional[datetime],
+        seed_id: str,
+        seed_raw: str,
+        seed_value: str,
+        max_hops: Optional[int],
+    ) -> tuple[
+        list[_Event],
+        int,
+        dict[str, int],
+        dict[str, tuple[set[str], tuple[str, str]]],
+        int,
+    ]:
+        """Discover the seed neighborhood without materializing unrelated edges."""
+        reached: dict[str, int] = {seed_id: 0}
+        frontier_ids = {seed_id}
+        frontier_values = {seed_raw, seed_value}
+        reached_values = set(frontier_values)
+        depth = 0
+        events_scanned = 0
+
+        def count_scan(item: Optional[_Event]) -> None:
+            nonlocal events_scanned
+            if item is None:
+                return
+            events_scanned += 1
+            if events_scanned > MAX_EVENTS:
+                raise ValueError(
+                    f"seeded graph scan exceeds MAX_EVENTS ({MAX_EVENTS}); narrow "
+                    "the time window or reduce hops"
+                )
+
+        while frontier_ids and (max_hops is None or depth < max_hops):
+            depth += 1
+            next_frontier_ids: set[str] = set()
+            next_frontier_values: set[str] = set()
+            for item in self._iter_events_touching_values(
+                run_ids, start, end, frontier_values
+            ):
+                count_scan(item)
+                if item is None:
+                    continue
+                keys = self._event_keys(item)
+                if keys is None:
+                    continue
+                (ia, _, _), (ib, _, _) = keys
+                if ia in frontier_ids and ib not in reached:
+                    reached[ib] = depth
+                    next_frontier_ids.add(ib)
+                    next_frontier_values.add(item.b)
+                if ib in frontier_ids and ia not in reached:
+                    reached[ia] = depth
+                    next_frontier_ids.add(ia)
+                    next_frontier_values.add(item.a)
+            frontier_ids = next_frontier_ids
+            frontier_values = next_frontier_values
+            reached_values.update(next_frontier_values)
+
+        excluded = 0
+        events: list[_Event] = []
+        presence: dict[str, tuple[set[str], tuple[str, str]]] = {}
+        for item in self._iter_events_touching_values(
+            run_ids, start, end, reached_values
+        ):
+            count_scan(item)
+            if item is None:
+                excluded += 1
+                continue
+            keys = self._event_keys(item)
+            if keys is None:
+                continue
+            (ia, va, ta), (ib, vb, tb) = keys
+            if ia == seed_id:
+                runs, _ = presence.setdefault(seed_id, (set(), (va, ta)))
+                runs.add(item.run_id)
+            if ib == seed_id:
+                runs, _ = presence.setdefault(seed_id, (set(), (vb, tb)))
+                runs.add(item.run_id)
+            if max_hops == 0:
+                continue
+            if ia in reached and ib in reached:
+                events.append(item)
+                if len(events) > MAX_EVENTS:
+                    raise ValueError(
+                        f"seeded graph materialization exceeds MAX_EVENTS ({MAX_EVENTS})"
+                    )
+        return events, excluded, reached, presence, events_scanned
+
     def _load_events(
         self, run_ids: list[str], start: Optional[datetime], end: Optional[datetime]
     ) -> tuple[list[_Event], int]:

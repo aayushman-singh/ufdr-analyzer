@@ -13,6 +13,7 @@ property a court cares about: the log can be *shown* to be intact.
 No fallbacks: a verification failure is returned explicitly (not swallowed), and
 recording is transactional with the caller's session.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -32,8 +33,15 @@ from db_setup import AuditEvent  # noqa: E402
 GENESIS_HASH = "0" * 64
 
 
-def _canonical(event_type: str, seq: int, timestamp: str, run_id: Optional[str],
-               user_id: Optional[str], payload: Optional[str], prev_hash: str) -> str:
+def _canonical(
+    event_type: str,
+    seq: int,
+    timestamp: str,
+    run_id: Optional[str],
+    user_id: Optional[str],
+    payload: Optional[str],
+    prev_hash: str,
+) -> str:
     """Deterministic serialization of the fields the hash commits to."""
     return json.dumps(
         {
@@ -51,8 +59,15 @@ def _canonical(event_type: str, seq: int, timestamp: str, run_id: Optional[str],
     )
 
 
-def _hash_event(event_type: str, seq: int, timestamp: str, run_id: Optional[str],
-                user_id: Optional[str], payload: Optional[str], prev_hash: str) -> str:
+def _hash_event(
+    event_type: str,
+    seq: int,
+    timestamp: str,
+    run_id: Optional[str],
+    user_id: Optional[str],
+    payload: Optional[str],
+    prev_hash: str,
+) -> str:
     canon = _canonical(event_type, seq, timestamp, run_id, user_id, payload, prev_hash)
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
@@ -82,9 +97,7 @@ class AuditService:
         any signed artifact references it. Pass a session whose only pending
         work is meant to be persisted alongside the audit event.
         """
-        head = session.exec(
-            select(AuditEvent).order_by(AuditEvent.seq.desc())
-        ).first()
+        head = session.exec(select(AuditEvent).order_by(AuditEvent.seq.desc())).first()
         seq = (head.seq + 1) if head and head.seq is not None else 0
         prev_hash = head.entry_hash if head else GENESIS_HASH
 
@@ -94,10 +107,13 @@ class AuditService:
         user_s = str(user_id) if user_id is not None else None
         payload_s = (
             json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
-            if payload is not None else None
+            if payload is not None
+            else None
         )
 
-        entry_hash = _hash_event(event_type, seq, ts_iso, run_s, user_s, payload_s, prev_hash)
+        entry_hash = _hash_event(
+            event_type, seq, ts_iso, run_s, user_s, payload_s, prev_hash
+        )
 
         event = AuditEvent(
             seq=seq,
@@ -120,17 +136,22 @@ class AuditService:
         prev_hash = GENESIS_HASH
         for ev in events:
             if ev.prev_hash != prev_hash:
-                return ChainStatus(False, len(events), ev.seq,
-                                   f"prev_hash mismatch at seq {ev.seq}")
+                return ChainStatus(
+                    False, len(events), ev.seq, f"prev_hash mismatch at seq {ev.seq}"
+                )
             recomputed = _hash_event(
-                ev.event_type, ev.seq, ev.timestamp.isoformat(),
+                ev.event_type,
+                ev.seq,
+                ev.timestamp.isoformat(),
                 str(ev.run_id) if ev.run_id else None,
                 str(ev.user_id) if ev.user_id else None,
-                ev.payload, ev.prev_hash,
+                ev.payload,
+                ev.prev_hash,
             )
             if recomputed != ev.entry_hash:
-                return ChainStatus(False, len(events), ev.seq,
-                                   f"entry_hash mismatch at seq {ev.seq}")
+                return ChainStatus(
+                    False, len(events), ev.seq, f"entry_hash mismatch at seq {ev.seq}"
+                )
             prev_hash = ev.entry_hash
         return ChainStatus(True, len(events), None, "chain intact")
 

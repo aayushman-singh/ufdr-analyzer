@@ -203,6 +203,14 @@ def test_seed_one_hop_reaches_cross_case_neighbors(session, runs):
     assert entity_key(P3)[0] not in ids
 
 
+def test_canonical_phone_seed_matches_formatted_evidence(session, runs):
+    a, b = runs
+    canonical = "15550100001"
+    g = LinkGraphService(session).build([a, b], seed=canonical, max_hops=1)
+    ids = {n.id for n in g.nodes}
+    assert ids == {entity_key(P1)[0], entity_key(P2)[0], entity_key(P9)[0]}
+
+
 def test_seed_not_found(session, runs):
     a, _ = runs
     g = LinkGraphService(session).build([a], seed="+19999999999", max_hops=2)
@@ -367,6 +375,79 @@ def test_citation_cap_keeps_true_weight(session, monkeypatch):
     assert edge["citations_truncated"] is True
 
 
+def test_full_graph_caps_initial_response_deterministically(session):
+    u = User(username="IO", email="cap@x.gov", password_hash="x")
+    session.add(u)
+    session.commit()
+    session.refresh(u)
+    r = Run(user_id=u.id, ufdr_file_name="cap.ufdr", status="complete")
+    session.add(r)
+    session.commit()
+    session.refresh(r)
+    for i in range(8):
+        session.add(
+            Message(
+                run_id=r.id,
+                sender=f"+15551000{i:03d}",
+                receiver=f"+15552000{i:03d}",
+                timestamp=datetime(2024, 1, 1, 0, i),
+                content=str(i),
+            )
+        )
+    session.commit()
+
+    g1 = LinkGraphService(session).build([r.id], max_hops=None, node_limit=4).to_dict()
+    g2 = LinkGraphService(session).build([r.id], max_hops=None, node_limit=4).to_dict()
+
+    assert g1 == g2
+    assert g1["truncated"] is True
+    assert g1["node_limit"] == 4
+    assert g1["node_count"] == 4
+    node_ids = {n["id"] for n in g1["nodes"]}
+    assert all(e["source"] in node_ids and e["target"] in node_ids for e in g1["edges"])
+
+
+def test_seeded_graph_expands_without_whole_case_event_ceiling(session, monkeypatch):
+    import ingest.services.link_graph_service as svc_mod
+
+    monkeypatch.setattr(svc_mod, "MAX_EVENTS", 5)
+    u = User(username="IO", email="lazy@x.gov", password_hash="x")
+    session.add(u)
+    session.commit()
+    session.refresh(u)
+    r = Run(user_id=u.id, ufdr_file_name="lazy.ufdr", status="complete")
+    session.add(r)
+    session.commit()
+    session.refresh(r)
+    session.add(
+        Message(
+            run_id=r.id,
+            sender=P1,
+            receiver=P2,
+            timestamp=datetime(2024, 1, 1),
+            content="seed edge",
+        )
+    )
+    for i in range(20):
+        session.add(
+            Message(
+                run_id=r.id,
+                sender=f"+16661000{i:03d}",
+                receiver=f"+16662000{i:03d}",
+                timestamp=datetime(2024, 1, 2, 0, i),
+                content="unrelated",
+            )
+        )
+    session.commit()
+
+    graph = LinkGraphService(session).build([r.id], seed=P1, max_hops=1).to_dict()
+
+    assert graph["seed_found"] is True
+    assert graph["truncated"] is False
+    assert {n["id"] for n in graph["nodes"]} == {entity_key(P1)[0], entity_key(P2)[0]}
+    assert graph["edge_count"] == 1
+
+
 # -- HTTP route contract (TestClient) ----------------------------------------
 def _client(session, *, token: str | None = None):
     """Test client for the link-graph router.
@@ -473,9 +554,7 @@ def test_route_get_without_token_is_401(session, runs):
 def test_route_export_without_token_is_401(session, runs):
     a, _ = runs
     c = _client(session)
-    res = c.post(
-        "/link-graph/export", json={"run_ids": [str(a)], "format": "json"}
-    )
+    res = c.post("/link-graph/export", json={"run_ids": [str(a)], "format": "json"})
     assert res.status_code == 401
 
 

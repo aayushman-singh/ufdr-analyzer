@@ -8,11 +8,13 @@ Every edge in the response cites the source rows that prove it. Identifiers seen
 across 2+ cases are returned salted-hash (redacted) unless they are the seed.
 
 Auth: both endpoints REQUIRE an authenticated user (Bearer token, see
-`auth_service.require_user`). The graph is scoped to that user's own cases —
-`owner_id` is bound to the authenticated identity, never accepted from the client.
-This closes the prior membership/PII oracle: an unauthenticated caller is rejected
-with 401, and a caller asking for runs they do not own is rejected with 403 — they
-cannot learn whether an entity appears across someone else's cases.
+`auth_service.require_user`) AND case-level RBAC authorization (see
+`case_access.authorize_runs`). The caller must hold at least 'viewer' on every
+requested case — as the case's implicit owner (`Run.user_id`) or via an explicit
+`CaseMembership` grant. The run set is never trusted from the client beyond this
+check. This closes the prior membership/PII oracle: an unauthenticated caller is
+401, and a caller asking for a case they are not a member of is 403 — they cannot
+learn whether an entity appears across someone else's cases.
 """
 
 import logging
@@ -31,18 +33,36 @@ from database import get_session
 from db_setup import User
 from ingest.services.audit_service import audit_service
 from ingest.services.auth_service import require_user
+from ingest.services.case_access import authorize_runs
 from ingest.services.graph_export import (
     build_graph_pdf,
     content_hash,
     signed_artifact,
 )
-from ingest.services.link_graph_service import LinkGraphService
+from ingest.services.link_graph_service import (
+    DEFAULT_EDGE_LIMIT,
+    DEFAULT_NODE_LIMIT,
+    MAX_EDGE_LIMIT,
+    MAX_NODE_LIMIT,
+    LinkGraphService,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/link-graph", tags=["Entity Link Graph"])
 
 
-def _build(session: Session, *, run_ids, seed, hops, start, end, owner_id=None):
+def _build(
+    session: Session,
+    *,
+    run_ids,
+    seed,
+    hops,
+    start,
+    end,
+    authorized_run_ids=None,
+    node_limit=DEFAULT_NODE_LIMIT,
+    edge_limit=DEFAULT_EDGE_LIMIT,
+):
     """Shared build path; maps service errors to 4xx (fail loud, never silent)."""
     try:
         return LinkGraphService(session).build(
@@ -51,7 +71,9 @@ def _build(session: Session, *, run_ids, seed, hops, start, end, owner_id=None):
             max_hops=hops,
             start=start,
             end=end,
-            owner_id=owner_id,
+            authorized_run_ids=authorized_run_ids,
+            node_limit=node_limit,
+            edge_limit=edge_limit,
         )
     except PermissionError as e:
         # Cross-owner set / run not owned by requester — refuse, don't leak.
@@ -78,14 +100,29 @@ def get_link_graph(
     end: Optional[datetime] = Query(
         None, description="inclusive ISO end of time window"
     ),
+    node_limit: int = Query(
+        DEFAULT_NODE_LIMIT,
+        ge=1,
+        le=MAX_NODE_LIMIT,
+        description="maximum nodes to serialize before marking the graph truncated",
+    ),
+    edge_limit: int = Query(
+        DEFAULT_EDGE_LIMIT,
+        ge=1,
+        le=MAX_EDGE_LIMIT,
+        description="maximum edges to serialize before marking the graph truncated",
+    ),
     session: Session = Depends(get_session),
     user: User = Depends(require_user),
 ) -> dict:
     """The entity link graph over the given cases, optionally centered on a seed
     and/or time-filtered. Every edge carries its source-row citations.
 
-    Scoped to the authenticated user's own cases — a run not owned by the caller
-    is refused (403), so the cross-case membership signal is not an oracle."""
+    Scoped by case-level RBAC: the caller must hold at least 'viewer' on every
+    requested case (implicit owner or an explicit membership grant). A nonexistent
+    case is 404; one the caller may not access is 403 — never an empty-but-revealing
+    graph, so the cross-case membership signal is not an oracle."""
+    authorized = authorize_runs(session, user, run_ids)
     graph = _build(
         session,
         run_ids=run_ids,
@@ -93,7 +130,9 @@ def get_link_graph(
         hops=hops,
         start=start,
         end=end,
-        owner_id=user.id,
+        authorized_run_ids=authorized,
+        node_limit=node_limit,
+        edge_limit=edge_limit,
     )
     return graph.to_dict()
 
@@ -104,6 +143,8 @@ class GraphExportRequest(BaseModel):
     hops: int = Field(2, ge=0, le=6)  # same bound as GET — no validation bypass
     start: Optional[datetime] = None
     end: Optional[datetime] = None
+    node_limit: int = Field(DEFAULT_NODE_LIMIT, ge=1, le=MAX_NODE_LIMIT)
+    edge_limit: int = Field(DEFAULT_EDGE_LIMIT, ge=1, le=MAX_EDGE_LIMIT)
     # No owner_id here: scope is bound to the authenticated caller, not the client.
     format: str = "json"  # "json" (signed artifact) | "pdf" (signed summary)
 
@@ -133,6 +174,7 @@ def export_link_graph(
             detail="SECRET_KEY not configured — cannot sign the graph export.",
         )
 
+    authorized = authorize_runs(session, user, req.run_ids)
     graph = _build(
         session,
         run_ids=req.run_ids,
@@ -140,7 +182,9 @@ def export_link_graph(
         hops=req.hops,
         start=req.start,
         end=req.end,
-        owner_id=user.id,
+        authorized_run_ids=authorized,
+        node_limit=req.node_limit,
+        edge_limit=req.edge_limit,
     ).to_dict()
     chash = content_hash(graph)
 
