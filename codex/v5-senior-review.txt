@@ -1,0 +1,97 @@
+Reading additional input from stdin...
+2026-06-12T05:22:33.622055Z  WARN codex_core_plugins::loader: failed to load plugin: plugin is not installed plugin="browser@openai-bundled" path=C:\Users\Aayushman\.codex\plugins\cache\openai-bundled\browser
+2026-06-12T05:22:33.622572Z  WARN codex_core_plugins::loader: failed to load plugin: plugin is not installed plugin="browser@openai-bundled" path=C:\Users\Aayushman\.codex\plugins\cache\openai-bundled\browser
+2026-06-12T05:22:33.730766Z  WARN codex_core::shell_snapshot: Failed to create shell snapshot for powershell: Shell snapshot not supported yet for PowerShell
+OpenAI Codex v0.135.0
+--------
+workdir: C:\Repo\ufdr-analyzer
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019eba48-2f91-76d1-b2ae-2fe13ed09d49
+--------
+user
+brutal senior security + perf review — authz bypass, injection, no-fallback, perf-claim honesty
+2026-06-12T05:22:33.960666Z  WARN codex_core_plugins::loader: failed to load plugin: plugin is not installed plugin="browser@openai-bundled" path=C:\Users\Aayushman\.codex\plugins\cache\openai-bundled\browser
+2026-06-12T05:22:34.462327Z  WARN codex_core_plugins::manifest: ignoring interface.defaultPrompt[0]: prompt must be at most 128 characters path=C:\Users\Aayushman\.codex\.tmp\plugins\plugins\ngs-analysis\.codex-plugin/plugin.json
+2026-06-12T05:22:35.115710Z  WARN codex_core_plugins::loader: failed to load plugin: plugin is not installed plugin="browser@openai-bundled" path=C:\Users\Aayushman\.codex\plugins\cache\openai-bundled\browser
+2026-06-12T05:22:35.125685Z  WARN codex_core_plugins::marketplace: skipping marketplace plugin with unsupported source path=C:\Users\Aayushman\.codex\.tmp\marketplaces\claude-plugins-official\.claude-plugin\marketplace.json plugin="fullstory"
+2026-06-12T05:22:35.126427Z  WARN codex_core_plugins::marketplace: skipping marketplace plugin with unsupported source path=C:\Users\Aayushman\.codex\.tmp\marketplaces\claude-plugins-official\.claude-plugin\marketplace.json plugin="jfrog"
+2026-06-12T05:22:35.128884Z  WARN codex_core_plugins::marketplace: skipping invalid marketplace plugin path=C:\Users\Aayushman\.codex\.tmp\marketplaces\claude-plugins-official\.claude-plugin\marketplace.json marketplace=claude-plugins-official error=invalid plugin name: only ASCII letters, digits, `_`, and `-` are allowed
+2026-06-12T05:22:35.145910Z  WARN codex_core_plugins::manifest: ignoring interface.defaultPrompt[0]: prompt must be at most 128 characters path=C:\Users\Aayushman\.codex\.tmp\plugins\plugins\ngs-analysis\.codex-plugin/plugin.json
+2026-06-12T05:22:35.199007Z  WARN codex_core_skills::loader: ignoring interface.icon_small: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:35.199042Z  WARN codex_core_skills::loader: ignoring interface.icon_large: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:35.200681Z  WARN codex_core_skills::loader: ignoring interface.icon_small: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:35.200702Z  WARN codex_core_skills::loader: ignoring interface.icon_large: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:35.202745Z  WARN codex_core_skills::loader: ignoring interface.icon_small: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:35.202764Z  WARN codex_core_skills::loader: ignoring interface.icon_large: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:35.204619Z  WARN codex_core_skills::loader: ignoring interface.icon_small: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:35.204639Z  WARN codex_core_skills::loader: ignoring interface.icon_large: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:35.206415Z  WARN codex_core_skills::loader: ignoring interface.icon_small: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:35.206441Z  WARN codex_core_skills::loader: ignoring interface.icon_large: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:35.208459Z  WARN codex_core_skills::loader: ignoring interface.icon_small: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:35.208482Z  WARN codex_core_skills::loader: ignoring interface.icon_large: icon path with '..' must resolve under plugin assets/
+hook: SessionStart
+hook: SessionStart Failed
+2026-06-12T05:22:37.256885Z  WARN codex_core_plugins::loader: failed to load plugin: plugin is not installed plugin="browser@openai-bundled" path=C:\Users\Aayushman\.codex\plugins\cache\openai-bundled\browser
+2026-06-12T05:22:37.265170Z  WARN codex_core_plugins::marketplace: skipping marketplace plugin with unsupported source path=C:\Users\Aayushman\.codex\.tmp\marketplaces\claude-plugins-official\.claude-plugin\marketplace.json plugin="fullstory"
+2026-06-12T05:22:37.265959Z  WARN codex_core_plugins::marketplace: skipping marketplace plugin with unsupported source path=C:\Users\Aayushman\.codex\.tmp\marketplaces\claude-plugins-official\.claude-plugin\marketplace.json plugin="jfrog"
+2026-06-12T05:22:37.268424Z  WARN codex_core_plugins::marketplace: skipping invalid marketplace plugin path=C:\Users\Aayushman\.codex\.tmp\marketplaces\claude-plugins-official\.claude-plugin\marketplace.json marketplace=claude-plugins-official error=invalid plugin name: only ASCII letters, digits, `_`, and `-` are allowed
+2026-06-12T05:22:37.289190Z  WARN codex_core_plugins::manifest: ignoring interface.defaultPrompt[0]: prompt must be at most 128 characters path=C:\Users\Aayushman\.codex\.tmp\plugins\plugins\ngs-analysis\.codex-plugin/plugin.json
+2026-06-12T05:22:37.356184Z  WARN codex_core_skills::loader: ignoring interface.icon_small: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:37.356218Z  WARN codex_core_skills::loader: ignoring interface.icon_large: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:37.358024Z  WARN codex_core_skills::loader: ignoring interface.icon_small: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:37.358049Z  WARN codex_core_skills::loader: ignoring interface.icon_large: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:37.359832Z  WARN codex_core_skills::loader: ignoring interface.icon_small: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:37.359853Z  WARN codex_core_skills::loader: ignoring interface.icon_large: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:37.361539Z  WARN codex_core_skills::loader: ignoring interface.icon_small: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:37.361561Z  WARN codex_core_skills::loader: ignoring interface.icon_large: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:37.363324Z  WARN codex_core_skills::loader: ignoring interface.icon_small: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:37.363344Z  WARN codex_core_skills::loader: ignoring interface.icon_large: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:37.365288Z  WARN codex_core_skills::loader: ignoring interface.icon_small: icon path with '..' must resolve under plugin assets/
+2026-06-12T05:22:37.365309Z  WARN codex_core_skills::loader: ignoring interface.icon_large: icon path with '..' must resolve under plugin assets/
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 2:42 PM.
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 2:42 PM.
+
+EXIT_CODE=1
+
+---
+
+# FINAL DIFF-ONLY FALLBACK REVIEW
+
+The required exact senior-review command was rerun for the final diff, but local Codex returned a usage-limit error before review output was produced. This section is a manual diff-only, no-tools review of the final changed files for the requested themes: authz bypass, injection, no-fallback, and performance-claim honesty.
+
+## Review Scope
+
+- RBAC authorization gates on routes returning case data.
+- Cross-case membership-oracle behavior.
+- Export/report authorization and path binding.
+- Query compiler/executor parameter handling and pagination.
+- Graph materialization caps, deterministic ordering, and seeded expansion.
+- New failure behavior in ingestion, storage, parser, sync, and startup paths.
+- Performance claims against `codex/v5-perf-bench.txt`.
+
+## Findings
+
+No blocking findings found in the final diff-only review.
+
+## Checks Performed
+
+- Case-data routes now require authenticated users and server-side case authorization before returning link graph, query, analytics/entity/transcription, report/export, ALEAPP structure, and upload-derived case data.
+- Cross-case links are filtered to runs visible to the caller and hidden when no other visible run remains, reducing membership-oracle leakage.
+- Report downloads require `run_id`, case authorization, PDF-only filenames, path containment under the report directory, and filename binding to the authorized run id.
+- Query planner/executor use structured parameters and bounded `limit` / `offset`; target tables and search types fail loudly when invalid.
+- Graph traversal is bounded by explicit node/edge/event limits and returns truncation metadata while preserving deterministic ordering.
+- Startup, storage, parser, sync, and ingestion paths now raise explicit errors for missing configuration or failed dependencies instead of silently falling back.
+- Performance claims are limited to the recorded SQLite synthetic benchmark: graph build 88.72ms -> 69.76ms, query execution 29.33ms -> 1.89ms.
+
+## Residual Risks / Non-Claims
+
+- This fallback review is not a replacement for a completed independent Codex senior-review run; the exact rerun was blocked by local usage limits.
+- Benchmark evidence is SQLite synthetic only and should not be presented as production Postgres performance.
+- Seeded phone expansion remains bounded scan plus canonical digit matching, not a normalized participant index.
+- External systems touched during ingestion are not transactionally rolled back with the database.
+- Repo-wide Ruff still exposes pre-existing ALEAPP/legacy lint debt outside the V5 diff.

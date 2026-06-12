@@ -19,23 +19,21 @@ class ReportService:
     def __init__(self, output_dir: str = "storage/reports"):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(
-            f"ReportService initialized, output folder: {self.output_dir}"
-        )
+        logger.info(f"ReportService initialized, output folder: {self.output_dir}")
 
     def generate_pdf(self, data: Dict[str, Any]) -> str:
         report_id = str(uuid.uuid4())
-        file_path = self.output_dir / f"{report_id}.pdf"
+        run_id = data.get("run_id")
+        if not run_id:
+            raise ValueError("report data must include run_id")
+        file_path = self.output_dir / f"{run_id}_{report_id}.pdf"
 
         c = canvas.Canvas(str(file_path), pagesize=A4)
         width, height = A4
 
         # === Title ===
         c.setFont("Helvetica-Bold", 16)
-        c.drawString(
-            50,
-            height - 50,
-            f"UFDR Report - Run ID: {data.get('run_id')}")
+        c.drawString(50, height - 50, f"UFDR Report - Run ID: {data.get('run_id')}")
 
         # === Run Details ===
         c.setFont("Helvetica", 12)
@@ -85,8 +83,9 @@ class ReportService:
             y -= 15
             c.drawString(
                 80,
-                y, f"Type: {res.get('result_type')}, "
-                f"Score: {res.get('confidence_score')}")
+                y,
+                f"Type: {res.get('result_type')}, Score: {res.get('confidence_score')}",
+            )
             y -= 15
             try:
                 evidence = json.loads(res.get("evidence_data", "{}"))

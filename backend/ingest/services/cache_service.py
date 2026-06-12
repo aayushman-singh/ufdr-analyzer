@@ -2,6 +2,7 @@
 Cache service for UFDR ingestion optimization.
 Provides content-based deduplication and result caching.
 """
+
 import hashlib
 import json
 import os
@@ -9,7 +10,6 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from datetime import datetime
-import uuid
 from sqlmodel import Session, select
 from db_setup import Run
 from ingest.utils.logger import get_logger
@@ -20,6 +20,7 @@ logger = get_logger(__name__)
 @dataclass
 class CachedResult:
     """Represents a cached processing result."""
+
     run_id: str
     file_path: str
     cached_at: datetime
@@ -39,6 +40,11 @@ class CacheService:
         # Ensure cache directories exist
         for cache_dir in [self.hashes_dir, self.parsed_data_dir, self.results_dir]:
             cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _hash_cache_file(self, file_path: str) -> Path:
+        resolved = str(Path(file_path).expanduser().resolve(strict=False))
+        key = hashlib.sha256(resolved.encode("utf-8")).hexdigest()
+        return self.hashes_dir / f"{key}.hash"
 
     @staticmethod
     def get_file_content_hash(file_path: str) -> str:
@@ -66,18 +72,23 @@ class CacheService:
     def get_cached_file_hash(self, file_path: str) -> Optional[str]:
         """Retrieve cached file hash if available."""
         filename = Path(file_path).name
-        hash_file = self.hashes_dir / f"{filename}.hash"
+        resolved = str(Path(file_path).expanduser().resolve(strict=False))
+        hash_file = self._hash_cache_file(file_path)
 
         if hash_file.exists():
             try:
-                with open(hash_file, 'r') as f:
+                with open(hash_file, "r") as f:
                     cached_data = json.load(f)
 
                 # Verify file hasn't changed since hash was computed
                 file_stat = os.stat(file_path)
-                if cached_data.get('mtime') == file_stat.st_mtime and cached_data.get('size') == file_stat.st_size:
+                if (
+                    cached_data.get("file_path") == resolved
+                    and cached_data.get("mtime") == file_stat.st_mtime
+                    and cached_data.get("size") == file_stat.st_size
+                ):
                     logger.info(f"Using cached hash for {filename}")
-                    return cached_data['hash']
+                    return cached_data["hash"]
                 else:
                     logger.info(f"File {filename} has changed, hash cache invalid")
 
@@ -89,19 +100,20 @@ class CacheService:
     def cache_file_hash(self, file_path: str, file_hash: str) -> None:
         """Cache file hash with metadata."""
         filename = Path(file_path).name
-        hash_file = self.hashes_dir / f"{filename}.hash"
+        resolved = str(Path(file_path).expanduser().resolve(strict=False))
+        hash_file = self._hash_cache_file(file_path)
 
         try:
             file_stat = os.stat(file_path)
             cache_data = {
-                'hash': file_hash,
-                'file_path': file_path,
-                'mtime': file_stat.st_mtime,
-                'size': file_stat.st_size,
-                'cached_at': datetime.now().isoformat()
+                "hash": file_hash,
+                "file_path": resolved,
+                "mtime": file_stat.st_mtime,
+                "size": file_stat.st_size,
+                "cached_at": datetime.now().isoformat(),
             }
 
-            with open(hash_file, 'w') as f:
+            with open(hash_file, "w") as f:
                 json.dump(cache_data, f, indent=2)
 
             logger.info(f"Cached hash for {filename}")
@@ -121,16 +133,24 @@ class CacheService:
         self.cache_file_hash(file_path, file_hash)
         return file_hash
 
-    def check_database_for_hash(self, file_hash: str, session: Session) -> Optional[Run]:
+    def check_database_for_hash(
+        self, file_hash: str, session: Session
+    ) -> Optional[Run]:
         """Check if a file with this hash has already been processed."""
         logger.info(f"Checking database for hash: {file_hash[:12]}...")
 
         try:
-            statement = select(Run).where(Run.file_content_hash == file_hash).order_by(Run.start_time.desc())
+            statement = (
+                select(Run)
+                .where(Run.file_content_hash == file_hash)
+                .order_by(Run.start_time.desc())
+            )
             result = session.exec(statement).first()
 
             if result:
-                logger.info(f"Found existing run: {result.id} (status: {result.status})")
+                logger.info(
+                    f"Found existing run: {result.id} (status: {result.status})"
+                )
                 return result
             else:
                 logger.info("No existing run found for this hash")
@@ -147,20 +167,20 @@ class CacheService:
 
         try:
             # Cache the main parsed data
-            with open(cache_file, 'w') as f:
+            with open(cache_file, "w") as f:
                 json.dump(parsed_data, f, indent=2, default=str)
 
             # Cache metadata about the parsing
             metadata = {
-                'file_hash': file_hash,
-                'cached_at': datetime.now().isoformat(),
-                'message_count': len(parsed_data.get('messages', [])),
-                'contact_count': len(parsed_data.get('contacts', [])),
-                'call_count': len(parsed_data.get('calls', [])),
-                'data_size_mb': cache_file.stat().st_size / (1024 * 1024)
+                "file_hash": file_hash,
+                "cached_at": datetime.now().isoformat(),
+                "message_count": len(parsed_data.get("messages", [])),
+                "contact_count": len(parsed_data.get("contacts", [])),
+                "call_count": len(parsed_data.get("calls", [])),
+                "data_size_mb": cache_file.stat().st_size / (1024 * 1024),
             }
 
-            with open(metadata_file, 'w') as f:
+            with open(metadata_file, "w") as f:
                 json.dump(metadata, f, indent=2)
 
             logger.info(f"Cached parsed data for hash {file_hash[:12]}...")
@@ -174,16 +194,20 @@ class CacheService:
 
         if cache_file.exists():
             try:
-                with open(cache_file, 'r') as f:
+                with open(cache_file, "r") as f:
                     data = json.load(f)
-                    logger.info(f"Retrieved cached parsed data for hash {file_hash[:12]}...")
+                    logger.info(
+                        f"Retrieved cached parsed data for hash {file_hash[:12]}..."
+                    )
                     return data
             except Exception as e:
                 logger.warning(f"Failed to read cached parsed data: {e}")
 
         return None
 
-    def cache_ingestion_result(self, file_hash: str, run_id: str, stats: Dict[str, Any]) -> None:
+    def cache_ingestion_result(
+        self, file_hash: str, run_id: str, stats: Dict[str, Any]
+    ) -> None:
         """Cache database ingestion results."""
         result_file = self.results_dir / f"{file_hash}_result.json"
         stats_file = self.results_dir / f"{file_hash}_stats.json"
@@ -191,17 +215,17 @@ class CacheService:
         try:
             # Cache ingestion result
             result_data = {
-                'file_hash': file_hash,
-                'run_id': run_id,
-                'cached_at': datetime.now().isoformat(),
-                'status': 'completed'
+                "file_hash": file_hash,
+                "run_id": run_id,
+                "cached_at": datetime.now().isoformat(),
+                "status": "completed",
             }
 
-            with open(result_file, 'w') as f:
+            with open(result_file, "w") as f:
                 json.dump(result_data, f, indent=2)
 
             # Cache processing statistics
-            with open(stats_file, 'w') as f:
+            with open(stats_file, "w") as f:
                 json.dump(stats, f, indent=2, default=str)
 
             logger.info(f"Cached ingestion result for hash {file_hash[:12]}...")
@@ -216,17 +240,17 @@ class CacheService:
 
         if result_file.exists() and stats_file.exists():
             try:
-                with open(result_file, 'r') as f:
+                with open(result_file, "r") as f:
                     result_data = json.load(f)
 
-                with open(stats_file, 'r') as f:
+                with open(stats_file, "r") as f:
                     stats_data = json.load(f)
 
                 return CachedResult(
-                    run_id=result_data['run_id'],
-                    file_path=stats_data.get('file_path', ''),
-                    cached_at=datetime.fromisoformat(result_data['cached_at']),
-                    processing_stats=stats_data
+                    run_id=result_data["run_id"],
+                    file_path=stats_data.get("file_path", ""),
+                    cached_at=datetime.fromisoformat(result_data["cached_at"]),
+                    processing_stats=stats_data,
                 )
 
             except Exception as e:
@@ -234,7 +258,9 @@ class CacheService:
 
         return None
 
-    def check_existing_processing(self, file_path: str, session: Session) -> Optional[CachedResult]:
+    def check_existing_processing(
+        self, file_path: str, session: Session
+    ) -> Optional[CachedResult]:
         """
         Check multiple cache levels for existing processing.
         Returns CachedResult if found, None otherwise.
@@ -250,44 +276,73 @@ class CacheService:
         if existing_run:
             # Check if this run has any actual data (messages, calls, contacts, media)
             from db_setup import Message, Call, Contact, Media
-            has_messages = session.exec(select(Message).where(Message.run_id == existing_run.id).limit(1)).first() is not None
-            has_calls = session.exec(select(Call).where(Call.run_id == existing_run.id).limit(1)).first() is not None
-            has_contacts = session.exec(select(Contact).where(Contact.run_id == existing_run.id).limit(1)).first() is not None
-            has_media = session.exec(select(Media).where(Media.run_id == existing_run.id).limit(1)).first() is not None
-            
+
+            has_messages = (
+                session.exec(
+                    select(Message).where(Message.run_id == existing_run.id).limit(1)
+                ).first()
+                is not None
+            )
+            has_calls = (
+                session.exec(
+                    select(Call).where(Call.run_id == existing_run.id).limit(1)
+                ).first()
+                is not None
+            )
+            has_contacts = (
+                session.exec(
+                    select(Contact).where(Contact.run_id == existing_run.id).limit(1)
+                ).first()
+                is not None
+            )
+            has_media = (
+                session.exec(
+                    select(Media).where(Media.run_id == existing_run.id).limit(1)
+                ).first()
+                is not None
+            )
+
             has_data = has_messages or has_calls or has_contacts or has_media
-            
+
             # If run has data, return it regardless of status
             if has_data:
-                logger.info(f"Found existing run {existing_run.id} with data (status: {existing_run.status})")
+                logger.info(
+                    f"Found existing run {existing_run.id} with data (status: {existing_run.status})"
+                )
                 stats = {
-                    'file_path': file_path,
-                    'run_id': str(existing_run.id),
-                    'status': existing_run.status,
-                    'start_time': existing_run.start_time.isoformat(),
-                    'end_time': existing_run.end_time.isoformat() if existing_run.end_time else None,
-                    'processing_time': 'cached',
-                    'aleapp_processed': False
+                    "file_path": file_path,
+                    "run_id": str(existing_run.id),
+                    "status": existing_run.status,
+                    "start_time": existing_run.start_time.isoformat(),
+                    "end_time": existing_run.end_time.isoformat()
+                    if existing_run.end_time
+                    else None,
+                    "processing_time": "cached",
+                    "aleapp_processed": False,
                 }
 
                 return CachedResult(
                     run_id=str(existing_run.id),
                     file_path=file_path,
                     cached_at=existing_run.start_time,
-                    processing_stats=stats
+                    processing_stats=stats,
                 )
-            elif existing_run.status in ['complete', 'completed', 'success']:
+            elif existing_run.status in ["complete", "completed", "success"]:
                 # Run is marked complete but has no data - this is an empty run
                 # Don't return it, let the system reprocess or create a proper run
-                logger.warning(f"Found completed run {existing_run.id} but it has no data - ignoring")
+                logger.warning(
+                    f"Found completed run {existing_run.id} but it has no data - ignoring"
+                )
             else:
                 # Run exists but has no data and isn't complete - probably failed or in progress
-                logger.info(f"Found run {existing_run.id} with status {existing_run.status} but no data - ignoring")
+                logger.info(
+                    f"Found run {existing_run.id} with status {existing_run.status} but no data - ignoring"
+                )
 
         # NOTE: We no longer create new runs from cache files alone
         # This was causing empty runs to be created without actual data
         # If no run with data exists, we should fall through to reprocessing
-        
+
         logger.info("No existing processing found with data")
         return None
 
@@ -296,9 +351,9 @@ class CacheService:
         try:
             # Check if we have XML cache
             xml_path = Path(file_path)
-            if xml_path.suffix.lower() == '.ufdr':
+            if xml_path.suffix.lower() == ".ufdr":
                 # For UFDR files, check if extraction cache exists
-                filename = xml_path.stem.lower().replace(' ', '_')
+                filename = xml_path.stem.lower().replace(" ", "_")
                 cache_dir = Path("UFDRConvert") / filename
                 report_xml = cache_dir / "report.xml"
 
@@ -307,12 +362,14 @@ class CacheService:
 
                 # Check if we have XML parse cache for the report.xml
                 file_stat = report_xml.stat()
-                cache_key = f"{report_xml.name}_{file_stat.st_mtime}_{file_stat.st_size}"
+                cache_key = (
+                    f"{report_xml.name}_{file_stat.st_mtime}_{file_stat.st_size}"
+                )
                 xml_cache_file = self.parsed_data_dir / f"xml_{cache_key}.json"
 
                 return xml_cache_file.exists()
 
-            elif xml_path.suffix.lower() == '.xml':
+            elif xml_path.suffix.lower() == ".xml":
                 # For direct XML files, check if we have XML parse cache
                 file_stat = xml_path.stat()
                 cache_key = f"{xml_path.name}_{file_stat.st_mtime}_{file_stat.st_size}"
@@ -357,12 +414,12 @@ class CacheService:
 
         try:
             # Check file integrity (basic validation)
-            with open(result_file, 'r') as f:
+            with open(result_file, "r") as f:
                 result_data = json.load(f)
-                if not result_data.get('run_id'):
+                if not result_data.get("run_id"):
                     return False
 
-            with open(parsed_file, 'r') as f:
+            with open(parsed_file, "r") as f:
                 parsed_data = json.load(f)
                 if not isinstance(parsed_data, dict):
                     return False
@@ -386,17 +443,21 @@ class CacheService:
             cache_file = self.parsed_data_dir / f"xml_{cache_key}.json"
 
             if cache_file.exists():
-                with open(cache_file, 'r', encoding='utf-8') as f:
+                with open(cache_file, "r", encoding="utf-8") as f:
                     cached_data = json.load(f)
 
                 file_size_mb = file_stat.st_size / (1024 * 1024)
-                logger.info(f"Using cached XML parse for {xml_path.name} ({file_size_mb:.1f} MB)")
-                return cached_data.get('parsed_content')
+                logger.info(
+                    f"Using cached XML parse for {xml_path.name} ({file_size_mb:.1f} MB)"
+                )
+                return cached_data.get("parsed_content")
 
             return None
 
         except Exception as e:
-            logger.error(f"Failed to retrieve cached XML parse for {xml_file_path}: {e}")
+            logger.error(
+                f"Failed to retrieve cached XML parse for {xml_file_path}: {e}"
+            )
             return None
 
     def cache_xml_parse(self, xml_file_path: str, parsed_content: dict) -> None:
@@ -410,19 +471,21 @@ class CacheService:
             cache_file = self.parsed_data_dir / f"xml_{cache_key}.json"
 
             cache_data = {
-                'xml_file_path': str(xml_path),
-                'file_size_mb': file_stat.st_size / (1024 * 1024),
-                'parsed_content': parsed_content,
-                'cached_at': datetime.now().isoformat(),
-                'mtime': file_stat.st_mtime,
-                'size': file_stat.st_size
+                "xml_file_path": str(xml_path),
+                "file_size_mb": file_stat.st_size / (1024 * 1024),
+                "parsed_content": parsed_content,
+                "cached_at": datetime.now().isoformat(),
+                "mtime": file_stat.st_mtime,
+                "size": file_stat.st_size,
             }
 
-            with open(cache_file, 'w', encoding='utf-8') as f:
+            with open(cache_file, "w", encoding="utf-8") as f:
                 json.dump(cache_data, f, indent=2, default=str)
 
             file_size_mb = file_stat.st_size / (1024 * 1024)
-            logger.info(f"Cached XML parse result for {xml_path.name} ({file_size_mb:.1f} MB)")
+            logger.info(
+                f"Cached XML parse result for {xml_path.name} ({file_size_mb:.1f} MB)"
+            )
 
         except Exception as e:
             logger.error(f"Failed to cache XML parse for {xml_file_path}: {e}")

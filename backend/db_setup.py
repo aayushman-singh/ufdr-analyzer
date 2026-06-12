@@ -4,8 +4,9 @@ import random
 import json
 from typing import List, Optional
 
-from sqlmodel import Field, SQLModel, Relationship, create_engine, Session
-from sqlalchemy import Column, TEXT, UniqueConstraint
+from sqlmodel import Field, SQLModel, Relationship, Session
+from sqlalchemy import Column, TEXT, UniqueConstraint, Index
+
 # Vector extension will be handled at runtime
 VECTOR_AVAILABLE = False
 Vector = None
@@ -13,14 +14,13 @@ Vector = None
 
 class User(SQLModel, table=True):
     """Represents a user of the system (an Investigating Officer)."""
-    id: Optional[uuid.UUID] = Field(
-        default_factory=uuid.uuid4, primary_key=True)
+
+    id: Optional[uuid.UUID] = Field(default_factory=uuid.uuid4, primary_key=True)
     username: str = Field(index=True)
     email: str = Field(unique=True)
     password_hash: str
     is_admin: bool = False
-    created_at: datetime.datetime = Field(
-        default_factory=datetime.datetime.now)
+    created_at: datetime.datetime = Field(default_factory=datetime.datetime.now)
 
     # Relationships to other tables
     runs: List["Run"] = Relationship(back_populates="user")
@@ -34,15 +34,14 @@ class Rule(SQLModel, table=True):
     Represents a specific natural language query or pattern.
     These are the "recipes" the AI will follow.
     """
-    id: Optional[uuid.UUID] = Field(
-        default_factory=uuid.uuid4, primary_key=True)
+
+    id: Optional[uuid.UUID] = Field(default_factory=uuid.uuid4, primary_key=True)
     user_id: uuid.UUID = Field(foreign_key="user.id")
     title: str = Field(index=True)
     description: str
     query_text: str  # The natural language query, e.g.,
     # "Show me all WhatsApp chats mentioning Bitcoin"
-    created_at: datetime.datetime = Field(
-        default_factory=datetime.datetime.now)
+    created_at: datetime.datetime = Field(default_factory=datetime.datetime.now)
     is_template: bool = False
 
     # Relationship to the user who created it
@@ -55,17 +54,22 @@ class Run(SQLModel, table=True):
     Represents a single analysis session on an ingested UFDR report.
     This tracks the entire process from ingestion to completion.
     """
-    id: Optional[uuid.UUID] = Field(
-        default_factory=uuid.uuid4, primary_key=True)
+
+    id: Optional[uuid.UUID] = Field(default_factory=uuid.uuid4, primary_key=True)
     user_id: uuid.UUID = Field(foreign_key="user.id")
     ufdr_file_name: str
     status: str  # e.g., "ingesting", "analyzing", "complete", "failed"
-    start_time: datetime.datetime = Field(
-        default_factory=datetime.datetime.now)
+    start_time: datetime.datetime = Field(default_factory=datetime.datetime.now)
     end_time: Optional[datetime.datetime]
-    extraction_metadata: Optional[str] = Field(default=None, sa_column=Column(TEXT))  # JSON string for UFDR extraction metadata
-    file_content_hash: Optional[str] = Field(default=None, index=True)  # SHA-256 hash for deduplication
-    original_file_path: Optional[str] = Field(default=None)  # Original file path for reference
+    extraction_metadata: Optional[str] = Field(
+        default=None, sa_column=Column(TEXT)
+    )  # JSON string for UFDR extraction metadata
+    file_content_hash: Optional[str] = Field(
+        default=None, index=True
+    )  # SHA-256 hash for deduplication
+    original_file_path: Optional[str] = Field(
+        default=None
+    )  # Original file path for reference
 
     # Relationships
     user: User = Relationship(back_populates="runs")
@@ -78,20 +82,20 @@ class Run(SQLModel, table=True):
     aleapp_reports: List["AleappReport"] = Relationship(back_populates="run")
     queries: List["Query"] = Relationship(back_populates="run")
 
+
 class Result(SQLModel, table=True):
     """
     Represents a finding or piece of evidence identified by a
     specific rule within a run.
     This is where the actionable data is stored.
     """
-    id: Optional[uuid.UUID] = Field(
-        default_factory=uuid.uuid4, primary_key=True)
+
+    id: Optional[uuid.UUID] = Field(default_factory=uuid.uuid4, primary_key=True)
     run_id: uuid.UUID = Field(foreign_key="run.id")
     rule_id: uuid.UUID = Field(foreign_key="rule.id")
     result_type: str  # e.g., "chat", "call_log", "contact"
     evidence_data: str  # A stringified JSON object containing the found data
-    created_at: datetime.datetime = Field(
-        default_factory=datetime.datetime.now)
+    created_at: datetime.datetime = Field(default_factory=datetime.datetime.now)
     confidence_score: Optional[float] = None
 
     # Relationships
@@ -104,8 +108,8 @@ class Backup(SQLModel, table=True):
     Implements the snapshot storage and audit logging.
     A log of important system events or database snapshots.
     """
-    id: Optional[uuid.UUID] = Field(
-        default_factory=uuid.uuid4, primary_key=True)
+
+    id: Optional[uuid.UUID] = Field(default_factory=uuid.uuid4, primary_key=True)
     user_id: uuid.UUID = Field(foreign_key="user.id")
     event_type: str  # e.g. "database_snapshot", "user_login", "security_event"
     timestamp: datetime.datetime = Field(default_factory=datetime.datetime.now)
@@ -124,16 +128,24 @@ class AuditEvent(SQLModel, table=True):
     any past event breaks every subsequent `entry_hash`, so tampering is
     detectable by recomputing the chain (`AuditService.verify_chain`).
     """
-    id: Optional[uuid.UUID] = Field(
-        default_factory=uuid.uuid4, primary_key=True)
-    seq: Optional[int] = Field(default=None, primary_key=False, index=True)  # monotonic order
+
+    id: Optional[uuid.UUID] = Field(default_factory=uuid.uuid4, primary_key=True)
+    seq: int = Field(index=True, unique=True)  # monotonic order
     event_type: str = Field(index=True)  # "query" | "ingest" | "export"
     run_id: Optional[uuid.UUID] = Field(default=None, index=True)
     user_id: Optional[uuid.UUID] = Field(default=None, index=True)
-    timestamp: datetime.datetime = Field(default_factory=datetime.datetime.utcnow, index=True)
-    payload: Optional[str] = Field(default=None, sa_column=Column(TEXT))  # canonical JSON
-    prev_hash: str = Field(default="")          # entry_hash of the previous event ("" for genesis)
-    entry_hash: str = Field(default="", index=True)  # sha256 over prev_hash + canonical fields
+    timestamp: datetime.datetime = Field(
+        default_factory=datetime.datetime.utcnow, index=True
+    )
+    payload: Optional[str] = Field(
+        default=None, sa_column=Column(TEXT)
+    )  # canonical JSON
+    prev_hash: str = Field(
+        default=""
+    )  # entry_hash of the previous event ("" for genesis)
+    entry_hash: str = Field(
+        default="", index=True
+    )  # sha256 over prev_hash + canonical fields
 
 
 class EntityIndex(SQLModel, table=True):
@@ -145,11 +157,11 @@ class EntityIndex(SQLModel, table=True):
     duplicating raw personal data into a shared index. The matching identifier is
     always supplied by the querying case, so no other case's PII is revealed.
     """
+
     __table_args__ = (
         UniqueConstraint("run_id", "identifier_hash", name="uq_entityindex_run_hash"),
     )
-    id: Optional[uuid.UUID] = Field(
-        default_factory=uuid.uuid4, primary_key=True)
+    id: Optional[uuid.UUID] = Field(default_factory=uuid.uuid4, primary_key=True)
     run_id: uuid.UUID = Field(index=True)
     identifier_hash: str = Field(index=True)  # HMAC of the canonical identifier
     identifier_type: str  # "phone" | "email"
@@ -166,8 +178,8 @@ class Transcript(SQLModel, table=True):
     hash so the transcription is itself auditable (an audit event records
     audio_file_id + model + timestamp + transcript_hash).
     """
-    id: Optional[uuid.UUID] = Field(
-        default_factory=uuid.uuid4, primary_key=True)
+
+    id: Optional[uuid.UUID] = Field(default_factory=uuid.uuid4, primary_key=True)
     run_id: uuid.UUID = Field(index=True)
     media_id: uuid.UUID = Field(index=True)  # the source audio Media.id
     model: str  # e.g. "faster-whisper/base"
@@ -179,8 +191,13 @@ class Transcript(SQLModel, table=True):
 
 class Message(SQLModel, table=True):
     """Represents a message from UFDR data."""
-    id: Optional[uuid.UUID] = Field(
-        default_factory=uuid.uuid4, primary_key=True)
+
+    # Composite (run_id, timestamp): every query/graph path filters by run_id and
+    # most order/window by timestamp, so this single index serves both the
+    # equality scan and the time-ordered scan (run_id prefix covers run_id-only
+    # lookups too). See SESSION_SUMMARY_V5 for measured before/after.
+    __table_args__ = (Index("ix_message_run_ts", "run_id", "timestamp"),)
+    id: Optional[uuid.UUID] = Field(default_factory=uuid.uuid4, primary_key=True)
     run_id: uuid.UUID = Field(foreign_key="run.id")
     sender: str
     receiver: str
@@ -194,8 +211,9 @@ class Message(SQLModel, table=True):
 
 class Call(SQLModel, table=True):
     """Represents a call from UFDR data."""
-    id: Optional[uuid.UUID] = Field(
-        default_factory=uuid.uuid4, primary_key=True)
+
+    __table_args__ = (Index("ix_call_run_ts", "run_id", "timestamp"),)
+    id: Optional[uuid.UUID] = Field(default_factory=uuid.uuid4, primary_key=True)
     run_id: uuid.UUID = Field(foreign_key="run.id")
     caller: str
     receiver: str
@@ -208,9 +226,11 @@ class Call(SQLModel, table=True):
 
 class Contact(SQLModel, table=True):
     """Represents a contact from UFDR data."""
-    id: Optional[uuid.UUID] = Field(
-        default_factory=uuid.uuid4, primary_key=True)
-    run_id: uuid.UUID = Field(foreign_key="run.id")
+
+    id: Optional[uuid.UUID] = Field(default_factory=uuid.uuid4, primary_key=True)
+    # Contacts have no timestamp; a plain run_id index serves the per-run lookups
+    # done during query execution and graph label resolution.
+    run_id: uuid.UUID = Field(foreign_key="run.id", index=True)
     name: str
     number: str
 
@@ -220,9 +240,9 @@ class Contact(SQLModel, table=True):
 
 class Media(SQLModel, table=True):
     """Represents media files from UFDR data."""
-    id: Optional[uuid.UUID] = Field(
-        default_factory=uuid.uuid4, primary_key=True)
-    run_id: uuid.UUID = Field(foreign_key="run.id")
+
+    id: Optional[uuid.UUID] = Field(default_factory=uuid.uuid4, primary_key=True)
+    run_id: uuid.UUID = Field(foreign_key="run.id", index=True)
     original_path: str
     storage_path: str
     media_type: Optional[str] = None
@@ -233,17 +253,16 @@ class Media(SQLModel, table=True):
 
 class AleappArtifact(SQLModel, table=True):
     """Represents ALEAPP analysis artifacts."""
-    id: Optional[uuid.UUID] = Field(
-        default_factory=uuid.uuid4, primary_key=True)
-    run_id: uuid.UUID = Field(foreign_key="run.id")
+
+    id: Optional[uuid.UUID] = Field(default_factory=uuid.uuid4, primary_key=True)
+    run_id: uuid.UUID = Field(foreign_key="run.id", index=True)
     artifact_type: str  # e.g., "csv", "json", "html"
     filename: str
     file_path: str
     category: Optional[str] = None
     row_count: Optional[int] = None
     data: Optional[str] = None  # JSON string for structured data
-    created_at: datetime.datetime = Field(
-        default_factory=datetime.datetime.now)
+    created_at: datetime.datetime = Field(default_factory=datetime.datetime.now)
 
     # Relationship
     run: Run = Relationship(back_populates="aleapp_artifacts")
@@ -251,14 +270,13 @@ class AleappArtifact(SQLModel, table=True):
 
 class AleappReport(SQLModel, table=True):
     """Represents ALEAPP HTML reports."""
-    id: Optional[uuid.UUID] = Field(
-        default_factory=uuid.uuid4, primary_key=True)
+
+    id: Optional[uuid.UUID] = Field(default_factory=uuid.uuid4, primary_key=True)
     run_id: uuid.UUID = Field(foreign_key="run.id")
     report_type: str  # e.g., "html", "summary"
     filename: str
     file_path: str
-    created_at: datetime.datetime = Field(
-        default_factory=datetime.datetime.now)
+    created_at: datetime.datetime = Field(default_factory=datetime.datetime.now)
 
     # Relationship
     run: Run = Relationship(back_populates="aleapp_reports")
@@ -266,24 +284,56 @@ class AleappReport(SQLModel, table=True):
 
 class Query(SQLModel, table=True):
     """Tracks natural language queries executed against UFDR data."""
-    id: Optional[uuid.UUID] = Field(
-        default_factory=uuid.uuid4, primary_key=True)
+
+    id: Optional[uuid.UUID] = Field(default_factory=uuid.uuid4, primary_key=True)
     run_id: uuid.UUID = Field(foreign_key="run.id", index=True)
     user_id: uuid.UUID = Field(foreign_key="user.id", index=True)
     query_text: str  # Original natural language query
-    intent: Optional[str] = None  # Classified intent (e.g., "crypto_search", "foreign_numbers")
-    parameters: Optional[str] = Field(default=None, sa_column=Column(TEXT))  # JSON of extracted query parameters
-    results_summary: Optional[str] = Field(default=None, sa_column=Column(TEXT))  # JSON summary of results
+    intent: Optional[str] = (
+        None  # Classified intent (e.g., "crypto_search", "foreign_numbers")
+    )
+    parameters: Optional[str] = Field(
+        default=None, sa_column=Column(TEXT)
+    )  # JSON of extracted query parameters
+    results_summary: Optional[str] = Field(
+        default=None, sa_column=Column(TEXT)
+    )  # JSON summary of results
     result_count: int = 0  # Number of results returned
     execution_time: Optional[float] = None  # Query execution time in seconds
     status: str = "pending"  # "pending", "completed", "failed"
     error_message: Optional[str] = None  # Error message if query failed
-    created_at: datetime.datetime = Field(
-        default_factory=datetime.datetime.now)
+    created_at: datetime.datetime = Field(default_factory=datetime.datetime.now)
 
     # Relationships
     run: Run = Relationship(back_populates="queries")
     user: User = Relationship(back_populates="queries")
+
+
+class CaseMembership(SQLModel, table=True):
+    """Per-case role grant — the unit of case-level RBAC (V5).
+
+    Authentication proves *who* a caller is; this table proves *which cases* they
+    may touch. A `Run` already has an implicit owner (`Run.user_id`); a membership
+    row grants an ADDITIONAL user access to that case at a named role:
+
+    - "viewer": may query, graph, and export the case (read-only analyst access).
+    - "owner":  viewer rights plus the right to grant/revoke other members.
+
+    The implicit owner (`Run.user_id`) is treated as "owner" without needing a
+    row here. Access is deny-by-default: absent an implicit-owner match or a
+    membership row, a caller is refused (403) — never handed an empty-but-revealing
+    result. `granted_by` records the actor for chain-of-custody.
+    """
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "user_id", name="uq_casemembership_run_user"),
+    )
+    id: Optional[uuid.UUID] = Field(default_factory=uuid.uuid4, primary_key=True)
+    run_id: uuid.UUID = Field(foreign_key="run.id", index=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id", index=True)
+    role: str  # "owner" | "viewer"
+    granted_by: Optional[uuid.UUID] = Field(default=None, foreign_key="user.id")
+    granted_at: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
 
 
 # 2. Database Setup and Seeding
@@ -306,16 +356,25 @@ def seed_db_with_sample_data(session: Session):
 
     # ------------------ USERS ------------------
     users_to_add = []
-    usernames = ["IO Sharma", "IO Mehta", "IO Singh", "IO Khan", "IO Patel",
-                 "IO Kumar", "IO Joshi", "IO Reddy", "IO Menon",
-                 "Admin Divyanshi"]
+    usernames = [
+        "IO Sharma",
+        "IO Mehta",
+        "IO Singh",
+        "IO Khan",
+        "IO Patel",
+        "IO Kumar",
+        "IO Joshi",
+        "IO Reddy",
+        "IO Menon",
+        "Admin Divyanshi",
+    ]
     for i in range(10):
-        is_admin = (i == 9)  # Last user is admin
+        is_admin = i == 9  # Last user is admin
         user = User(
             username=usernames[i],
             email=f"{usernames[i].lower().replace(' ', '.')}@investigator.gov",
-            password_hash=f"hashed_password_{i+1}",
-            is_admin=is_admin
+            password_hash=f"hashed_password_{i + 1}",
+            is_admin=is_admin,
         )
         users_to_add.append(user)
     session.add_all(users_to_add)
@@ -335,14 +394,14 @@ def seed_db_with_sample_data(session: Session):
         "List all web browsing history related to a specific domain.",
         "Find all deleted messages from social media apps.",
         "Identify chats with keywords related to illegal activities.",
-        "Show all contacts in the suspect's 'favorites' list."
+        "Show all contacts in the suspect's 'favorites' list.",
     ]
     for i in range(10):
         rule = Rule(
             user_id=users_to_add[i % 10].id,
-            title=f"Query {i+1}: {rule_queries[i]}",
-            description=f"Automated query for rule {i+1}.",
-            query_text=rule_queries[i]
+            title=f"Query {i + 1}: {rule_queries[i]}",
+            description=f"Automated query for rule {i + 1}.",
+            query_text=rule_queries[i],
         )
         rules_to_add.append(rule)
     session.add_all(rules_to_add)
@@ -356,10 +415,11 @@ def seed_db_with_sample_data(session: Session):
     for i in range(10):
         run = Run(
             user_id=users_to_add[i % 10].id,
-            ufdr_file_name=f"Case-2023_0{i+1}_Phone_Dump.ufdr",
+            ufdr_file_name=f"Case-2023_0{i + 1}_Phone_Dump.ufdr",
             status=random.choice(statuses),
-            end_time=datetime.datetime.now() if statuses[i % 5] in [
-                "complete", "analyzing", "failed"] else None
+            end_time=datetime.datetime.now()
+            if statuses[i % 5] in ["complete", "analyzing", "failed"]
+            else None,
         )
         runs_to_add.append(run)
     session.add_all(runs_to_add)
@@ -376,9 +436,9 @@ def seed_db_with_sample_data(session: Session):
         if result_type == "chat":
             evidence_data = {
                 "app": random.choice(["WhatsApp", "Telegram", "Signal"]),
-                "message": f"Message related to query for rule {i+1}.",
+                "message": f"Message related to query for rule {i + 1}.",
                 "from_number": f"+9198765432{i}",
-                "timestamp": datetime.datetime.now().isoformat()
+                "timestamp": datetime.datetime.now().isoformat(),
             }
         elif result_type == "call_log":
             evidence_data = {
@@ -386,25 +446,25 @@ def seed_db_with_sample_data(session: Session):
                 "from_number": f"+9198765432{i}",
                 "to_number": f"+1555123456{i}",
                 "duration_sec": random.randint(30, 600),
-                "timestamp": datetime.datetime.now().isoformat()
+                "timestamp": datetime.datetime.now().isoformat(),
             }
         elif result_type == "contact":
             evidence_data = {
-                "name": f"Suspect {i+1}",
+                "name": f"Suspect {i + 1}",
                 "phone_number": f"+9199998888{i}",
-                "email": f"suspect{i+1}@example.com"
+                "email": f"suspect{i + 1}@example.com",
             }
         elif result_type == "location":
             evidence_data = {
                 "latitude": 28.6139 + random.uniform(-0.1, 0.1),
                 "longitude": 77.2090 + random.uniform(-0.1, 0.1),
-                "timestamp": datetime.datetime.now().isoformat()
+                "timestamp": datetime.datetime.now().isoformat(),
             }
         elif result_type == "web_history":
             evidence_data = {
-                "url": f"https://www.example.com/page{i+1}",
-                "title": f"Web Page Title {i+1}",
-                "visit_count": random.randint(1, 10)
+                "url": f"https://www.example.com/page{i + 1}",
+                "title": f"Web Page Title {i + 1}",
+                "visit_count": random.randint(1, 10),
             }
 
         result = Result(
@@ -412,7 +472,7 @@ def seed_db_with_sample_data(session: Session):
             rule_id=rules_to_add[i % 10].id,
             result_type=result_type,
             evidence_data=json.dumps(evidence_data),
-            confidence_score=random.uniform(0.7, 0.99)
+            confidence_score=random.uniform(0.7, 0.99),
         )
         results_to_add.append(result)
     session.add_all(results_to_add)
@@ -420,16 +480,21 @@ def seed_db_with_sample_data(session: Session):
 
     # ------------------ BACKUPS ------------------
     backups_to_add = []
-    backup_events = ["database_snapshot", "user_login", "security_event",
-                     "system_update"]
+    backup_events = [
+        "database_snapshot",
+        "user_login",
+        "security_event",
+        "system_update",
+    ]
     for i in range(10):
         event_type = random.choice(backup_events)
         backup = Backup(
             user_id=users_to_add[i % 10].id,
             event_type=event_type,
-            description=f"Log for event type: {event_type} number {i+1}",
-            snapshot_path=f"/backups/daily/snapshot_{i+1}.db"
-            if event_type == "database_snapshot" else None
+            description=f"Log for event type: {event_type} number {i + 1}",
+            snapshot_path=f"/backups/daily/snapshot_{i + 1}.db"
+            if event_type == "database_snapshot"
+            else None,
         )
         backups_to_add.append(backup)
     session.add_all(backups_to_add)
@@ -450,17 +515,20 @@ if __name__ == "__main__":
     try:
         # Connect to PostgreSQL server (not to specific database)
         conn = psycopg2.connect(
-            host=POSTGRES_CONFIG['host'],
-            port=POSTGRES_CONFIG['port'],
-            user=POSTGRES_CONFIG['user'],
-            password=POSTGRES_CONFIG['password'],
-            database='postgres'  # Connect to default postgres database
+            host=POSTGRES_CONFIG["host"],
+            port=POSTGRES_CONFIG["port"],
+            user=POSTGRES_CONFIG["user"],
+            password=POSTGRES_CONFIG["password"],
+            database="postgres",  # Connect to default postgres database
         )
         conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         cursor = conn.cursor()
 
         # Check if database exists
-        cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", (POSTGRES_CONFIG['database'],))
+        cursor.execute(
+            "SELECT 1 FROM pg_database WHERE datname = %s",
+            (POSTGRES_CONFIG["database"],),
+        )
         if not cursor.fetchone():
             cursor.execute(f'CREATE DATABASE "{POSTGRES_CONFIG["database"]}"')
             print(f"Created database '{POSTGRES_CONFIG['database']}'")
@@ -472,11 +540,11 @@ if __name__ == "__main__":
 
         # Connect to the target database to install vector extension
         conn = psycopg2.connect(
-            host=POSTGRES_CONFIG['host'],
-            port=POSTGRES_CONFIG['port'],
-            user=POSTGRES_CONFIG['user'],
-            password=POSTGRES_CONFIG['password'],
-            database=POSTGRES_CONFIG['database']
+            host=POSTGRES_CONFIG["host"],
+            port=POSTGRES_CONFIG["port"],
+            user=POSTGRES_CONFIG["user"],
+            password=POSTGRES_CONFIG["password"],
+            database=POSTGRES_CONFIG["database"],
         )
         conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         cursor = conn.cursor()
@@ -501,6 +569,7 @@ if __name__ == "__main__":
 
     # Now use the engine from database.py
     from database import engine
+
     create_db_and_tables(engine)
 
     with Session(engine) as session:

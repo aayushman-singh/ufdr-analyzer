@@ -1,0 +1,47 @@
+Command:
+./.venv-test/Scripts/python.exe backend/perf/bench_v5.py --runs 40 --msgs 5000 --reps 5
+
+Output:
+seeding 40 cases x 5000 msgs ...
+  message rows total: 200000
+
+=== V5 perf: run_id index, before vs after (median ms) ===
+  dataset: 200000 messages across 40 cases
+
+  EXPLAIN before: SCAN message | USE TEMP B-TREE FOR ORDER BY
+  EXPLAIN after : SEARCH message USING INDEX ix_message_run_ts (run_id=?)
+
+  op                    before       after   speedup
+  ------------------------------------------------
+  graph_build          88.72ms     69.76ms      1.3x
+  query_exec           29.33ms      1.89ms     15.5x
+
+JSON:
+{
+  "config": {
+    "runs": 40,
+    "msgs_per_run": 5000,
+    "reps": 5,
+    "total_messages": 200000
+  },
+  "explain_query_plan": {
+    "before_no_index": "SCAN message | USE TEMP B-TREE FOR ORDER BY",
+    "after_with_index": "SEARCH message USING INDEX ix_message_run_ts (run_id=?)"
+  },
+  "before_no_index": {
+    "graph_build_ms": 88.72,
+    "query_exec_ms": 29.33
+  },
+  "after_with_index": {
+    "graph_build_ms": 69.76,
+    "query_exec_ms": 1.89
+  },
+  "before_no_index_recheck": {
+    "graph_build_ms": 90.83,
+    "query_exec_ms": 31.75
+  },
+  "speedup": {
+    "graph_build": "1.3x",
+    "query_exec": "15.5x"
+  }
+}

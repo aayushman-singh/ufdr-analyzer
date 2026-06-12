@@ -21,6 +21,7 @@ Mechanism (no fallbacks, fail loud):
 `SECRET_KEY` is required for both signing and verifying. If it is absent the
 auth path raises rather than degrading to an unsigned/again-oracle mode.
 """
+
 from __future__ import annotations
 
 import datetime
@@ -63,6 +64,17 @@ def _secret_key() -> str:
         raise RuntimeError(
             "SECRET_KEY is not configured — cannot issue or verify auth tokens."
         )
+    if (
+        key.strip().lower()
+        in {
+            "change_me",
+            "changeme",
+            "dev_secret_change_me",
+            "your_very_secure_secret_key_here",
+        }
+        or "change_me" in key.strip().lower()
+    ):
+        raise RuntimeError("SECRET_KEY is still a template placeholder.")
     return key
 
 
@@ -175,5 +187,20 @@ def require_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token subject does not correspond to a known user.",
             headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
+
+
+def require_admin(user: User = Depends(require_user)) -> User:
+    """FastAPI dependency: resolve an authenticated administrator or reject.
+
+    Global maintenance routes (Neo4j sync/clear, service-wide stats) are outside
+    any single case. They must not be made case-visible by returning partial data;
+    they require an explicit admin user instead.
+    """
+    if not user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrator privileges required.",
         )
     return user

@@ -5,8 +5,8 @@ Provides API endpoints for executing natural language queries against UFDR data.
 Integrates LLM-based query understanding with database/search execution.
 """
 
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query as FastAPIQuery
+from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 from meilisearch import Client as MeiliClient
 from typing import Optional, Dict, Any, List
@@ -15,9 +15,11 @@ import time
 import uuid
 
 from database import get_session
-from db_setup import Query, Run, User
+from db_setup import Query, User
 from ai.llm_client import LLMClient
 from ai.query_executor import QueryExecutor
+from ingest.services.auth_service import require_user
+from ingest.services.case_access import authorize_run
 from ingest.utils.logger import get_logger
 import os
 
@@ -29,17 +31,30 @@ router = APIRouter(prefix="/query", tags=["Query"])
 # Pydantic models for request/response
 class ExecuteQueryRequest(BaseModel):
     """Request model for executing a natural language query"""
+
     query: str
     run_id: str
     user_id: Optional[str] = None  # Default to system user if not provided
     provider: Optional[str] = "openai"  # "openai" or "anthropic"
     generate_insights: Optional[bool] = True  # Generate LLM summary of results
-    max_insight_results: Optional[int] = 50  # Max results to send to insight LLM (saves tokens)
-    max_response_results: Optional[int] = 100  # Max results to return in API response
+    max_insight_results: int = Field(
+        default=50,
+        ge=1,
+        le=50,
+        description="Max results to send to insight LLM",
+    )
+    max_response_results: int = Field(
+        default=100,
+        ge=1,
+        le=500,
+        description="Max results to return in API response",
+    )
+    offset: int = Field(default=0, ge=0, le=100000)
 
 
 class ExecuteQueryResponse(BaseModel):
     """Response model for query execution"""
+
     query_id: str
     status: str
     intent: Optional[str] = None
@@ -52,12 +67,14 @@ class ExecuteQueryResponse(BaseModel):
 
 class QueryHistoryResponse(BaseModel):
     """Response model for query history"""
+
     queries: List[Dict[str, Any]]
     total: int
 
 
 class QuerySuggestion(BaseModel):
     """Suggested query template"""
+
     category: str
     query: str
     description: str
@@ -66,6 +83,7 @@ class QuerySuggestion(BaseModel):
 def get_meili_client():
     """Get MeiliSearch client instance"""
     from meilisearch import Client as MeiliClient
+
     MEILI_URL = os.getenv("MEILI_URL", "http://localhost:7700")
     MEILI_KEY = os.getenv("MEILI_KEY", None)
     return MeiliClient(MEILI_URL, MEILI_KEY)
@@ -81,7 +99,7 @@ def get_or_create_system_user(session: Session) -> User:
             username="system",
             email="system@ufdr-analyzer.local",
             password_hash="",  # System user doesn't need password
-            is_admin=False
+            is_admin=False,
         )
         session.add(system_user)
         session.commit()
@@ -95,12 +113,14 @@ def get_or_create_system_user(session: Session) -> User:
 async def execute_query(
     request: ExecuteQueryRequest,
     session: Session = Depends(get_session),
-    meili_client: MeiliClient = Depends(get_meili_client)
+    auth_user: User = Depends(require_user),
+    meili_client: MeiliClient = Depends(get_meili_client),
 ):
     """
     Execute a natural language query against UFDR data.
 
     Flow:
+    0. Authenticate + authorize the caller on the case (case-level RBAC)
     1. Validate run_id exists
     2. Use LLM to parse NL query → structured parameters
     3. Execute structured query against DB + search indexes
@@ -110,33 +130,38 @@ async def execute_query(
     start_time = time.time()
     logger.info(f"Executing query: '{request.query}' for run_id: {request.run_id}")
 
-    # Validate run exists
+    # Validate run_id format (400 on garbage) before any authorization/DB work.
     try:
         run_uuid = uuid.UUID(request.run_id)
-        run = session.get(Run, run_uuid)
-        if not run:
-            raise HTTPException(status_code=404, detail=f"Run not found: {request.run_id}")
     except ValueError:
-        raise HTTPException(status_code=400, detail=f"Invalid run_id format: {request.run_id}")
+        raise HTTPException(
+            status_code=400, detail=f"Invalid run_id format: {request.run_id}"
+        )
 
-    # Get or create user
+    # Case-level RBAC: the caller must hold 'viewer' on the run. authorize_run
+    # also resolves run existence (404). 401/403/404 here are loud and final.
+    run = authorize_run(session, auth_user, run_uuid)
+
+    # Attribution is bound to the bearer identity. A client-supplied user_id may
+    # only restate that identity; it cannot move the query into someone else's
+    # history or a synthetic "system" account.
     if request.user_id:
         try:
-            user_uuid = uuid.UUID(request.user_id)
-            user = session.get(User, user_uuid)
-            if not user:
-                raise HTTPException(status_code=404, detail=f"User not found: {request.user_id}")
+            requested_user_id = uuid.UUID(request.user_id)
         except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid user_id format: {request.user_id}")
-    else:
-        user = get_or_create_system_user(session)
+            raise HTTPException(
+                status_code=400, detail=f"Invalid user_id format: {request.user_id}"
+            )
+        if requested_user_id != auth_user.id:
+            raise HTTPException(
+                status_code=403,
+                detail="query user_id must match the authenticated user",
+            )
+    user = auth_user
 
     # Create query record
     query_record = Query(
-        run_id=run_uuid,
-        user_id=user.id,
-        query_text=request.query,
-        status="processing"
+        run_id=run_uuid, user_id=user.id, query_text=request.query, status="processing"
     )
     session.add(query_record)
     session.commit()
@@ -150,11 +175,15 @@ async def execute_query(
         # Build context about the run
         context = {
             "run_id": request.run_id,
-            "device_info": run.extraction_metadata if hasattr(run, 'extraction_metadata') else None,
-            "file_name": run.ufdr_file_name
+            "device_info": run.extraction_metadata
+            if hasattr(run, "extraction_metadata")
+            else None,
+            "file_name": run.ufdr_file_name,
         }
 
         structured_params = llm_client.parse_query(request.query, context=context)
+        structured_params["limit"] = request.max_response_results
+        structured_params["offset"] = request.offset
         logger.info(f"LLM parsed intent: {structured_params.get('intent')}")
 
         # Update query record with intent and parameters
@@ -175,26 +204,22 @@ async def execute_query(
         # Step 3: Generate insights (always generate for conversational response)
         insights = None
         if request.generate_insights:
-            logger.info(f"Generating conversational response...")
-            try:
-                if result_count > 0:
-                    # Create subset of results for insight generation (token optimization)
-                    insight_results = {
-                        "results": results[:request.max_insight_results],
-                        "total_results": result_count
-                    }
-                    insights = llm_client.generate_insights(
-                        query_results=insight_results,
-                        original_query=request.query,
-                        max_results=request.max_insight_results
-                    )
-                else:
-                    # No results - generate helpful response
-                    insights = llm_client._generate_no_results_response(request.query, insight_results)
-                logger.info("Insights generated successfully")
-            except Exception as insight_error:
-                logger.warning(f"Failed to generate insights: {insight_error}")
-                insights = f"Found {result_count} results matching your query." if result_count > 0 else "No results found."
+            logger.info("Generating conversational response...")
+            insight_results = {
+                "results": results[: request.max_insight_results],
+                "total_results": result_count,
+            }
+            if result_count > 0:
+                insights = llm_client.generate_insights(
+                    query_results=insight_results,
+                    original_query=request.query,
+                    max_results=request.max_insight_results,
+                )
+            else:
+                insights = llm_client._generate_no_results_response(
+                    request.query, insight_results
+                )
+            logger.info("Insights generated successfully")
 
         # Calculate execution time
         execution_time = time.time() - start_time
@@ -203,15 +228,19 @@ async def execute_query(
         query_record.result_count = result_count
         query_record.execution_time = execution_time
         query_record.status = "completed"
-        query_record.results_summary = insights if insights else f"{result_count} results"
+        query_record.results_summary = (
+            insights if insights else f"{result_count} results"
+        )
         session.add(query_record)
         session.commit()
 
         logger.info(f"Query completed successfully in {execution_time:.2f}s")
 
         # Return controlled number of results based on max_response_results
-        response_results = results[:request.max_response_results]
-        logger.info(f"Returning {len(response_results)} of {result_count} total results in API response")
+        response_results = results[: request.max_response_results]
+        logger.info(
+            f"Returning {len(response_results)} of {result_count} total results in API response"
+        )
 
         return ExecuteQueryResponse(
             query_id=str(query_record.id),
@@ -221,7 +250,7 @@ async def execute_query(
             results=response_results,  # Controlled via max_response_results parameter
             insights=insights,
             execution_time=execution_time,
-            structured_params=structured_params
+            structured_params=structured_params,
         )
 
     except Exception as e:
@@ -237,22 +266,23 @@ async def execute_query(
         logger.error(f"Traceback: {traceback.format_exc()}")
 
         raise HTTPException(
-            status_code=500,
-            detail=f"Query execution failed: {error_msg}"
+            status_code=500, detail=f"Query execution failed: {error_msg}"
         )
 
 
 @router.get("/history/{run_id}", response_model=QueryHistoryResponse)
 async def get_query_history(
     run_id: str,
-    limit: int = 50,
-    offset: int = 0,
-    session: Session = Depends(get_session)
+    limit: int = FastAPIQuery(50, ge=1, le=500),
+    offset: int = FastAPIQuery(0, ge=0, le=100000),
+    session: Session = Depends(get_session),
+    auth_user: User = Depends(require_user),
 ):
     """
     Get query history for a specific run.
 
     Returns recent queries executed against this run, newest first.
+    Case-level RBAC: caller must hold 'viewer' on the run (else 401/403/404).
     """
     logger.info(f"Fetching query history for run_id: {run_id}")
 
@@ -262,10 +292,8 @@ async def get_query_history(
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid run_id format: {run_id}")
 
-    # Check run exists
-    run = session.get(Run, run_uuid)
-    if not run:
-        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+    # Authorize (also resolves run existence -> 404).
+    authorize_run(session, auth_user, run_uuid)
 
     # Fetch queries for this run
     statement = (
@@ -281,16 +309,18 @@ async def get_query_history(
     # Convert to dict format
     query_list = []
     for q in queries:
-        query_list.append({
-            "query_id": str(q.id),
-            "query_text": q.query_text,
-            "intent": q.intent,
-            "result_count": q.result_count,
-            "execution_time": q.execution_time,
-            "status": q.status,
-            "created_at": q.created_at.isoformat(),
-            "error_message": q.error_message
-        })
+        query_list.append(
+            {
+                "query_id": str(q.id),
+                "query_text": q.query_text,
+                "intent": q.intent,
+                "result_count": q.result_count,
+                "execution_time": q.execution_time,
+                "status": q.status,
+                "created_at": q.created_at.isoformat(),
+                "error_message": q.error_message,
+            }
+        )
 
     # Get total count
     count_statement = select(Query).where(Query.run_id == run_uuid)
@@ -298,10 +328,7 @@ async def get_query_history(
 
     logger.info(f"Found {len(query_list)} queries (total: {total_count})")
 
-    return QueryHistoryResponse(
-        queries=query_list,
-        total=total_count
-    )
+    return QueryHistoryResponse(queries=query_list, total=total_count)
 
 
 @router.get("/suggestions", response_model=List[QuerySuggestion])
@@ -316,68 +343,63 @@ async def get_query_suggestions():
         QuerySuggestion(
             category="cryptocurrency",
             query="Find all messages mentioning Bitcoin or cryptocurrency wallet addresses",
-            description="Search for crypto-related communications"
+            description="Search for crypto-related communications",
         ),
         QuerySuggestion(
             category="cryptocurrency",
             query="Show transactions or wallet addresses discussed in the last 30 days",
-            description="Recent crypto activity"
+            description="Recent crypto activity",
         ),
-
         # International/suspicious contacts
         QuerySuggestion(
             category="contacts",
             query="Find all calls and messages with international phone numbers",
-            description="Identify foreign contacts"
+            description="Identify foreign contacts",
         ),
         QuerySuggestion(
             category="contacts",
             query="Show all contacts not in the contact list",
-            description="Find unknown or unlisted numbers"
+            description="Find unknown or unlisted numbers",
         ),
-
         # Timeline/temporal queries
         QuerySuggestion(
             category="timeline",
             query="Show all activity between 2AM and 6AM",
-            description="Unusual hour activity"
+            description="Unusual hour activity",
         ),
         QuerySuggestion(
             category="timeline",
             query="What happened on January 15, 2024?",
-            description="Specific date investigation"
+            description="Specific date investigation",
         ),
-
         # Content searches
         QuerySuggestion(
             category="keywords",
             query="Search for messages containing 'deal' or 'payment'",
-            description="Financial discussion search"
+            description="Financial discussion search",
         ),
         QuerySuggestion(
             category="keywords",
             query="Find deleted messages or call logs",
-            description="Recover deleted data"
+            description="Recover deleted data",
         ),
-
         # Media/files
         QuerySuggestion(
             category="media",
             query="Show all images and videos shared with contact +91-XXXXXXXXXX",
-            description="Media exchange with specific contact"
+            description="Media exchange with specific contact",
         ),
-
         # Pattern matching
         QuerySuggestion(
             category="patterns",
             query="Find messages with addresses or location coordinates",
-            description="Location-related communications"
+            description="Location-related communications",
         ),
         QuerySuggestion(
             category="patterns",
             query="Search for email addresses or URLs in messages",
-            description="Extract communication channels"
-        )
+            description="Extract communication channels",
+        ),
     ]
 
     logger.info(f"Returning {len(suggestions)} query suggestions")

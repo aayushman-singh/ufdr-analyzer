@@ -8,6 +8,7 @@ investigator (or a court) trace a result back to the evidence that produced it.
 This module does the deterministic execution + citation work. The LLM step
 (NL -> QueryPlan) lives in `ai.planner`; `answer_question()` wires them together.
 """
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -18,7 +19,7 @@ from datetime import datetime
 from sqlalchemy import DateTime, Uuid, bindparam, text
 from sqlmodel import Session
 
-from ai.query_compiler import SCHEMA, TableQuery
+from ai.query_compiler import SCHEMA
 from ai.query_plan import Op, QueryPlan, Target
 
 _SNIPPET_PAD = 40
@@ -27,6 +28,7 @@ _SNIPPET_PAD = 40
 @dataclass
 class Citation:
     """Evidence locator: a result row traces to this exact span."""
+
     source_table: str
     row_id: str
     column: str
@@ -48,12 +50,13 @@ class CitedRow:
 @dataclass
 class QueryAnswer:
     """The full audit bundle returned to the API/UI."""
+
     question: str
-    plan: dict          # QueryPlan as JSON
-    sql: str            # rendered SQL (display); per-table bound SQL ran
+    plan: dict  # QueryPlan as JSON
+    sql: str  # rendered SQL (display); per-table bound SQL ran
     rows: list[CitedRow]
     total: int
-    planner: str        # "llm" | "stub" — provenance of the plan
+    planner: str  # "llm" | "stub" — provenance of the plan
 
     def to_dict(self) -> dict:
         return {
@@ -63,8 +66,10 @@ class QueryAnswer:
             "total": self.total,
             "planner": self.planner,
             "rows": [
-                {**{k: v for k, v in asdict(r).items() if k != "citations"},
-                 "citations": [asdict(c) for c in r.citations]}
+                {
+                    **{k: v for k, v in asdict(r).items() if k != "citations"},
+                    "citations": [asdict(c) for c in r.citations],
+                }
                 for r in self.rows
             ],
         }
@@ -133,8 +138,9 @@ def _preview(target: Target, row_map: dict) -> str:
     return f"{schema.table}:{row_map.get('row_id')}"
 
 
-def run_plan(session: Session, plan: QueryPlan, run_id, question: str = "",
-             planner: str = "llm") -> QueryAnswer:
+def run_plan(
+    session: Session, plan: QueryPlan, run_id, question: str = "", planner: str = "llm"
+) -> QueryAnswer:
     """Compile + execute `plan` against `run_id`, returning cited results."""
     compiled = plan.compile()
     rows: list[CitedRow] = []
@@ -170,10 +176,15 @@ def run_plan(session: Session, plan: QueryPlan, run_id, question: str = "",
     # Stable, deterministic ordering across heterogeneous tables: time desc,
     # then table, then row id — so the same plan yields the same row order.
     rows.sort(
-        key=lambda r: (r.event_time is None, r.event_time or "", r.source_table, r.row_id),
+        key=lambda r: (
+            r.event_time is None,
+            r.event_time or "",
+            r.source_table,
+            r.row_id,
+        ),
         reverse=plan.sort.direction.value == "desc",
     )
-    rows = rows[: plan.limit]
+    rows = rows[plan.offset : plan.offset + plan.limit]
 
     return QueryAnswer(
         question=question,

@@ -5,6 +5,7 @@
 - POST /audit/evidence-report -> run a query, record an `export` event, and
   return a signed, deterministic PDF of the cited results.
 """
+
 import logging
 import os
 import uuid
@@ -16,9 +17,12 @@ from pydantic import BaseModel
 from sqlmodel import Session
 
 from database import get_session
+from db_setup import User
 from ai.planner import plan_question
 from ai.query_pipeline import run_plan
 from ingest.services.audit_service import audit_service
+from ingest.services.auth_service import require_admin, require_user
+from ingest.services.case_access import authorize_run
 from ingest.services.evidence_report import build_evidence_pdf
 
 logger = logging.getLogger(__name__)
@@ -26,13 +30,19 @@ router = APIRouter(prefix="/audit", tags=["Audit & Evidence Export"])
 
 
 @router.get("")
-def get_audit(session: Session = Depends(get_session)) -> dict:
+def get_audit(
+    session: Session = Depends(get_session),
+    admin: User = Depends(require_admin),
+) -> dict:
     """Full audit chain plus a recomputed integrity verdict."""
     return audit_service.export(session)
 
 
 @router.post("/timestamp")
-def timestamp_chain(session: Session = Depends(get_session)) -> dict:
+def timestamp_chain(
+    session: Session = Depends(get_session),
+    admin: User = Depends(require_admin),
+) -> dict:
     """Anchor the current audit-chain head to an RFC 3161 TSA token.
 
     The custody root (chain head hash) is sent to an external Time-Stamp
@@ -41,7 +51,9 @@ def timestamp_chain(session: Session = Depends(get_session)) -> dict:
     never return an unstamped result dressed up as stamped.
     """
     from ingest.services.timestamp_service import (
-        DEFAULT_TSA_URL, TimestampError, request_timestamp,
+        DEFAULT_TSA_URL,
+        TimestampError,
+        request_timestamp,
     )
 
     head_hash = audit_service.export(session)["head_hash"]
@@ -56,13 +68,17 @@ def timestamp_chain(session: Session = Depends(get_session)) -> dict:
     except TimestampError as e:
         # Record the failure (exact reason) in the tamper-evident chain, then fail.
         audit_service.record(
-            session, "timestamp_failed",
+            session,
+            "timestamp_failed",
+            user_id=admin.id,
             payload={"tsa_url": tsa_url, "head_hash": head_hash, "reason": str(e)},
         )
         raise HTTPException(status_code=502, detail=str(e))
 
     event = audit_service.record(
-        session, "timestamp",
+        session,
+        "timestamp",
+        user_id=admin.id,
         payload={
             "tsa_url": token.tsa_url,
             "head_hash": head_hash,
@@ -83,7 +99,10 @@ def timestamp_chain(session: Session = Depends(get_session)) -> dict:
 
 
 @router.get("/verify")
-def verify_audit(session: Session = Depends(get_session)) -> dict:
+def verify_audit(
+    session: Session = Depends(get_session),
+    admin: User = Depends(require_admin),
+) -> dict:
     status = audit_service.verify_chain(session)
     return {
         "verified": status.ok,
@@ -100,10 +119,20 @@ class EvidenceReportRequest(BaseModel):
 
 
 @router.post("/evidence-report")
-def evidence_report(req: EvidenceReportRequest, session: Session = Depends(get_session)):
-    """Run the query, record an export audit event, return a signed PDF."""
+def evidence_report(
+    req: EvidenceReportRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_user),
+):
+    """Run the query, record an export audit event, return a signed PDF.
+
+    Case-level RBAC: caller must hold 'viewer' on `run_id` (else 401/403/404) —
+    an evidence export must not be a back door to a case the caller may not see."""
     if not req.question.strip():
         raise HTTPException(status_code=422, detail="question must not be empty")
+
+    # Authorize the caller on the case before any planning, query, or signing.
+    authorize_run(session, user, req.run_id)
 
     # Validate signing config BEFORE doing anything that mutates the audit
     # chain — otherwise the chain would claim an export that never produced a
@@ -116,17 +145,25 @@ def evidence_report(req: EvidenceReportRequest, session: Session = Depends(get_s
         )
 
     plan, planner = plan_question(req.question, req.context)
-    answer = run_plan(session, plan, req.run_id, question=req.question, planner=planner).to_dict()
+    answer = run_plan(
+        session, plan, req.run_id, question=req.question, planner=planner
+    ).to_dict()
 
     # Record the export, committing to the content hash, then build the PDF that
     # cites the resulting chain head. The audit head is folded into the signed
     # payload so the chain-of-custody pointer cannot be edited post-hoc.
     from ingest.services.evidence_report import content_hash
+
     event = audit_service.record(
-        session, "export",
-        payload={"question": req.question, "content_hash": content_hash(answer),
-                 "total": answer["total"]},
+        session,
+        "export",
+        payload={
+            "question": req.question,
+            "content_hash": content_hash(answer),
+            "total": answer["total"],
+        },
         run_id=req.run_id,
+        user_id=user.id,  # chain-of-custody: WHO exported
     )
     pdf = build_evidence_pdf(answer, secret_key, audit_head_hash=event.entry_hash)
 

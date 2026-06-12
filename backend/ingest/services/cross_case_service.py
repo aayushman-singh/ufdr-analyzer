@@ -16,6 +16,7 @@ Design constraints (hardened after review):
   form (not whichever raw formatting happened to be read first), and lists sorted.
 - The hash is never returned over the API.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -43,6 +44,8 @@ def _require_key() -> bytes:
             "a keyed HMAC; a missing or default key makes phone/email hashes "
             "brute-forceable. Set CROSS_CASE_SALT to a strong shared secret."
         )
+    if salt.strip().lower() in {"change_me", "changeme"} or "change_me" in salt.lower():
+        raise RuntimeError("CROSS_CASE_SALT is still a template placeholder.")
     return salt.encode("utf-8")
 
 
@@ -73,10 +76,10 @@ def hash_identifier(identifier: str) -> str | None:
 
 @dataclass
 class RunLink:
-    identifier: str            # the querying run's own identifier, canonical form
+    identifier: str  # the querying run's own identifier, canonical form
     identifier_type: str
-    also_in_runs: list[str]    # other run ids sharing this identifier
-    case_count: int            # number of distinct runs (incl. this one)
+    also_in_runs: list[str]  # other run ids sharing this identifier
+    case_count: int  # number of distinct runs (incl. this one)
 
 
 class CrossCaseService:
@@ -85,6 +88,7 @@ class CrossCaseService:
 
     def _run_exists(self, run_id) -> bool:
         from db_setup import Run
+
         return self.session.get(Run, run_id) is not None
 
     def _occurrences(self, run_id) -> dict[str, dict]:
@@ -105,15 +109,27 @@ class CrossCaseService:
             value, vtype = norm
             h = hmac.new(key, value.encode("utf-8"), hashlib.sha256).hexdigest()
             slot = acc.setdefault(
-                h, {"value": value, "type": vtype, "count": 0, "first": None, "last": None})
+                h,
+                {
+                    "value": value,
+                    "type": vtype,
+                    "count": 0,
+                    "first": None,
+                    "last": None,
+                },
+            )
             slot["count"] += 1
             if ts is not None:
                 slot["first"] = ts if slot["first"] is None else min(slot["first"], ts)
                 slot["last"] = ts if slot["last"] is None else max(slot["last"], ts)
 
-        for c in self.session.exec(select(Contact).where(Contact.run_id == run_id)).all():
+        for c in self.session.exec(
+            select(Contact).where(Contact.run_id == run_id)
+        ).all():
             add(c.number, None)
-        for m in self.session.exec(select(Message).where(Message.run_id == run_id)).all():
+        for m in self.session.exec(
+            select(Message).where(Message.run_id == run_id)
+        ).all():
             add(m.sender, m.timestamp)
             add(m.receiver, m.timestamp)
         for c in self.session.exec(select(Call).where(Call.run_id == run_id)).all():
@@ -130,8 +146,12 @@ class CrossCaseService:
         occ = self._occurrences(run_id)
         rows = [
             EntityIndex(
-                run_id=run_id, identifier_hash=h, identifier_type=d["type"],
-                first_seen=d["first"], last_seen=d["last"], occurrence_count=d["count"],
+                run_id=run_id,
+                identifier_hash=h,
+                identifier_type=d["type"],
+                first_seen=d["first"],
+                last_seen=d["last"],
+                occurrence_count=d["count"],
             )
             for h, d in occ.items()
         ]
@@ -158,8 +178,12 @@ class CrossCaseService:
             run_set = by_hash.get(h, set())
             others = sorted(run_set - {str(run_id)})
             if others:  # only surface genuine cross-case hits
-                links.append(RunLink(
-                    identifier=d["value"], identifier_type=d["type"],
-                    also_in_runs=others, case_count=len(run_set | {str(run_id)}),
-                ))
+                links.append(
+                    RunLink(
+                        identifier=d["value"],
+                        identifier_type=d["type"],
+                        also_in_runs=others,
+                        case_count=len(run_set | {str(run_id)}),
+                    )
+                )
         return links
