@@ -1,8 +1,7 @@
 "use client"
 
 import { useEffect, useRef, useState } from 'react'
-import { Network } from 'vis-network'
-import type { Edge, Node } from 'vis-network'
+import { Network, type Node as VisNode, type Edge as VisEdge } from 'vis-network'
 import { DataSet } from 'vis-data'
 import { graphApi, GraphData, graphUtils } from '@/lib/api/graph-api'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -62,8 +61,8 @@ export function GraphVisualization({ className }: GraphVisualizationProps) {
 
     const transformedData = graphUtils.transformForVisNetwork(data)
 
-    const nodes = new DataSet<Node>(transformedData.nodes)
-    const edges = new DataSet<Edge>(transformedData.edges)
+    const nodes = new DataSet<VisNode>(transformedData.nodes as VisNode[])
+    const edges = new DataSet<VisEdge>(transformedData.edges as VisEdge[])
 
     // Read CSS custom properties at runtime so vis-network honours the dark theme
     const style = getComputedStyle(document.documentElement)

@@ -143,6 +143,7 @@ export function HierarchicalTree({ data, className = "" }: HierarchicalTreeProps
         nodeSize={{ x: 200, y: 100 }}
         renderCustomNodeElement={renderCustomNodeElement}
         pathFunc="diagonal"
+        pathClassFunc={() => "ufdr-tree-link"}
         initialDepth={2}
         collapsible={true}
         zoom={0.8}
