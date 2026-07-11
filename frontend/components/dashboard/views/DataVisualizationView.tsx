@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import {
   Card,
   CardContent,
@@ -24,20 +24,27 @@ import {
   MapPin,
   TrendingUp,
   ArrowLeft,
+  Loader2,
+  AlertTriangle,
 } from "lucide-react"
+import { getPatterns, type PatternsResponse } from "@/lib/analyticsApi"
 
-// Mock data for the bar chart
-const mockChartData = [
-  { date: "Sep 18", calls: 8, messages: 22, media: 5 },
-  { date: "Sep 19", calls: 12, messages: 35, media: 8 },
-  { date: "Sep 20", calls: 5, messages: 15, media: 12 },
-  { date: "Sep 21", calls: 18, messages: 45, media: 7 },
-  { date: "Sep 22", calls: 25, messages: 60, media: 15 },
-  { date: "Sep 23", calls: 10, messages: 30, media: 10 },
-  { date: "Sep 24", calls: 14, messages: 28, media: 9 },
-]
+type ChartRow = {
+  date: string
+  calls: number
+  messages: number
+  total: number
+}
 
-// Chart configuration for colors + labels
+function toChartRows(patterns: PatternsResponse | null): ChartRow[] {
+  return (patterns?.daily_series ?? []).map((point) => ({
+    date: point.date,
+    calls: point.calls,
+    messages: point.messages,
+    total: point.total,
+  }))
+}
+
 const chartConfig = {
   calls: {
     label: "Calls",
@@ -47,14 +54,109 @@ const chartConfig = {
     label: "Messages",
     color: "hsl(var(--chart-2))",
   },
-  media: {
-    label: "Media Files",
-    color: "hsl(var(--chart-3))",
-  },
 } satisfies ChartConfig
 
 export function DataVisualizationView() {
   const [activeView, setActiveView] = useState<"grid" | "chart">("grid")
+  const [patterns, setPatterns] = useState<PatternsResponse | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [reloadToken, setReloadToken] = useState(0)
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function load() {
+      setLoading(true)
+      setError(null)
+
+      const runId = window.localStorage.getItem("run_id")
+      if (!runId) {
+        if (!cancelled) {
+          setPatterns(null)
+          setError(
+            "No active analysis session found. Upload or reset a case first.",
+          )
+          setLoading(false)
+        }
+        return
+      }
+
+      try {
+        const result = await getPatterns(runId)
+        if (!cancelled) {
+          setPatterns(result)
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setPatterns(null)
+          setError(err instanceof Error ? err.message : String(err))
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false)
+        }
+      }
+    }
+
+    void load()
+    return () => {
+      cancelled = true
+    }
+  }, [reloadToken])
+
+  const chartData = toChartRows(patterns)
+  const retry = () => setReloadToken((token) => token + 1)
+
+  if (loading) {
+    return (
+      <div className="flex min-h-[320px] flex-col items-center justify-center gap-3 rounded-lg border border-border bg-surface-1 p-8 text-center">
+        <Loader2 className="h-8 w-8 animate-spin text-signal" />
+        <p className="text-sm text-muted-foreground">
+          Loading communication activity...
+        </p>
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="flex min-h-[320px] flex-col items-center justify-center gap-4 rounded-lg border border-red-200 bg-red-50 p-8 text-center">
+        <AlertTriangle className="h-8 w-8 text-red-700" />
+        <div className="max-w-lg space-y-1">
+          <p className="font-medium text-red-800">Unable to load analytics</p>
+          <p className="whitespace-pre-wrap break-words font-mono text-xs text-red-700">
+            {error}
+          </p>
+        </div>
+        <Button variant="outline" onClick={retry}>
+          Retry
+        </Button>
+      </div>
+    )
+  }
+
+  if (chartData.length === 0) {
+    return (
+      <div className="flex min-h-[320px] flex-col items-center justify-center gap-3 rounded-lg border border-border bg-surface-1 p-8 text-center">
+        <BarChart3 className="h-10 w-10 text-muted-foreground" />
+        <div className="space-y-1">
+          <p className="font-medium text-foreground">No activity data</p>
+          <p className="text-sm text-muted-foreground">
+            This run has no daily communication series to chart yet.
+          </p>
+        </div>
+        <Button variant="outline" onClick={retry}>
+          Retry
+        </Button>
+      </div>
+    )
+  }
+
+  const peakDay = chartData.reduce((best, row) =>
+    row.total > best.total ? row : best,
+  )
+  const activitySummary = `Peak: ${peakDay.date} (${peakDay.total.toLocaleString()}) | ${patterns!.total_events.toLocaleString()} total events | ${patterns!.findings.length} findings`
 
   // Grid view of all cards
   const GridView = () => (
@@ -83,9 +185,9 @@ export function DataVisualizationView() {
                 Interactive Network Diagram
               </p>
               <p className="text-sm text-muted-foreground mb-4">
-                89 contacts • 234 connections
+                Available in Graph Analysis
               </p>
-              <Button className="bg-primary hover:bg-primary/80">
+              <Button className="bg-primary hover:bg-primary/80" disabled>
                 Launch Interactive View
               </Button>
             </div>
@@ -104,9 +206,7 @@ export function DataVisualizationView() {
             <div className="bg-surface-1 border border-border rounded-lg p-8 text-center h-64 flex flex-col justify-center">
               <BarChart3 className="w-16 h-16 mx-auto mb-4 text-info" />
               <p className="text-muted-foreground font-medium mb-2">Activity Chart</p>
-              <p className="text-sm text-muted-foreground mb-4">
-                Peak: 2-4 PM • 2,847 total events
-              </p>
+              <p className="text-sm text-muted-foreground mb-4">{activitySummary}</p>
               <Button variant="outline" onClick={() => setActiveView("chart")}>
                 View Chart
               </Button>
@@ -127,9 +227,9 @@ export function DataVisualizationView() {
               <MapPin className="w-16 h-16 mx-auto mb-4 text-[var(--severity-low)]" />
               <p className="text-muted-foreground font-medium mb-2">Movement Heatmap</p>
               <p className="text-sm text-muted-foreground mb-4">
-                47 locations • 234 miles traveled
+                No location analytics endpoint is wired here
               </p>
-              <Button variant="outline">View Map</Button>
+              <Button variant="outline" disabled>View Map</Button>
             </div>
           </CardContent>
         </Card>
@@ -147,9 +247,9 @@ export function DataVisualizationView() {
               <TrendingUp className="w-16 h-16 mx-auto mb-4 text-[var(--severity-medium)]" />
               <p className="text-muted-foreground font-medium mb-2">Risk Dashboard</p>
               <p className="text-sm text-muted-foreground mb-4">
-                Score: 8.7/10 • 15 anomalies detected
+                Risk scoring is not connected to this analytics response
               </p>
-              <Button variant="outline">View Dashboard</Button>
+              <Button variant="outline" disabled>View Dashboard</Button>
             </div>
           </CardContent>
         </Card>
@@ -169,18 +269,20 @@ export function DataVisualizationView() {
             Communication Timeline
           </h2>
           <p className="text-lg text-muted-foreground font-light">
-            Analysis of messages, calls, and media files exchanged over the past week.
+            Daily calls and messages for this extraction run.
           </p>
         </div>
       </div>
       <Card>
         <CardHeader>
-          <CardTitle>Communication Activity - Last 7 Days</CardTitle>
-          <CardDescription>Daily breakdown of communications by type.</CardDescription>
+          <CardTitle>Communication Activity</CardTitle>
+          <CardDescription>
+            {patterns!.span_start} to {patterns!.span_end} | {activitySummary}
+          </CardDescription>
         </CardHeader>
         <CardContent>
           <ChartContainer config={chartConfig} className="min-h-[400px] w-full">
-            <BarChart accessibilityLayer data={mockChartData}>
+            <BarChart accessibilityLayer data={chartData}>
               <CartesianGrid vertical={false} />
               <XAxis
                 dataKey="date"
@@ -201,12 +303,6 @@ export function DataVisualizationView() {
                 dataKey="messages"
                 stackId="a"
                 fill="var(--color-messages)"
-                radius={[4, 4, 0, 0]}
-              />
-              <Bar
-                dataKey="media"
-                stackId="a"
-                fill="var(--color-media)"
                 radius={[4, 4, 0, 0]}
               />
             </BarChart>
