@@ -1,4 +1,4 @@
-import { Bot, Search, Clock, BarChart3, Network, LucideIcon, MapPin, Phone, MessageCircle, Users, Activity, GitBranch } from "lucide-react"
+import { Bot, Search, Clock, BarChart3, Network, LucideIcon, MapPin, Phone, MessageCircle, Activity, GitBranch } from "lucide-react"
 
 // Type Definitions
 export interface MenuItem {
@@ -9,13 +9,20 @@ export interface MenuItem {
   content: string
 }
 
+export interface ChatEvidenceResult {
+  id?: string | number;
+  original_path: string;
+  media_type: string;
+  combined_score: number;
+}
+
 export interface ChatMessage {
   id: number;
   type: "user" | "assistant";
   message: string;
   timestamp: string;
   isLoading?: boolean;      
-  results?: any[];          
+  results?: ChatEvidenceResult[];          
   result_count?: number;    
 }
 

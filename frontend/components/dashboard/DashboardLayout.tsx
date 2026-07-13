@@ -97,12 +97,12 @@ export function DashboardLayout() {
 
       
       setChatMessages(prev => prev.map(msg => (msg.id === loadingMessageId ? aiResponse : msg)))
-    } catch (error:any) {
+    } catch (error: unknown) {
       console.error("Failed to fetch AI response:", error)
       const errorMessage: ChatMessage = {
         id: loadingMessageId,
         type: "assistant",
-        message: `Sorry, an error occurred: ${error.message}`,
+        message: `Sorry, an error occurred: ${error instanceof Error ? error.message : String(error)}`,
         isLoading: false,
         timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       }

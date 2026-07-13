@@ -3,15 +3,14 @@
 import { GraphVisualization } from "@/components/graph/GraphVisualization"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
-import { Badge } from "@/components/ui/badge"
-import { graphApi } from "@/lib/api/graph-api"
+import { graphApi, type GraphData, type GraphNode } from "@/lib/api/graph-api"
 import { useState, useEffect } from "react"
-import { RefreshCw, Database, Network, Users, MessageSquare, Phone } from "lucide-react"
+import { RefreshCw, Database, Network, Users, MessageSquare } from "lucide-react"
 
 export default function GraphTestPage() {
   const [connectionStatus, setConnectionStatus] = useState<'checking' | 'connected' | 'error'>('checking')
   const [error, setError] = useState<string | null>(null)
-  const [sampleData, setSampleData] = useState<any>(null)
+  const [sampleData, setSampleData] = useState<GraphData | null>(null)
 
   // Test connection and load sample data
   useEffect(() => {
@@ -168,7 +167,7 @@ export default function GraphTestPage() {
                   <div>
                     <p className="text-sm text-muted-foreground">People</p>
                     <p className="text-2xl font-bold">
-                      {sampleData.nodes?.filter((n: any) => n.label === 'Person').length || 0}
+                      {sampleData.nodes?.filter((n: GraphNode) => n.label === 'Person').length || 0}
                     </p>
                   </div>
                   <Users className="w-8 h-8 text-signal" />
@@ -182,7 +181,7 @@ export default function GraphTestPage() {
                   <div>
                     <p className="text-sm text-muted-foreground">Messages</p>
                     <p className="text-2xl font-bold">
-                      {sampleData.nodes?.filter((n: any) => n.label === 'Message').length || 0}
+                      {sampleData.nodes?.filter((n: GraphNode) => n.label === 'Message').length || 0}
                     </p>
                   </div>
                   <MessageSquare className="w-8 h-8 text-muted-foreground" />
@@ -226,8 +225,8 @@ export default function GraphTestPage() {
               <div>
                 <h4 className="font-medium mb-2">3. Test Steps</h4>
                 <ul className="text-sm text-muted-foreground space-y-1">
-                  <li>• Click "Test Connection" to verify backend connectivity</li>
-                  <li>• Click "Add Sample Data" to populate the graph with test data</li>
+                  <li>• Click &quot;Test Connection&quot; to verify backend connectivity</li>
+                  <li>• Click &quot;Add Sample Data&quot; to populate the graph with test data</li>
                   <li>• Use the interactive graph to explore relationships</li>
                   <li>• Navigate to Dashboard → Graph Analysis for full features</li>
                 </ul>

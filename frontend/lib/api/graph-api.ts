@@ -4,7 +4,37 @@ const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 export interface GraphNode {
   id: string;
   label: string;
-  properties?: Record<string, any>;
+  properties?: Record<string, unknown>;
+}
+
+export interface GraphPersonInput {
+  id: string;
+  name: string;
+}
+
+export interface GraphMessageInput {
+  id: string;
+  content: string;
+  timestamp: string;
+}
+
+export interface GraphCallInput {
+  id: string;
+  caller: string;
+  receiver: string;
+  duration: number;
+}
+
+export interface GraphRelationshipInput {
+  from_id: string;
+  to_id: string;
+  type: string;
+}
+
+export interface GraphNodeStats {
+  totalNodes: number;
+  totalEdges: number;
+  nodeTypes: Record<string, number>;
 }
 
 export interface GraphEdge {
@@ -89,8 +119,8 @@ export class GraphApiService {
   }
 
   // Run custom Cypher query
-  async runQuery(query: string): Promise<any[]> {
-    return this.request<any[]>('/graph/query', {
+  async runQuery(query: string): Promise<Record<string, unknown>[]> {
+    return this.request<Record<string, unknown>[]>('/graph/query', {
       method: 'POST',
       body: JSON.stringify({ query }),
     });
@@ -138,10 +168,10 @@ export class GraphApiService {
 
   // Batch ingest data
   async batchIngest(data: {
-    people?: any[];
-    messages?: any[];
-    calls?: any[];
-    relationships?: any[];
+    people?: GraphPersonInput[];
+    messages?: GraphMessageInput[];
+    calls?: GraphCallInput[];
+    relationships?: GraphRelationshipInput[];
   }): Promise<{ message: string }> {
     return this.request<{ message: string }>('/graph/batch_ingest', {
       method: 'POST',
@@ -186,7 +216,7 @@ export const graphUtils = {
   },
 
   // Get node statistics
-  getNodeStats: (graphData: GraphData) => {
+  getNodeStats: (graphData: GraphData): GraphNodeStats => {
     const nodeCounts = graphData.nodes.reduce((acc, node) => {
       acc[node.label] = (acc[node.label] || 0) + 1;
       return acc;

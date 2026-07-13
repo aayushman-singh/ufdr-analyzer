@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Network, type Node as VisNode, type Edge as VisEdge } from 'vis-network'
 import { DataSet } from 'vis-data'
-import { graphApi, GraphData, graphUtils } from '@/lib/api/graph-api'
+import { graphApi, GraphData, GraphNodeStats, graphUtils } from '@/lib/api/graph-api'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -22,14 +22,21 @@ interface GraphVisualizationProps {
   className?: string
 }
 
+interface SelectedGraphNode {
+  id: string | number
+  label?: string
+  group?: string
+  properties?: Record<string, unknown>
+}
+
 export function GraphVisualization({ className }: GraphVisualizationProps) {
   const networkRef = useRef<HTMLDivElement>(null)
   const networkInstance = useRef<Network | null>(null)
   const [graphData, setGraphData] = useState<GraphData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [selectedNode, setSelectedNode] = useState<any>(null)
-  const [stats, setStats] = useState<any>(null)
+  const [selectedNode, setSelectedNode] = useState<SelectedGraphNode | null>(null)
+  const [stats, setStats] = useState<GraphNodeStats | null>(null)
   const [filterType, setFilterType] = useState<string>('all')
 
   // Load graph data
@@ -134,7 +141,9 @@ export function GraphVisualization({ className }: GraphVisualizationProps) {
       if (params.nodes.length > 0) {
         const nodeId = params.nodes[0]
         const node = nodes.get(nodeId)
-        setSelectedNode(node)
+        if (node && !Array.isArray(node)) {
+          setSelectedNode(node as SelectedGraphNode)
+        }
       }
     })
 
@@ -351,7 +360,7 @@ export function GraphVisualization({ className }: GraphVisualizationProps) {
                   <div>
                     <label className="text-sm font-medium text-muted-foreground">Type</label>
                     <div className="flex items-center gap-2 mt-1">
-                      {getNodeTypeIcon(selectedNode.group)}
+                      {getNodeTypeIcon(selectedNode.group ?? '')}
                       <Badge variant="secondary">{selectedNode.group}</Badge>
                     </div>
                   </div>

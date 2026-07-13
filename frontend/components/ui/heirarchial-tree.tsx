@@ -1,7 +1,6 @@
 "use client"
-import type React from "react"
 import Tree from "react-d3-tree"
-import { Database, FileText, HardDrive, Settings, Network, Clock, Hash, Shield } from "lucide-react"
+import type { CustomNodeElementProps } from "react-d3-tree"
 
 interface TreeNode {
   name: string
@@ -14,27 +13,22 @@ interface TreeNode {
   children?: TreeNode[]
 }
 
+interface SourceTreeNode {
+  id?: string
+  name: string
+  type?: string
+  size?: string
+  count?: number
+  children?: SourceTreeNode[]
+}
+
 interface HierarchicalTreeProps {
-  data: any[]
+  data: SourceTreeNode[]
   className?: string
 }
 
-const getIconComponent = (iconType: string) => {
-  const iconMap: { [key: string]: React.ReactNode } = {
-    database: <Database className="w-4 h-4" />,
-    file: <FileText className="w-4 h-4" />,
-    harddrive: <HardDrive className="w-4 h-4" />,
-    settings: <Settings className="w-4 h-4" />,
-    network: <Network className="w-4 h-4" />,
-    clock: <Clock className="w-4 h-4" />,
-    hash: <Hash className="w-4 h-4" />,
-    shield: <Shield className="w-4 h-4" />,
-  }
-  return iconMap[iconType] || <FileText className="w-4 h-4" />
-}
-
-const transformDataForD3Tree = (data: any[]): TreeNode => {
-  const transformNode = (node: any): TreeNode => {
+const transformDataForD3Tree = (data: SourceTreeNode[]): TreeNode => {
+  const transformNode = (node: SourceTreeNode): TreeNode => {
     const transformed: TreeNode = {
       name: node.name,
       attributes: {
@@ -59,7 +53,7 @@ const transformDataForD3Tree = (data: any[]): TreeNode => {
   }
 }
 
-const renderCustomNodeElement = ({ nodeDatum, toggleNode }: any) => {
+const renderCustomNodeElement = ({ nodeDatum, toggleNode }: CustomNodeElementProps) => {
   const isFolder = nodeDatum.children && nodeDatum.children.length > 0
   const nodeColor = isFolder ? "oklch(0.860 0.175 117)" : "oklch(0.700 0.090 235)"
   const textColor = "oklch(0.967 0.004 247)"
@@ -110,7 +104,7 @@ const renderCustomNodeElement = ({ nodeDatum, toggleNode }: any) => {
           fontSize="10"
           style={{ fontFamily: "system-ui, sans-serif" }}
         >
-          {nodeDatum.attributes.count.toLocaleString()} items
+          {Number(nodeDatum.attributes.count).toLocaleString()} items
         </text>
       )}
 
@@ -123,7 +117,7 @@ const renderCustomNodeElement = ({ nodeDatum, toggleNode }: any) => {
           fontSize="10"
           style={{ fontFamily: "system-ui, sans-serif" }}
         >
-          {nodeDatum.attributes.size}
+          {String(nodeDatum.attributes.size)}
         </text>
       )}
     </g>

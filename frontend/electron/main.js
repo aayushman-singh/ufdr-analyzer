@@ -1,6 +1,6 @@
+/* eslint-disable @typescript-eslint/no-require-imports -- Electron main process is CommonJS */
 const { app, BrowserWindow, dialog, ipcMain } = require("electron");
 const path = require("path");
-const isDev = process.env.NODE_ENV !== "production";
 
 function createWindow() {
   const mainWindow = new BrowserWindow({

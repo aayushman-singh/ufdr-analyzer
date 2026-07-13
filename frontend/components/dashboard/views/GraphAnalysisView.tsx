@@ -11,20 +11,17 @@ import {
   MessageSquare, 
   Phone, 
   TrendingUp,
-  Search,
   Filter,
   BarChart3,
-  PieChart
 } from "lucide-react"
-import { graphApi, GraphData, graphUtils } from "@/lib/api/graph-api"
+import { graphApi, GraphNodeStats, CentralityData, CommunityData, graphUtils } from "@/lib/api/graph-api"
 
 export function GraphAnalysisView() {
-  const [graphData, setGraphData] = useState<GraphData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [stats, setStats] = useState<any>(null)
-  const [centralityData, setCentralityData] = useState<any[]>([])
-  const [communityData, setCommunityData] = useState<any[]>([])
+  const [stats, setStats] = useState<GraphNodeStats | null>(null)
+  const [centralityData, setCentralityData] = useState<CentralityData[]>([])
+  const [communityData, setCommunityData] = useState<CommunityData[]>([])
   const [activeTab, setActiveTab] = useState<'network' | 'analytics' | 'insights'>('network')
 
   // Load initial data
@@ -37,7 +34,6 @@ export function GraphAnalysisView() {
       setLoading(true)
       setError(null)
       const data = await graphApi.getFullGraph()
-      setGraphData(data)
       
       // Calculate stats
       const nodeStats = graphUtils.getNodeStats(data)
@@ -319,7 +315,7 @@ export function GraphAnalysisView() {
                   <ul className="text-sm text-muted-foreground space-y-1">
                     <li>• Network shows {stats?.totalNodes || 0} entities with {stats?.totalEdges || 0} connections</li>
                     <li>• Most active entity type: {stats ? Object.entries(stats.nodeTypes).sort(([,a], [,b]) => (b as number) - (a as number))[0]?.[0] : 'N/A'}</li>
-                    <li>• Network density: {stats?.totalNodes > 0 ? ((stats.totalEdges / (stats.totalNodes * (stats.totalNodes - 1))) * 100).toFixed(1) : 0}%</li>
+                    <li>• Network density: {stats && stats.totalNodes > 0 ? ((stats.totalEdges / (stats.totalNodes * (stats.totalNodes - 1))) * 100).toFixed(1) : 0}%</li>
                   </ul>
                 </div>
 
