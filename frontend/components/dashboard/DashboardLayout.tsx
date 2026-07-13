@@ -21,6 +21,7 @@ import { TimelineAnalysisView } from "./views/TimelineAnalysisView"
 import { ReportsAnalyticsView } from "./views/ReportAnalyticsView"
 import { DataVisualizationView } from "./views/DataVisualizationView"
 import { GraphAnalysisView } from "./views/GraphAnalysisView"
+import { authedFetch, API_BASE_URL } from "@/lib/auth"
 
 export function DashboardLayout() {
   const [activeContent, setActiveContent] = useState("ai-assistant")
@@ -64,7 +65,7 @@ export function DashboardLayout() {
 
     try {
     
-      const response = await fetch("http://localhost:8000/query/execute", {
+      const response = await authedFetch(`${API_BASE_URL}/query/execute`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

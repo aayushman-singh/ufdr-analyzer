@@ -61,6 +61,11 @@ export default function Header() {
           >
             Demo
           </a>
+          <Link href="/login">
+            <button className="text-muted-foreground hover:text-foreground px-4 py-2 text-sm font-medium transition-colors">
+              Sign In
+            </button>
+          </Link>
           <Link href="/signup">
             <button className="bg-signal text-signal-foreground px-4 py-2 rounded-lg text-sm font-medium hover:brightness-110 transition-all">
               Get Started

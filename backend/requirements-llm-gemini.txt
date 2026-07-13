@@ -1,0 +1,9 @@
+# Optional: Google Gemini via google-generativeai
+#
+# WARNING: Conflicts with the default stack — blackboxprotobuf (ALEAPP) pins
+# protobuf==3.10.0; this package needs protobuf>=3.20.2. Do not install alongside
+# the main requirements.txt in the same venv if you need ALEAPP ingest.
+#
+# Prefer OPENAI_API_KEY / OPENROUTER in the main env, or use a dedicated venv for
+# Gemini-only development.
+google-generativeai>=0.8.0

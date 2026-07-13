@@ -3,12 +3,21 @@
 import { Mail, Lock } from "lucide-react"
 import { Seal } from "@/components/brand/Seal"
 import Link from "next/link"
-import { useRouter } from "next/navigation"
-import { useState } from "react"
+import { useRouter, useSearchParams } from "next/navigation"
+import { Suspense, useState } from "react"
 import { login } from "@/lib/auth"
 
 export default function LoginPage() {
+  return (
+    <Suspense fallback={null}>
+      <LoginForm />
+    </Suspense>
+  )
+}
+
+function LoginForm() {
   const router = useRouter()
+  const searchParams = useSearchParams()
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
   const [error, setError] = useState<string | null>(null)
@@ -20,7 +29,8 @@ export default function LoginPage() {
     setLoading(true)
     try {
       await login(email, password)
-      router.push("/link-graph")
+      const next = searchParams.get("next")
+      router.push(next && next.startsWith("/") ? next : "/query-plan")
     } catch (err) {
       // Surface the failure loudly — no silent retry, no fake "success".
       setError(err instanceof Error ? err.message : "Sign in failed.")
@@ -128,7 +138,7 @@ export default function LoginPage() {
                 disabled={loading}
                 className="w-full bg-signal text-signal-foreground py-3 px-4 rounded-lg font-medium hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-[var(--ring)] focus:ring-offset-2 transition-all disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                {loading ? "Signing In…" : "Sign In"}
+                {loading ? "Signing In..." : "Sign In"}
               </button>
             </form>
 

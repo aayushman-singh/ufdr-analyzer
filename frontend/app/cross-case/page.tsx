@@ -4,12 +4,10 @@ import { useState } from "react"
 import Link from "next/link"
 import {
   Link2,
-  Search,
   Loader2,
   AlertTriangle,
   Phone,
   Mail,
-  Lock,
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
@@ -25,9 +23,7 @@ import { Badge } from "@/components/ui/badge"
 import { Seal } from "@/components/brand/Seal"
 import {
   getCrossCaseLinks,
-  lookupIdentifier,
   type CrossCaseLinksResponse,
-  type IdentifierLookupResponse,
   type IdentifierType,
 } from "@/lib/analyticsApi"
 
@@ -74,17 +70,10 @@ function RunIdList({ runs }: { runs: string[] }) {
 }
 
 export default function CrossCasePage() {
-  // Mode (a): links for a run.
   const [runId, setRunId] = useState("")
   const [linksLoading, setLinksLoading] = useState(false)
   const [linksError, setLinksError] = useState<string | null>(null)
   const [links, setLinks] = useState<CrossCaseLinksResponse | null>(null)
-
-  // Mode (b): single-identifier lookup.
-  const [identifier, setIdentifier] = useState("")
-  const [lookupLoading, setLookupLoading] = useState(false)
-  const [lookupError, setLookupError] = useState<string | null>(null)
-  const [lookup, setLookup] = useState<IdentifierLookupResponse | null>(null)
 
   const findLinks = async () => {
     if (!runId.trim()) {
@@ -96,29 +85,10 @@ export default function CrossCasePage() {
     try {
       setLinks(await getCrossCaseLinks(runId.trim()))
     } catch (err) {
-      // Do not swallow — surface the backend error text verbatim.
       setLinksError(err instanceof Error ? err.message : String(err))
       setLinks(null)
     } finally {
       setLinksLoading(false)
-    }
-  }
-
-  const runLookup = async () => {
-    if (!identifier.trim()) {
-      setLookupError("Enter an identifier first.")
-      return
-    }
-    setLookupLoading(true)
-    setLookupError(null)
-    try {
-      setLookup(await lookupIdentifier(identifier.trim()))
-    } catch (err) {
-      // Do not swallow — surface the backend error text verbatim.
-      setLookupError(err instanceof Error ? err.message : String(err))
-      setLookup(null)
-    } finally {
-      setLookupLoading(false)
     }
   }
 
@@ -146,7 +116,6 @@ export default function CrossCasePage() {
           </p>
         </div>
 
-        {/* Mode (a): links for a run */}
         <Card className="mb-8">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -234,86 +203,19 @@ export default function CrossCasePage() {
           </CardContent>
         </Card>
 
-        {/* Mode (b): single-identifier lookup */}
         <Card>
           <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Search className="h-4 w-4 text-signal" />
-              Identifier lookup
-            </CardTitle>
+            <CardTitle>Seed a phone or email across cases</CardTitle>
             <CardDescription>
-              Check which cases a single phone number or email appears in.
+              Arbitrary identifier lookup is intentionally unavailable — it would
+              act as a cross-case membership oracle. To explore a specific seed
+              entity and its neighbourhood, use the{" "}
+              <Link href="/link-graph" className="text-signal underline">
+                Link Graph
+              </Link>{" "}
+              page instead.
             </CardDescription>
           </CardHeader>
-          <CardContent className="flex flex-col gap-4">
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
-              <div className="flex flex-1 flex-col gap-2">
-                <label
-                  htmlFor="identifier"
-                  className="text-sm font-medium text-foreground"
-                >
-                  Identifier
-                </label>
-                <Input
-                  id="identifier"
-                  value={identifier}
-                  onChange={(e) => setIdentifier(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !lookupLoading) runLookup()
-                  }}
-                  placeholder="+15551234567 or name@example.com"
-                  disabled={lookupLoading}
-                  className="font-mono"
-                />
-              </div>
-              <Button
-                variant="signal"
-                onClick={runLookup}
-                disabled={lookupLoading}
-              >
-                {lookupLoading ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Search className="h-4 w-4" />
-                )}
-                Look up
-              </Button>
-            </div>
-
-            {lookupError && <ErrorBanner message={lookupError} />}
-
-            {lookup && (
-              <div className="rounded-xl border bg-card p-4">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-mono text-sm font-medium text-foreground">
-                    {lookup.identifier}
-                  </span>
-                  <Badge variant="signal" className="ml-auto">
-                    {lookup.count} case{lookup.count === 1 ? "" : "s"}
-                  </Badge>
-                </div>
-
-                <div className="mt-3 border-t pt-3">
-                  <p className="mb-1.5 text-xs font-medium text-muted-foreground">
-                    Appears in runs
-                  </p>
-                  <RunIdList runs={lookup.runs} />
-                </div>
-
-                <div className="mt-3 flex items-start gap-2 rounded-lg bg-surface-1 p-3">
-                  <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-signal" />
-                  <div className="min-w-0">
-                    <p className="text-xs font-medium text-foreground">
-                      Salted hash (privacy-preserving)
-                    </p>
-                    <p className="mt-0.5 break-all font-mono text-xs text-muted-foreground">
-                      {lookup.identifier_hash}
-                    </p>
-                  </div>
-                </div>
-              </div>
-            )}
-          </CardContent>
         </Card>
       </main>
     </div>

@@ -5,7 +5,7 @@
 // These endpoints require an authenticated owner: every request carries the
 // bearer token (see lib/auth). Without one the server returns 401, which is
 // surfaced to the user as an error (prompting login) rather than hidden.
-import { authHeader } from "./auth"
+import { authedFetch } from "./auth"
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
 
@@ -76,8 +76,8 @@ export async function getLinkGraph(
   params: LinkGraphParams,
 ): Promise<LinkGraphResponse> {
   const url = `${API_BASE_URL}/link-graph?${buildQuery(params)}`
-  const res = await fetch(url, {
-    headers: { Accept: "application/json", ...authHeader() },
+  const res = await authedFetch(url, {
+    headers: { Accept: "application/json" },
   })
   if (!res.ok) {
     const detail = await res.text().catch(() => "")
@@ -94,9 +94,9 @@ export async function exportLinkGraph(
   params: LinkGraphParams,
   format: "json" | "pdf",
 ): Promise<Blob> {
-  const res = await fetch(`${API_BASE_URL}/link-graph/export`, {
+  const res = await authedFetch(`${API_BASE_URL}/link-graph/export`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...authHeader() },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       run_ids: params.runIds,
       seed: params.seed ?? null,

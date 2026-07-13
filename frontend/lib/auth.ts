@@ -7,6 +7,8 @@
 // Errors are surfaced, never swallowed.
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
 
+export { API_BASE_URL }
+
 const TOKEN_KEY = "ufdr.access_token"
 
 export interface TokenResponse {
@@ -39,6 +41,23 @@ export function isAuthenticated(): boolean {
 export function authHeader(): Record<string, string> {
   const token = getToken()
   return token ? { Authorization: `Bearer ${token}` } : {}
+}
+
+/** Fetch with bearer auth; redirects to /login on 401 when running in the browser. */
+export async function authedFetch(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<Response> {
+  const headers = new Headers(init?.headers)
+  for (const [key, value] of Object.entries(authHeader())) {
+    headers.set(key, value)
+  }
+  const res = await fetch(input, { ...init, headers })
+  if (res.status === 401 && typeof window !== "undefined") {
+    const next = encodeURIComponent(window.location.pathname + window.location.search)
+    window.location.href = `/login?next=${next}`
+  }
+  return res
 }
 
 async function postAuth(path: string, body: unknown): Promise<TokenResponse> {

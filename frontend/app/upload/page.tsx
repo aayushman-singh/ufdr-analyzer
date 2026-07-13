@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button"
 import { Database, Maximize2, Minimize2, FileText, HardDrive, Network, Clock, Hash, Settings } from "lucide-react"
 import { useRouter } from "next/navigation"
 import Header from "@/components/header"
+import { authedFetch, API_BASE_URL } from "@/lib/auth"
 
 // Types for backend data
 interface BackendData {
@@ -34,7 +35,7 @@ const extractAleappFileStructure = async (backendData: BackendData | null) => {
 
   try {
     // Fetch the ALEAPP report directory structure
-    const response = await fetch(`http://localhost:8000/ingest/aleapp-structure?report_path=${encodeURIComponent(backendData.aleapp_report_path)}`);
+    const response = await authedFetch(`${API_BASE_URL}/ingest/aleapp-structure?report_path=${encodeURIComponent(backendData.aleapp_report_path)}`);
     if (!response.ok) {
       console.warn('Failed to fetch ALEAPP structure');
       return null;
@@ -309,8 +310,8 @@ export default function UploadPage() {
 
     setIsValidating(true);
     try {
-      const response = await fetch(
-        `http://localhost:8000/ingest/validate-path?file_path=${encodeURIComponent(
+      const response = await authedFetch(
+        `${API_BASE_URL}/ingest/validate-path?file_path=${encodeURIComponent(
           path
         )}`
       );
@@ -381,7 +382,7 @@ export default function UploadPage() {
 
     setIsAnalyzing(true);
     try {
-      const response = await fetch("http://localhost:8000/ingest/", {
+      const response = await authedFetch(`${API_BASE_URL}/ingest/`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

@@ -3,12 +3,21 @@
 import { Mail, Lock, User } from "lucide-react"
 import { Seal } from "@/components/brand/Seal"
 import Link from "next/link"
-import { useRouter } from "next/navigation"
-import { useState } from "react"
+import { useRouter, useSearchParams } from "next/navigation"
+import { Suspense, useState } from "react"
 import { signup } from "@/lib/auth"
 
 export default function SignupPage() {
+  return (
+    <Suspense fallback={null}>
+      <SignupForm />
+    </Suspense>
+  )
+}
+
+function SignupForm() {
   const router = useRouter()
+  const searchParams = useSearchParams()
   const [name, setName] = useState("")
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
@@ -30,7 +39,8 @@ export default function SignupPage() {
     setLoading(true)
     try {
       await signup(name, email, password)
-      router.push("/link-graph")
+      const next = searchParams.get("next")
+      router.push(next && next.startsWith("/") ? next : "/query-plan")
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not create account.")
     } finally {
@@ -209,7 +219,7 @@ export default function SignupPage() {
                 disabled={loading}
                 className="w-full bg-signal text-signal-foreground py-3 px-4 rounded-lg font-medium hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-[var(--ring)] focus:ring-offset-2 transition-all disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                {loading ? "Creating Account…" : "Create Account"}
+                {loading ? "Creating Account..." : "Create Account"}
               </button>
             </form>
 

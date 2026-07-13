@@ -1,5 +1,7 @@
 // Analytics API Service
 // Calls the behavioural-pattern detection and cross-case correlation endpoints.
+import { authedFetch } from "./auth"
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
 
 // ---- Patterns ----
@@ -63,15 +65,8 @@ export interface CrossCaseLinksResponse {
   links: CrossCaseLink[]
 }
 
-export interface IdentifierLookupResponse {
-  identifier: string
-  identifier_hash: string
-  runs: string[]
-  count: number
-}
-
 async function getJson<T>(endpoint: string): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+  const response = await authedFetch(`${API_BASE_URL}${endpoint}`, {
     method: "GET",
     headers: { Accept: "application/json" },
   })
@@ -102,11 +97,3 @@ export function getCrossCaseLinks(runId: string): Promise<CrossCaseLinksResponse
   )
 }
 
-// Look up a single identifier across all cases (privacy-preserving salted hash).
-export function lookupIdentifier(
-  identifier: string,
-): Promise<IdentifierLookupResponse> {
-  return getJson<IdentifierLookupResponse>(
-    `/cross-case/lookup?identifier=${encodeURIComponent(identifier)}`,
-  )
-}

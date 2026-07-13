@@ -1,4 +1,5 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -80,3 +81,4 @@ backend/ingest/database.db
 # Orchestration scratch
 orchestrator.log
 .venv-test/
+.local/

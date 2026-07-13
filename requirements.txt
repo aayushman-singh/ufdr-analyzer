@@ -1,0 +1,10 @@
+# Install from repo root:
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# Backend deps: backend/requirements.txt (single source of truth).
+# Optional extras (do not mix Gemini with ALEAPP in one venv):
+#   pip install -r backend/requirements-llm-gemini.txt
+#   pip install -r backend/requirements-transcription.txt
+-r backend/requirements.txt

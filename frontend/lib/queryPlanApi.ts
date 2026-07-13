@@ -1,5 +1,7 @@
 // Query Plan API Service
 // Calls the auditable NL -> QueryPlan IR -> SQL -> cited results flow.
+import { authedFetch } from "./auth"
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
 
 export type PlannerKind = "llm" | "stub"
@@ -80,7 +82,7 @@ export interface QueryPlanPreviewResponse {
 }
 
 async function postJson<T>(endpoint: string, body: QueryPlanRequest): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+  const response = await authedFetch(`${API_BASE_URL}${endpoint}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
