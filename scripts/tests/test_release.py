@@ -318,6 +318,21 @@ def test_prepare_returns_one_contract_object_without_secret_values():
     assert "api_key" not in result.stdout.lower()
 
 
+def test_credential_scan_ignores_inert_scanner_source_but_checks_runtime_config():
+    inert_source = (
+        "SECRET_PATTERNS = (re.compile(r'neo4j_password\\s*[:=]...'),)\n"
+        "NEO4J_PASSWORD=%s\\nPOSTGRES_PASSWORD=%s\\n"
+    )
+
+    assert release._credential_scan_findings(
+        [
+            ("scripts/release.py", inert_source),
+            ("scripts/tests/test_release.py", 'secret = "synthetic-neo4j-password"'),
+            (".env", "NEO4J_PASSWORD=real-runtime-secret"),
+        ]
+    ) == [".env"]
+
+
 def test_tracked_scan_rejects_large_renamed_forensic_content(tmp_path):
     suspect = tmp_path / "renamed-export.bin"
     suspect.write_bytes(b"SQLite format 3\x00" + (b"x" * (2 * 1024 * 1024)))

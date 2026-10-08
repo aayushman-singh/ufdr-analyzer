@@ -64,6 +64,12 @@ SECRET_PATTERNS = (
     re.compile(r"(?i)(openrouter|openai)_api_key\s*[:=]\s*['\"]?(?!REPLACE_WITH|CHANGE_ME|CHANGEME)[A-Za-z0-9_-]{20,}"),
     re.compile(r"(?i)neo4j_password\s*[:=]\s*(?!os\.getenv\b|[-$])['\"]?(?!\*{3}REDACTED)[^\s'\"]{8,}"),
 )
+INERT_CREDENTIAL_SCANNER_SOURCES = frozenset(
+    {
+        "scripts/release.py",
+        "scripts/tests/test_release.py",
+    }
+)
 FORENSIC_EXTENSIONS = {
     ".ufdr", ".zip", ".tar", ".gz", ".tgz", ".7z", ".rar", ".db", ".sqlite",
     ".sqlite3", ".sql", ".csv", ".tsv", ".dd", ".e01", ".aff", ".aff4", ".mem", ".dmp", ".raw",
@@ -323,6 +329,18 @@ def _release_text() -> list[tuple[str, str]]:
             except UnicodeDecodeError:
                 raise RuntimeError(f"release blocked: configuration is not valid UTF-8: {name}")
     return values
+
+
+def _credential_scan_findings(values: list[tuple[str, str]]) -> list[str]:
+    """Find credential values without treating scanner fixtures as runtime data."""
+    findings = []
+    for name, text in values:
+        normalized_name = name.replace("\\", "/")
+        if normalized_name in INERT_CREDENTIAL_SCANNER_SOURCES:
+            continue
+        if any(pattern.search(text) for pattern in SECRET_PATTERNS):
+            findings.append(name)
+    return findings
 
 
 def _history_credential_findings() -> list[str]:
@@ -1573,10 +1591,10 @@ def _observation_command() -> str:
 def _prepare(payload: dict[str, Any]) -> dict[str, Any]:
     action = _provider_payload(payload)
     _check_payload_secrets(payload)
-    for name, text in _release_text():
-        for pattern in SECRET_PATTERNS:
-            if pattern.search(text):
-                raise RuntimeError(f"release blocked: credential pattern found in tracked file {name}")
+    release_text = _release_text()
+    for name in _credential_scan_findings(release_text):
+        raise RuntimeError(f"release blocked: credential pattern found in tracked file {name}")
+    for name, _ in release_text:
         if Path(name).name.lower() in REAL_DATA_NAMES:
             raise RuntimeError(f"release blocked: real forensic data file is tracked: {name}")
     _demo_run_id(payload)
