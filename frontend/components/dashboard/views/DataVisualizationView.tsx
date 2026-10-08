@@ -240,7 +240,7 @@ export function DataVisualizationView() {
             <CardTitle className="flex items-center gap-2 text-foreground font-medium">
               <TrendingUp className="w-5 h-5 text-[var(--severity-medium)]" /> Risk Assessment
             </CardTitle>
-            <CardDescription>AI-powered risk scoring visualization</CardDescription>
+            <CardDescription>Risk indicators from available evidence. No machine-learning model is active.</CardDescription>
           </CardHeader>
           <CardContent>
             <div className="bg-surface-1 border border-border rounded-lg p-8 text-center h-64 flex flex-col justify-center">

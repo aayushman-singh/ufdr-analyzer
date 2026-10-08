@@ -24,6 +24,7 @@ import {
 } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Seal } from "@/components/brand/Seal"
+import { API_BASE_URL, authedFetch } from "@/lib/auth"
 import {
   previewQueryPlan,
   runQueryPlan,
@@ -74,14 +75,57 @@ function highlightSnippet(citation: ResultCitation) {
 
 export default function QueryPlanPage() {
   const [question, setQuestion] = useState("")
-  const [runId, setRunId] = useState("")
-  const [loading, setLoading] = useState<"run" | "preview" | null>(null)
+  const [runId, setRunId] = useState(() =>
+    typeof window === "undefined"
+      ? ""
+      : window.localStorage.getItem("citespan.demo.run_id") || ""
+  )
+  const [loading, setLoading] = useState<"reset" | "run" | "preview" | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [sampleStatus, setSampleStatus] = useState<string | null>(() =>
+    typeof window === "undefined"
+      ? null
+      : window.localStorage.getItem("citespan.demo.run_id")
+        ? "Sample loaded: canonical synthetic UFDR."
+        : null
+  )
   const [response, setResponse] = useState<AnyResponse | null>(null)
+
+  const resetToSample = async () => {
+    setLoading("reset")
+    setError(null)
+    setSampleStatus(null)
+    setResponse(null)
+    try {
+      const result = await authedFetch(`${API_BASE_URL}/demo/reset`, { method: "POST" })
+      const body = (await result.json()) as {
+        run_id?: string
+        sample?: string
+        detail?: string
+      }
+      if (!result.ok) {
+        throw new Error(body.detail || `Demo reset failed: ${result.status}`)
+      }
+      if (!body.run_id || body.sample !== "canonical synthetic UFDR") {
+        throw new Error("Demo reset did not return the canonical synthetic run.")
+      }
+      window.localStorage.setItem("citespan.demo.run_id", body.run_id)
+      setRunId(body.run_id)
+      setSampleStatus("Sample loaded: canonical synthetic UFDR.")
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setLoading(null)
+    }
+  }
 
   const submit = async (mode: "run" | "preview") => {
     if (!question.trim()) {
       setError("Enter a question first.")
+      return
+    }
+    if (!runId.trim()) {
+      setError("Reset to sample before you run a query.")
       return
     }
     setLoading(mode)
@@ -108,7 +152,7 @@ export default function QueryPlanPage() {
         <div className="mx-auto flex max-w-5xl items-center justify-between">
           <Link href="/" className="flex items-center gap-2">
             <Seal size={28} />
-            <span className="text-xl font-medium text-foreground">ForensicAI</span>
+            <span className="text-xl font-medium text-foreground">CiteSpan</span>
           </Link>
           <Badge variant="signal">Auditable Query</Badge>
         </div>
@@ -155,17 +199,29 @@ export default function QueryPlanPage() {
               <Input
                 id="run-id"
                 value={runId}
-                onChange={(e) => setRunId(e.target.value)}
-                placeholder="Optional — leave blank to query the default run"
                 disabled={busy}
+                readOnly
+                placeholder="Use Reset to sample to select the demo run"
                 className="font-mono"
               />
               <p className="text-xs text-muted-foreground">
-                Identifies which extraction run to query. Leave blank if unsure.
+                DEMO_MODE uses the canonical synthetic sample. Reset it before a query.
               </p>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
+              <Button
+                variant="outline"
+                onClick={resetToSample}
+                disabled={busy}
+              >
+                {loading === "reset" ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Database className="h-4 w-4" />
+                )}
+                Reset to sample
+              </Button>
               <Button
                 variant="signal"
                 onClick={() => submit("run")}
@@ -191,6 +247,12 @@ export default function QueryPlanPage() {
                 Preview plan
               </Button>
             </div>
+
+            {sampleStatus && (
+              <p role="status" className="text-sm text-signal">
+                {sampleStatus}
+              </p>
+            )}
 
             <div className="flex flex-wrap gap-2 pt-1">
               {SAMPLE_QUESTIONS.map((q) => (
@@ -233,9 +295,9 @@ export default function QueryPlanPage() {
                     Query Plan
                   </CardTitle>
                   <Badge
-                    variant={response.planner === "llm" ? "signal" : "secondary"}
+                    variant="secondary"
                   >
-                    planner: {response.planner}
+                    planner: {response.planner === "stub" ? "deterministic demo planner" : "configured planner"}
                   </Badge>
                 </div>
                 <CardDescription>
@@ -301,6 +363,7 @@ export default function QueryPlanPage() {
                     response.rows.map((row) => (
                       <div
                         key={`${row.source_table}:${row.row_id}`}
+                        data-testid="cited-result-row"
                         className="rounded-xl border bg-card p-4"
                       >
                         <div className="flex flex-wrap items-center gap-2 text-xs">

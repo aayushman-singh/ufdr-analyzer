@@ -115,8 +115,8 @@ def build_graph_pdf(
     doc = SimpleDocTemplate(
         buf,
         pagesize=A4,
-        title="UFDR Entity Link Graph",
-        author="UFDR Analyzer",
+        title="CiteSpan Entity Link Graph",
+        author="CiteSpan",
         subject=f"content-hash:{chash}",
         leftMargin=18 * mm,
         rightMargin=18 * mm,
@@ -128,7 +128,7 @@ def build_graph_pdf(
     small = ParagraphStyle("small", parent=styles["Normal"], fontSize=8, leading=10)
     story: list = []
 
-    story.append(Paragraph("UFDR Analyzer — Entity Link Graph", styles["Title"]))
+    story.append(Paragraph("CiteSpan — Entity Link Graph", styles["Title"]))
     seed = graph.get("seed")
     scope = (
         f"Seed: <b>{_esc(seed)}</b> &nbsp;|&nbsp; max hops: {graph.get('max_hops')}"

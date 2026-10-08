@@ -1,4 +1,4 @@
-# UFDR Analyzer - Development Setup
+# CiteSpan - Development Setup
 
 ## 🚀 Quick Start
 

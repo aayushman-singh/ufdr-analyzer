@@ -1,6 +1,6 @@
-# UFDR Analyzer Backend
+# CiteSpan Backend
 
-This is the backend API for the UFDR (Universal Forensic Data Report) Analyzer tool.
+This is the backend API for CiteSpan. It analyzes UFDR (Universal Forensic Data Report) evidence.
 
 ## Project Structure
 
@@ -108,7 +108,7 @@ The application uses environment variables for configuration:
 ```bash
 # Test if the server is running
 curl http://127.0.0.1:8000/
-# Should return: {"message": "UFDR Analyzer is running!"}
+# Should return: {"message": "CiteSpan is running!"}
 ```
 
 ## Dependencies

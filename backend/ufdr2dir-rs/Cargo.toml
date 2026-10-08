@@ -2,7 +2,7 @@
 name = "ufdr2dir-rs"
 version = "0.1.11"
 edition = "2021"
-authors = ["UFDR Analyzer Team"]
+authors = ["CiteSpan Team"]
 
 [[bin]]
 name = "ufdr2dir"

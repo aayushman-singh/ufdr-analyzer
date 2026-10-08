@@ -27,20 +27,20 @@ export default function Home() {
         </div>
 
         {/* Headlines */}
-        <h2 className="text-5xl md:text-6xl font-light text-foreground tracking-tight">AI-Powered Insights</h2>
-        <h1 className="text-5xl md:text-6xl font-normal text-foreground tracking-tight mb-6">from UFDR Files</h1>
+        <h2 className="text-5xl md:text-6xl font-light text-foreground tracking-tight">Cited Evidence Insights</h2>
+        <h1 className="text-5xl md:text-6xl font-normal text-foreground tracking-tight mb-6">from a Synthetic UFDR Sample</h1>
 
         {/* Sub-description */}
         <p className="max-w-xl text-lg text-muted-foreground font-light mb-10">
-          Transform raw forensic data into actionable intelligence. Our assistant empowers investigators with natural
-          language queries and visual analysis.
+          Ask natural-language questions about the canonical synthetic sample. CiteSpan returns results linked to exact
+          evidence spans. The hosted demo does not accept file uploads.
         </p>
 
         {/* Call to Action Buttons */}
         <div className="flex flex-col sm:flex-row gap-4 mb-16">
-          <Link href="/upload">
+          <Link href="/signup">
             <button className="bg-signal text-signal-foreground font-medium py-3 px-6 rounded-lg hover:brightness-110 transition-all flex items-center justify-center gap-2 shadow-sm">
-              Start Analyzing <ArrowRight size={18} />
+              Open the demo <ArrowRight size={18} />
             </button>
           </Link>
           <button className="bg-surface-1 text-foreground font-light py-3 px-6 rounded-lg border border-border hover:bg-surface-2 transition-colors flex items-center justify-center gap-2 shadow-sm">
@@ -65,10 +65,9 @@ export default function Home() {
               FileText – Organize and Analyze
             </h3>
             <p className="mt-4 text-left text-base text-muted-foreground">
-             Upload UFDR files or forensic documents and let AI handle
-                  extraction and organization instantly. Our advanced parsing
-                  engine supports XML, HTML, SQLite, JSON, and more, creating a
-                  structured database for efficient analysis.
+              Explore the canonical synthetic UFDR sample. The hosted demo
+                  keeps upload disabled and provides reset-to-sample as its only
+                  data mutation.
             </p>
           </div>
           <img
@@ -86,8 +85,8 @@ export default function Home() {
             Powerful Search
           </h3>
           <p className="mt-4 text-left text-base text-muted-foreground">
-               Natural language search across all your data, from chats to call
-                logs, leveraging AI for precise and contextual results.
+               Natural language search across the synthetic sample, with each
+                result tied to its source row and evidence span.
           </p>
         </WobbleCard>
 
@@ -123,7 +122,7 @@ export default function Home() {
           <div className="text-center mb-12">
             <h3 className="text-3xl font-light text-foreground mb-4">See It In Action</h3>
             <p className="text-lg text-muted-foreground font-light">
-              Experience how natural language queries transform complex forensic data into clear insights
+              Experience how natural language queries return cited evidence from the synthetic sample
             </p>
           </div>
 
@@ -168,7 +167,7 @@ export default function Home() {
 
       {/* Footer */}
       <footer className="relative z-10 w-full py-8 text-center text-sm text-muted-foreground font-light">
-        <p>Powered by AI. Designed for speed and precision.</p>
+        <p>Designed for traceable evidence review.</p>
       </footer>
     </div>
   )

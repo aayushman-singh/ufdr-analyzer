@@ -1,19 +1,36 @@
+import json
 import os
 import subprocess
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from config import APP_NAME, APP_VERSION, CORS_ALLOWED_ORIGINS
+from config import APP_NAME, APP_VERSION, CORS_ALLOWED_ORIGINS, DEMO_MODE
 from fastapi.exceptions import RequestValidationError
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from meilisearch import Client as MeiliClient
-from sqlmodel import Session
+from sqlmodel import Session, select
 from dotenv import load_dotenv
 
 from database import create_db_and_tables, get_session
+from db_setup import (
+    AleappArtifact,
+    AleappReport,
+    Call,
+    CaseMembership,
+    Contact,
+    EntityIndex,
+    Media,
+    Message,
+    Query,
+    Result,
+    Run,
+    Transcript,
+    User,
+)
 from ingest.routers import (
     aleapp_structure,
     analytics_router,
@@ -32,6 +49,7 @@ from ingest.routers import (
     upload,
 )
 from ingest.services.ingest_service import IngestService
+from ingest.services.auth_service import require_user
 from ingest.utils.logger import get_logger
 
 # Load environment variables from .env file
@@ -40,6 +58,96 @@ load_dotenv(dotenv_path=env_path)
 
 logger = get_logger(__name__)
 _SENSITIVE_HEADERS = {"authorization", "cookie", "set-cookie", "x-api-key"}
+CANONICAL_DEMO_RUN_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
+CANONICAL_DEMO_FILE_NAME = "demo_synthetic.ufdr"
+CANONICAL_DEMO_OWNER_EMAIL = "citespan-demo-owner@example.invalid"
+CANONICAL_DEMO_MARKER = "citespan-synthetic-demo-v1"
+CANONICAL_DEMO_MESSAGES = (
+    (
+        "+15551234567",
+        "+15559876543",
+        "Can you send the bitcoin wallet address for the transfer?",
+    ),
+    (
+        "+15559876543",
+        "+15551234567",
+        "Use the bank transfer reference for the synthetic sample.",
+    ),
+)
+CANONICAL_DEMO_ARTIFACT = {
+    "artifact_type": "csv",
+    "filename": "whatsapp_messages.csv",
+    "file_path": "/synthetic/whatsapp_messages.csv",
+    "category": "WhatsApp messages",
+    "row_count": 1,
+    "data": json.dumps(
+        {
+            "message": "The synthetic WhatsApp message confirms the bank transfer reference."
+        },
+        sort_keys=True,
+    ),
+}
+
+
+def _validate_canonical_demo_run(session: Session, run: Run) -> User:
+    """Reject every configured run that is not the exact synthetic sample."""
+    if run.id != CANONICAL_DEMO_RUN_ID:
+        raise RuntimeError("configured demo run identity is not canonical")
+    if run.ufdr_file_name != CANONICAL_DEMO_FILE_NAME:
+        raise RuntimeError("configured demo run filename is not canonical")
+    owner = session.get(User, run.user_id)
+    if owner is None or owner.email != CANONICAL_DEMO_OWNER_EMAIL:
+        raise RuntimeError("configured demo run owner is not the canonical demo owner")
+    try:
+        metadata = json.loads(run.extraction_metadata or "")
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("configured demo run synthetic marker is invalid") from exc
+    if metadata != {
+        "citespan_marker": CANONICAL_DEMO_MARKER,
+        "owner_email": CANONICAL_DEMO_OWNER_EMAIL,
+        "sample_id": "canonical-v1",
+        "synthetic_only": True,
+    }:
+        raise RuntimeError(
+            "configured demo run synthetic marker or ownership is invalid"
+        )
+
+    messages = session.exec(select(Message).where(Message.run_id == run.id)).all()
+    observed_messages = tuple(
+        (item.sender, item.receiver, item.content)
+        for item in sorted(messages, key=lambda item: item.timestamp)
+    )
+    if observed_messages != CANONICAL_DEMO_MESSAGES:
+        raise RuntimeError(
+            "configured demo run contains non-canonical message contents"
+        )
+    artifacts = session.exec(
+        select(AleappArtifact).where(AleappArtifact.run_id == run.id)
+    ).all()
+    observed_artifacts = [
+        {key: getattr(item, key) for key in CANONICAL_DEMO_ARTIFACT}
+        for item in artifacts
+    ]
+    if observed_artifacts != [CANONICAL_DEMO_ARTIFACT]:
+        raise RuntimeError("configured demo run contains non-canonical artifacts")
+    for model in (
+        AleappReport,
+        Call,
+        Contact,
+        EntityIndex,
+        Media,
+        Query,
+        Result,
+        Transcript,
+    ):
+        if (
+            session.exec(select(model).where(model.run_id == run.id)).first()
+            is not None
+        ):
+            raise RuntimeError(
+                f"configured demo run contains a forbidden {model.__name__} row"
+            )
+    return owner
 
 
 def _redacted_headers(headers) -> dict:
@@ -93,7 +201,7 @@ app = FastAPI(
     lifespan=lifespan,
     title=APP_NAME,
     version=APP_VERSION,
-    description="Backend for AI-based UFDR Analysis Tool",
+    description="Backend for CiteSpan evidence analysis",
 )
 
 # Configure for large file uploads
@@ -132,6 +240,37 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
+
+def _demo_data_request_blocked(path: str) -> bool:
+    normalized = path.rstrip("/")
+    return (
+        normalized == "/ingest"
+        or path.startswith("/ingest/")
+        or normalized == "/api/ingest"
+        or path.startswith("/api/ingest/")
+        or normalized == "/upload"
+        or path.startswith("/upload/")
+        or path.startswith("/api/upload/")
+    )
+
+
+@app.middleware("http")
+async def enforce_demo_data_policy(request: Request, call_next):
+    """Reject every hosted-demo file and path ingestion request."""
+    if DEMO_MODE and _demo_data_request_blocked(request.url.path):
+        logger.error(
+            "Demo data policy rejected request",
+            extra={"method": request.method, "path": request.url.path},
+        )
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": "File upload and path ingestion are disabled in demo mode."
+            },
+        )
+    return await call_next(request)
+
 
 # ------------------------
 # Request Logging Middleware
@@ -275,6 +414,51 @@ async def options_handler(path: str):
 @app.get("/")
 async def root():
     return {"message": f"{APP_NAME} is running!"}
+
+
+@app.post("/demo/reset")
+def reset_demo_sample(
+    session: Session = Depends(get_session),
+    _user=Depends(require_user),
+):
+    """Return only the configured canonical synthetic run for the demo UI."""
+    if not DEMO_MODE:
+        raise HTTPException(status_code=404, detail="Demo reset is not enabled.")
+    raw_run_id = os.getenv("CITESPAN_DEMO_RUN_ID")
+    if not raw_run_id:
+        raise RuntimeError("CITESPAN_DEMO_RUN_ID is required for demo reset")
+    try:
+        run_id = uuid.UUID(raw_run_id)
+    except ValueError as exc:
+        raise RuntimeError("CITESPAN_DEMO_RUN_ID is not a valid UUID") from exc
+    if run_id != CANONICAL_DEMO_RUN_ID:
+        raise RuntimeError(
+            "CITESPAN_DEMO_RUN_ID is not the canonical synthetic identity"
+        )
+    run = session.exec(select(Run).where(Run.id == run_id)).first()
+    if run is None:
+        raise RuntimeError("configured canonical demo run does not exist")
+    owner = _validate_canonical_demo_run(session, run)
+    membership = session.exec(
+        select(CaseMembership).where(
+            CaseMembership.run_id == run_id,
+            CaseMembership.user_id == _user.id,
+        )
+    ).first()
+    if membership is None and run.user_id != _user.id:
+        session.add(
+            CaseMembership(
+                run_id=run_id,
+                user_id=_user.id,
+                role="viewer",
+                granted_by=owner.id,
+            )
+        )
+        session.commit()
+    logger.info(
+        "Demo reset selected canonical synthetic run", extra={"run_id": str(run_id)}
+    )
+    return {"run_id": str(run_id), "sample": "canonical synthetic UFDR", "reset": True}
 
 
 # ------------------------

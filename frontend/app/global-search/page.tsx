@@ -89,7 +89,7 @@ export default function GlobalSearchPage() {
             <SidebarHeader className="flex flex-col items-center gap-3 mb-4">
               <div className="flex items-center gap-2">
                 <Seal size={28} />
-                <Link href="/"><span className="text-lg font-medium text-foreground">ForensicAI</span>
+                <Link href="/"><span className="text-lg font-medium text-foreground">CiteSpan</span>
               </Link>
                 </div>
               <Button

@@ -1,6 +1,6 @@
 {
   "appId": "com.ufdr-analyzer.app",
-  "productName": "UFDR Analyzer",
+  "productName": "CiteSpan",
   "directories": {
     "output": "dist"
   },

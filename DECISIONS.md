@@ -1,4 +1,8 @@
-# DECISIONS — ufdr-analyzer
+# DECISIONS — CiteSpan
+
+The public product name is CiteSpan. The repository identity remains
+aayushman-singh/ufdr-analyzer. Any ufdr-analyzer reference below is a
+repository or legacy deployment reference.
 
 Autonomous calls made by the orchestrator. Per HANDOFF rule 1, the user is never blocked; ambitious-path choices are logged here instead.
 
@@ -48,3 +52,24 @@ Brainstormed candidates, scored on (a) investigator value, (b) wow-for-hire, (c)
 - **ROTATE the OpenRouter API key and Neo4j Aura password** that were present in `.env` — treat as compromised.
 - Fly.io + Vercel account/login, DNS — needed for real deploy (configs + runbook provided).
 - Decide whether to scrub `test_comprehensive.ufdr` (395 MB) from git history (LFS migrate or `filter-repo`) before any public push.
+
+## Dependency exposure assessment
+
+The reviewed frontend lock audit reports 0 critical, 39 high, 9 moderate, and
+1 low finding. A count of 0 critical does not prove complete safety.
+
+The hosted demo uses a static Next export behind Nginx. It does not run a Next
+server and it does not use Next image optimization. `electron` and
+`electron-builder` are development dependencies and are not part of the hosted
+runtime. The `react-d3-tree` dependency inherits a `uuid` buffer issue.
+
+The retained maintenance security release is Next 15.5.27. The `react-d3-tree`
+dependency uses `uuid.v4`; the external-buffer advisory concerns uuid v3, v5,
+and v6, so that advisory path does not match the runtime call used by this
+product. The CSS build inputs are trusted project files, not attacker-controlled
+runtime CSS.
+
+The audit counts do not prove zero risk. Remaining risk includes future
+dependency changes, runtime configuration errors, and defects in the static
+export or browser proof. The release gate must still run authentic lock
+validation and the live user-flow proof.

@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "ForensicAI — Evidence Terminal",
-  description: "UFDR Analyzer — offline forensic analysis workbench",
+  title: "CiteSpan — Evidence Terminal",
+  description: "CiteSpan — forensic evidence analysis workbench",
 };
 
 export default function RootLayout({

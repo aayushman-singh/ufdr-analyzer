@@ -98,7 +98,7 @@ export default function CrossCasePage() {
         <div className="mx-auto flex max-w-5xl items-center justify-between">
           <Link href="/" className="flex items-center gap-2">
             <Seal size={28} />
-            <span className="text-xl font-medium text-foreground">ForensicAI</span>
+            <span className="text-xl font-medium text-foreground">CiteSpan</span>
           </Link>
           <Badge variant="signal">Cross-case Correlation</Badge>
         </div>

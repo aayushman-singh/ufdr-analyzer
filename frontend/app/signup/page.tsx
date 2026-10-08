@@ -61,12 +61,12 @@ function SignupForm() {
         />
       </div>
 
-      {/* Header with ForensicAI branding */}
+      {/* Header with CiteSpan branding */}
       <header className="relative z-10 w-full px-8 py-6">
         <div className="max-w-7xl mx-auto">
           <Link href="/" className="flex items-center space-x-2 w-fit">
             <Seal size={28} />
-            <span className="text-xl font-medium text-foreground">ForensicAI</span>
+            <span className="text-xl font-medium text-foreground">CiteSpan</span>
           </Link>
         </div>
       </header>
@@ -84,7 +84,7 @@ function SignupForm() {
             {/* Create Account Header */}
             <div className="text-center mb-8">
               <h1 className="text-2xl font-semibold text-foreground mb-2">Create Account</h1>
-              <p className="text-muted-foreground">Join ForensicAI to start your investigation journey.</p>
+              <p className="text-muted-foreground">Join CiteSpan to start your investigation journey.</p>
             </div>
 
             {/* Signup Form */}

@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# UFDR Analyzer Development Setup Script
+# CiteSpan Development Setup Script
 # This script sets up the development environment
 
 set -e
 
-echo "🚀 Setting up UFDR Analyzer Development Environment..."
+echo "🚀 Setting up CiteSpan Development Environment..."
 
 # Colors for output
 RED='\033[0;31m'
@@ -70,7 +70,7 @@ fi
 # Create PostgreSQL initialization script
 print_status "Creating PostgreSQL initialization script..."
 cat > databases/postgresql/init.sql << EOF
--- UFDR Analyzer Database Initialization
+-- CiteSpan Database Initialization
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 

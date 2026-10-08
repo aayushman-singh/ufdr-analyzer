@@ -56,6 +56,7 @@ const CaseCard = ({ caseData }: { caseData: typeof analysisCases[0] }) => {
 };
 
 export default function AnalysisDashboardPage() {
+  const demoMode = process.env.NEXT_PUBLIC_DEMO_MODE === "1";
   return (
     <div className="theme-light min-h-screen w-full relative bg-background">
       {/* Signal radial background */}
@@ -90,12 +91,21 @@ export default function AnalysisDashboardPage() {
                 Manage and review your forensic analysis cases.
               </p>
             </div>
-            <Link href="/upload" passHref>
-              <button className="bg-signal text-signal-foreground font-medium py-3 px-6 rounded-lg flex items-center space-x-2 hover:brightness-110 transition-all shadow-sm">
-                <Plus className="w-5 h-5" />
-                <span>Upload UFDR File</span>
-              </button>
-            </Link>
+            {demoMode ? (
+              <Link href="/query-plan" passHref>
+                <button className="bg-signal text-signal-foreground font-medium py-3 px-6 rounded-lg flex items-center space-x-2 hover:brightness-110 transition-all shadow-sm">
+                  <Plus className="w-5 h-5" />
+                  <span>Reset to sample</span>
+                </button>
+              </Link>
+            ) : (
+              <Link href="/upload" passHref>
+                <button className="bg-signal text-signal-foreground font-medium py-3 px-6 rounded-lg flex items-center space-x-2 hover:brightness-110 transition-all shadow-sm">
+                  <Plus className="w-5 h-5" />
+                  <span>Upload UFDR File</span>
+                </button>
+              </Link>
+            )}
           </div>
 
           {/* Case Cards Grid */}

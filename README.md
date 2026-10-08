@@ -1,4 +1,4 @@
-# 🚀 AI-based UFDR Analysis Tool
+# CiteSpan - evidence analysis
 
 **Project ID:** SIH25198
 
@@ -97,7 +97,7 @@ anywhere public. See [DECISIONS.md](DECISIONS.md) for the full record.
 During digital forensic investigations, UFDR (Universal Forensic Extraction Device Report) reports obtained from seized digital devices contain massive amounts of data including chats, calls, images, and videos. Manual analysis of this data is extremely time-consuming and delays critical evidence discovery. Investigating Officers need an intelligent tool that makes this data easily searchable and actionable.
 
 ### Solution Overview
-An AI-powered software solution that:
+CiteSpan is an evidence analysis tool that:
 - **Ingests UFDRs** from forensic tools automatically
 - **Provides natural language queries** for investigators (e.g., "show me chat records containing crypto addresses")
 - **Generates readable reports** with key findings highlighted
@@ -150,7 +150,7 @@ An AI-powered software solution that:
 
 ## 🖥️ Electron Desktop Application
 
-The UFDR Analyzer is also available as a desktop application using Electron, providing native file system access and offline capabilities for forensic investigators.
+The CiteSpan desktop application is also available using Electron. It provides native file system access and offline capabilities for forensic investigators.
 
 ### **🚀 Quick Start - Electron Version**
 
@@ -241,7 +241,7 @@ npm run electron:build -- --win --mac --linux
 ```json
 {
   "appId": "com.ufdr-analyzer.app",
-  "productName": "UFDR Analyzer",
+  "productName": "CiteSpan",
   "directories": {
     "output": "dist"
   },

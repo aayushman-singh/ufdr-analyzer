@@ -109,7 +109,7 @@ export default function PatternsPage() {
         <div className="mx-auto flex max-w-5xl items-center justify-between">
           <Link href="/" className="flex items-center gap-2">
             <Seal size={28} />
-            <span className="text-xl font-medium text-foreground">ForensicAI</span>
+            <span className="text-xl font-medium text-foreground">CiteSpan</span>
           </Link>
           <Badge variant="signal">Behavioural Patterns</Badge>
         </div>
@@ -295,7 +295,7 @@ export default function PatternsPage() {
                     Findings
                   </CardTitle>
                   <CardDescription>
-                    Detected anomalies, ordered as returned by the analyzer.
+                    Detected anomalies, ordered as returned by CiteSpan.
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">

@@ -291,6 +291,7 @@ const ufdrStructure = [
 ];
 
 export default function UploadPage() {
+  const demoMode = process.env.NEXT_PUBLIC_DEMO_MODE === "1";
   const [filePath, setFilePath] = useState("");
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [showStructure, setShowStructure] = useState(false);
@@ -300,9 +301,14 @@ export default function UploadPage() {
   const [backendData, setBackendData] = useState<BackendData | null>(null);
   const [aleappStructure, setAleappStructure] = useState<AleappStructure | null>(null);
   const [isLoadingStructure, setIsLoadingStructure] = useState(false);
+  const [isResettingSample, setIsResettingSample] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
   const router = useRouter();
 
   const validateFilePath = useCallback(async (pathToValidate?: string) => {
+    if (demoMode) {
+      return;
+    }
     const path = pathToValidate || filePath;
     if (!path.trim()) {
       return;
@@ -337,17 +343,20 @@ export default function UploadPage() {
     } finally {
       setIsValidating(false);
     }
-  }, [filePath]);
+  }, [demoMode, filePath]);
 
   // Auto-validate file path when it changes
   useEffect(() => {
+    if (demoMode) {
+      return;
+    }
     if (filePath.trim()) {
       const timeoutId = setTimeout(() => {
         validateFilePath();
       }, 1000);
       return () => clearTimeout(timeoutId);
     }
-  }, [filePath, validateFilePath]);
+  }, [demoMode, filePath, validateFilePath]);
 
   const handleFilePathChange = (path: string) => {
     setFilePath(path);
@@ -355,6 +364,9 @@ export default function UploadPage() {
   };
 
   const handleSelectFile = async () => {
+    if (demoMode) {
+      throw new Error("Upload disabled in the synthetic demo");
+    }
     if (window.electronAPI) {
       const selectedPath = await window.electronAPI.selectFile();
       if (selectedPath) {
@@ -369,6 +381,9 @@ export default function UploadPage() {
   };
 
   const handleStartAnalysis = async () => {
+    if (demoMode) {
+      throw new Error("Upload disabled in the synthetic demo");
+    }
     if (!filePath.trim()) {
       alert("Please enter a file path first.");
       return;
@@ -442,6 +457,39 @@ export default function UploadPage() {
     router.push("/dashboard");
   };
 
+  const handleResetToSample = async () => {
+    setIsResettingSample(true);
+    setResetError(null);
+    try {
+      const response = await authedFetch("/api/demo/reset", {
+        method: "POST",
+        credentials: "include",
+      });
+      const body = (await response.json()) as {
+        run_id?: string;
+        sample?: string;
+        reset?: boolean;
+        detail?: string;
+      };
+      if (!response.ok) {
+        throw new Error(body.detail || `Demo reset failed: ${response.status}`);
+      }
+      if (
+        body.run_id !== "11111111-1111-4111-8111-111111111111" ||
+        body.sample !== "canonical synthetic UFDR" ||
+        body.reset !== true
+      ) {
+        throw new Error("Demo reset did not return the canonical synthetic run.");
+      }
+      localStorage.setItem("citespan.demo.run_id", body.run_id);
+      router.push("/query-plan/");
+    } catch (error: unknown) {
+      setResetError(error instanceof Error ? error.message : "Demo reset failed.");
+    } finally {
+      setIsResettingSample(false);
+    }
+  };
+
   return (
     <div className="min-h-screen w-full relative bg-background">
       {/* Signal Glow Top */}
@@ -466,14 +514,34 @@ export default function UploadPage() {
         <Header />
 
         <main className="max-w-7xl mx-auto px-8 py-16">
-          {!showStructure ? (
+          {demoMode ? (
+            <div className="mx-auto max-w-2xl rounded-xl border border-info/30 bg-info/10 p-8 text-center">
+              <h1 className="mb-4 text-4xl font-light text-foreground">Synthetic demo</h1>
+              <p className="mb-6 text-lg text-muted-foreground">
+                Upload disabled in the synthetic demo. Use Reset to sample to load the canonical synthetic UFDR data.
+              </p>
+              {resetError ? (
+                <p role="alert" className="mb-4 text-sm text-destructive">
+                  {resetError}
+                </p>
+              ) : null}
+              <Button
+                variant="signal"
+                size="lg"
+                onClick={handleResetToSample}
+                disabled={isResettingSample}
+              >
+                {isResettingSample ? "Loading sample..." : "Reset to sample"}
+              </Button>
+            </div>
+          ) : !showStructure ? (
             <>
               <div className="text-center mb-12">
                 <h1 className="text-4xl font-light text-foreground mb-4">
                   Process UFDR File
                 </h1>
                 <p className="text-lg text-muted-foreground font-light">
-                  Enter the server file path to begin AI-powered analysis
+                   Enter the server file path to begin forensic analysis
                 </p>
               </div>
 

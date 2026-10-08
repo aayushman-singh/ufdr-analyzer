@@ -52,12 +52,12 @@ function LoginForm() {
         />
       </div>
 
-      {/* Header with ForensicAI branding */}
+      {/* Header with CiteSpan branding */}
       <header className="relative z-10 w-full px-8 py-6">
         <div className="max-w-7xl mx-auto">
           <Link href="/" className="flex items-center space-x-2 w-fit">
             <Seal size={28} />
-            <span className="text-xl font-medium text-foreground">ForensicAI</span>
+            <span className="text-xl font-medium text-foreground">CiteSpan</span>
           </Link>
         </div>
       </header>

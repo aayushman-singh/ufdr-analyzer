@@ -267,7 +267,7 @@ Be conversational, intelligent, and USE ALEAPP ARTIFACTS for app queries!"""
         if self.provider == "openrouter":
             request_params["extra_headers"] = {
                 "HTTP-Referer": "https://github.com/aayushman-singh/ufdr-analyzer",
-                "X-Title": "UFDR Analyzer",
+                "X-Title": "CiteSpan",
             }
 
         response = self.client.chat.completions.create(**request_params)
@@ -411,7 +411,7 @@ CRITICAL: If results are from ALEAPP artifacts:
                 if self.provider == "openrouter":
                     request_params["extra_headers"] = {
                         "HTTP-Referer": "https://github.com/aayushman-singh/ufdr-analyzer",
-                        "X-Title": "UFDR Analyzer",
+                        "X-Title": "CiteSpan",
                     }
 
                 response = self.client.chat.completions.create(**request_params)

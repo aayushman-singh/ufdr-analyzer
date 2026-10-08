@@ -33,7 +33,7 @@ class ReportService:
 
         # === Title ===
         c.setFont("Helvetica-Bold", 16)
-        c.drawString(50, height - 50, f"UFDR Report - Run ID: {data.get('run_id')}")
+        c.drawString(50, height - 50, f"CiteSpan Report - Run ID: {data.get('run_id')}")
 
         # === Run Details ===
         c.setFont("Helvetica", 12)

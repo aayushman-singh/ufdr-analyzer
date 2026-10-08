@@ -7,6 +7,7 @@ rather than silently falling back to a dev default (see project no-fallback rule
 Non-secret connection params (host/port/db name) keep sensible local-dev
 defaults that match `docker-compose.dev.yml`.
 """
+
 import os
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -18,8 +19,14 @@ _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(dotenv_path=_ENV_PATH)
 
 # Sentinel values that mean "you forgot to fill this in" — never accepted.
-_PLACEHOLDERS = {"change_me", "changeme", "your_secure_postgres_password",
-                 "your_very_secure_secret_key_here", "password", "masterkey"}
+_PLACEHOLDERS = {
+    "change_me",
+    "changeme",
+    "your_secure_postgres_password",
+    "your_very_secure_secret_key_here",
+    "password",
+    "masterkey",
+}
 
 
 def _opt(name: str, default: str) -> str:
@@ -51,7 +58,7 @@ for folder in [JSON_STORAGE, REPORT_STORAGE, TMP_STORAGE]:
 # ------------------------
 # API / App Settings
 # ------------------------
-APP_NAME = "UFDR Analyzer"
+APP_NAME = "CiteSpan"
 APP_VERSION = "0.1.0"
 HOST = _opt("HOST", "127.0.0.1")
 PORT = int(_opt("PORT", "8000"))

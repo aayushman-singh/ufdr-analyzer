@@ -8,7 +8,7 @@ export default function Header() {
         <Link href="/">
           <div className="flex items-center space-x-2">
             <Seal size={28} />
-            <span className="text-xl font-medium text-foreground">ForensicAI</span>
+            <span className="text-xl font-medium text-foreground">CiteSpan</span>
           </div>
         </Link>
 

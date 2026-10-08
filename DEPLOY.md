@@ -1,4 +1,4 @@
-# DEPLOY — ufdr-analyzer slim demo profile
+# DEPLOY — CiteSpan slim demo profile
 
 Runbook for the **slim demo profile**: a public, read-only demo with one
 canonical synthetic UFDR pre-loaded.
@@ -10,6 +10,10 @@ Next.js (Vercel, static export)  →  FastAPI (Fly.io)  →  Postgres + Meilisea
 NOT in this profile: Neo4j, Celery, Redis, nginx. Graph reads use a Postgres
 recursive CTE; ingest runs inline. Upload is disabled (`DEMO_MODE=1`); the only
 mutation a visitor can trigger is the "Reset to sample" button.
+
+The public product name is CiteSpan. Commands and URLs that use `ufdr-analyzer`
+below are repository or legacy deployment references. They do not rename the
+public product or replace existing legacy links.
 
 Every env var name in this document matches `backend/config.py` exactly.
 

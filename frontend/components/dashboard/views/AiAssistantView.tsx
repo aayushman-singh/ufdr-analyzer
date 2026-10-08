@@ -44,7 +44,7 @@ export function AiAssistantView({
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="mb-2 text-4xl font-light tracking-tight text-foreground">AI Assistant</h2>
+        <h2 className="mb-2 text-4xl font-light tracking-tight text-foreground">Evidence Query</h2>
         <p className="text-lg font-light text-muted-foreground">
           Ask questions about your forensic data in natural language
         </p>
@@ -55,9 +55,12 @@ export function AiAssistantView({
             <CardHeader className="border-b bg-card">
               <CardTitle className="flex items-center gap-2 font-medium text-foreground">
                 <Bot className="h-5 w-5 text-signal" />
-                Forensic AI Chat
+                Deterministic Evidence Query
               </CardTitle>
             </CardHeader>
+            <div className="border-b bg-info/10 px-6 py-3 text-sm text-muted-foreground">
+              Demo limit: CiteSpan uses a deterministic planner over synthetic data. It does not run a live large language model.
+            </div>
             <CardContent className="flex flex-1 flex-col overflow-hidden p-0">
               {/* The ref is attached to the scrollable div here */}
               <div ref={chatContainerRef} className="flex-1 space-y-4 overflow-y-auto p-4">

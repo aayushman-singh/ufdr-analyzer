@@ -80,8 +80,8 @@ def build_evidence_pdf(
     doc = SimpleDocTemplate(
         buf,
         pagesize=A4,
-        title="UFDR Evidence Report",
-        author="UFDR Analyzer",
+        title="CiteSpan Evidence Report",
+        author="CiteSpan",
         subject=f"content-hash:{chash}",
         leftMargin=18 * mm,
         rightMargin=18 * mm,
@@ -93,7 +93,7 @@ def build_evidence_pdf(
     small = ParagraphStyle("small", parent=styles["Normal"], fontSize=8, leading=10)
     story: list = []
 
-    story.append(Paragraph("UFDR Analyzer — Evidence Report", styles["Title"]))
+    story.append(Paragraph("CiteSpan — Evidence Report", styles["Title"]))
     story.append(
         Paragraph(
             f"Question: <b>{_esc(answer.get('question', ''))}</b>", styles["Normal"]

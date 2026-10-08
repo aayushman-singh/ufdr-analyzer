@@ -306,7 +306,7 @@ export function GraphAnalysisView() {
           <Card>
             <CardHeader>
               <CardTitle>Network Insights</CardTitle>
-              <CardDescription>AI-powered analysis of network patterns</CardDescription>
+              <CardDescription>Deterministic network metrics from the available evidence. No live AI analysis is active.</CardDescription>
             </CardHeader>
             <CardContent>
               <div className="space-y-4">

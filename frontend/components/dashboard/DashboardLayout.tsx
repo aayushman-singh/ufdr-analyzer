@@ -99,7 +99,7 @@ export function DashboardLayout() {
       
       setChatMessages(prev => prev.map(msg => (msg.id === loadingMessageId ? aiResponse : msg)))
     } catch (error: unknown) {
-      console.error("Failed to fetch AI response:", error)
+      console.error("Failed to fetch query response:", error)
       const errorMessage: ChatMessage = {
         id: loadingMessageId,
         type: "assistant",
@@ -148,7 +148,7 @@ export function DashboardLayout() {
             <div className="flex items-center gap-2 p-2">
               <Seal size={28} />
               <Link href="/">
-                <span className="text-sm font-medium">ForensicAI</span>
+                <span className="text-sm font-medium">CiteSpan</span>
               </Link>
             </div>
           </SidebarHeader>

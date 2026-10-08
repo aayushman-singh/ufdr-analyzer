@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# UFDR Analyzer Production Setup Script
+# CiteSpan Production Setup Script
 # This script sets up the production environment
 
 set -e
 
-echo "🚀 Setting up UFDR Analyzer Production Environment..."
+echo "🚀 Setting up CiteSpan Production Environment..."
 
 # Colors for output
 RED='\033[0;31m'
