@@ -58,6 +58,54 @@ DEPLOY_DOMAIN = "citespan.169.58.64.150.nip.io"
 DEPLOYMENT_METADATA = f"{DEPLOY_PATH}/.citespan-deployment.json"
 DEMO_MARKER = f"{DEPLOY_PATH}/.citespan-demo-marker.json"
 EXTERNAL_PROOF_ROOT = Path.home() / ".citespan" / "release-proof"
+MINIO_SOURCE_REPOSITORY = "https://github.com/minio/minio.git"
+MINIO_SOURCE_REVISION = "RELEASE.2025-10-15T17-29-55Z"
+MINIO_SOURCE_COMMIT = "9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a"
+MINIO_BUILDER_IMAGE = "golang:1.27.2-alpine3.24@sha256:85dc1069ac644ea3c527b177303a406eb3358192816cd7f9e5848eb658851673"
+MINIO_RUNTIME_IMAGE = "alpine:3.22.6@sha256:3e9b4b680bfc9fb5269227cffbd6d42be39fbf7c0b908123913864aa4447e764"
+MINIO_IMAGE = "citespan-minio-source:RELEASE.2025-10-15T17-29-55Z"
+MINIO_BUILD_PROVENANCE = {
+    "source_repository": MINIO_SOURCE_REPOSITORY,
+    "source_tag": MINIO_SOURCE_REVISION,
+    "source_commit": MINIO_SOURCE_COMMIT,
+    "builder_image": MINIO_BUILDER_IMAGE,
+    "runtime_image": MINIO_RUNTIME_IMAGE,
+    "builder_provenance": "Docker Official Image golang:1.27.2-alpine3.24 index digest verified 2026-10-09",
+    "runtime_provenance": (
+        "Docker Official Image alpine:3.22.6 linux/amd64 manifest digest "
+        "sha256:3e9b4b680bfc9fb5269227cffbd6d42be39fbf7c0b908123913864aa4447e764 "
+        "verified from https://github.com/docker-library/repo-info/blob/master/repos/alpine/remote/3.22.6.md"
+    ),
+}
+IMMUTABLE_SOURCE_COMMITS = {"MINIO_SOURCE_COMMIT": MINIO_SOURCE_COMMIT}
+IMMUTABLE_MINIO_IMAGES = {
+    "MINIO_BUILDER_IMAGE": MINIO_BUILDER_IMAGE,
+    "MINIO_RUNTIME_IMAGE": MINIO_RUNTIME_IMAGE,
+}
+
+
+def _validate_immutable_source_commits(
+    source_commits: dict[str, object] | None = None,
+) -> None:
+    """Reject source identities that are not complete hexadecimal commits."""
+    values = IMMUTABLE_SOURCE_COMMITS if source_commits is None else source_commits
+    for name, value in values.items():
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40}", value) is None:
+            raise RuntimeError(
+                f"release blocked: invalid immutable source commit: {name}"
+            )
+
+
+def _validate_immutable_minio_images() -> None:
+    """Reject changed, malformed, or mutable MinIO build identities."""
+    for name, expected in IMMUTABLE_MINIO_IMAGES.items():
+        value = globals()[name]
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"[^:@\s]+:[^@\s]+@sha256:[0-9a-f]{64}", value) is None
+            or value != expected
+        ):
+            raise RuntimeError(f"release blocked: invalid immutable image identity: {name}")
 CANONICAL_DEMO_RUN_ID = "11111111-1111-4111-8111-111111111111"
 CANONICAL_DEMO_ARTIFACT_ROW_ID = "22222222-2222-4222-8222-222222222222"
 CANONICAL_DEMO_MESSAGE_ROW_IDS = (
@@ -1988,6 +2036,98 @@ python3 -c {receipt_writer} "$receipt" "$runtime" "$CITESPAN_SYNTHETIC_MARKER" "
 """
 
 
+def _minio_source_build_definition() -> str:
+    """Return the controlled Dockerfile that compiles the official MinIO source."""
+    _validate_immutable_source_commits()
+    _validate_immutable_minio_images()
+    return f"""FROM {MINIO_BUILDER_IMAGE} AS builder
+WORKDIR /src
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /out/minio ./ && chmod 0755 /out/minio
+
+FROM {MINIO_RUNTIME_IMAGE}
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /out/minio /usr/bin/minio
+VOLUME [\"/data\"]
+ENTRYPOINT [\"/usr/bin/minio\"]
+CMD [\"server\", \"/data\"]
+"""
+
+
+def _minio_source_preflight_script() -> str:
+    """Return a fail-closed, temporary-only MinIO source build preflight."""
+    _validate_immutable_source_commits()
+    definition = base64.b64encode(_minio_source_build_definition().encode()).decode()
+    return f"""minio_source_preflight() {{
+    command -v docker >/dev/null 2>&1 || {{ echo 'source build dependency unavailable: docker' >&2; exit 1; }}
+    command -v git >/dev/null 2>&1 || {{ echo 'source build dependency unavailable: git' >&2; exit 1; }}
+    work_dir=$(mktemp -d)
+    trap 'rm -rf \"$work_dir\"' RETURN
+    if ! git clone --quiet --filter=blob:none --branch {shlex.quote(MINIO_SOURCE_REVISION)} --depth 1 {shlex.quote(MINIO_SOURCE_REPOSITORY)} \"$work_dir/minio\"; then
+        echo 'minio source checkout failed' >&2
+        exit 1
+    fi
+    source_revision=$(git -C \"$work_dir/minio\" rev-parse HEAD 2>/dev/null) || {{ echo 'minio source checkout failed: revision unavailable' >&2; exit 1; }}
+    case \"$source_revision\" in
+        {MINIO_SOURCE_COMMIT}) ;;
+        *) echo 'minio source checkout failed: verified revision mismatch' >&2; exit 1 ;;
+    esac
+    printf %s {shlex.quote(definition)} | base64 -d > \"$work_dir/minio/Dockerfile.citespan\" || {{ echo 'minio source build definition failed' >&2; exit 1; }}
+    docker pull {shlex.quote(MINIO_BUILDER_IMAGE)} >/dev/null 2>&1 || {{ echo 'source build dependency unavailable: official builder image' >&2; exit 1; }}
+    docker pull {shlex.quote(MINIO_RUNTIME_IMAGE)} >/dev/null 2>&1 || {{ echo 'source build dependency unavailable: official runtime image' >&2; exit 1; }}
+    if ! docker build --pull=false --file \"$work_dir/minio/Dockerfile.citespan\" --tag {shlex.quote(MINIO_IMAGE)} \"$work_dir/minio\" >/dev/null; then
+        echo 'minio source compilation failed' >&2
+        exit 1
+    fi
+    minio_image={shlex.quote(MINIO_IMAGE)}
+}}
+"""
+
+
+def _authoritative_reconciliation_script(receipt_writer_source: str) -> str:
+    """Return shell checks that preserve compatible partial data resources."""
+    receipt_writer = shlex.quote(receipt_writer_source)
+    return f"""reconcile_authoritative_resources() {{
+    if docker network inspect \"$authoritative_network\" >/dev/null 2>&1; then
+        python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" network created
+    elif [ \"$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))[\"resources\"][\"network\"][\"created\"]))' \"$receipt\")\" -eq 1 ]; then
+        echo 'incompatible authoritative network: receipt owns a missing network' >&2
+        exit 1
+    else
+        docker network create \"$authoritative_network\"
+        python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" network created
+    fi
+    for service in postgres meili minio; do
+        case \"$service\" in
+            postgres) container=\"$authoritative_postgres\"; expected_image=postgres:17-alpine; volume=citespan-postgres-data; image_field=postgres ;;
+            meili) container=\"$authoritative_meili\"; expected_image=getmeili/meilisearch:v1.15; volume=citespan-meili-data; image_field=meili ;;
+            minio) container=\"$authoritative_minio\"; expected_image=\"$minio_image\"; volume=citespan-minio-data; image_field=minio ;;
+        esac
+        if docker inspect \"$container\" >/dev/null 2>&1; then
+            docker inspect \"$container\" | python3 -c 'import json, os, sys
+data = json.load(sys.stdin)[0]
+service, expected_image, network, volume = sys.argv[1:5]
+if data.get("Config", {{}}).get("Image") != expected_image:
+    raise SystemExit(f"incompatible authoritative {{service}} image")
+if set(data.get("NetworkSettings", {{}}).get("Networks", {{}})) != {{network}}:
+    raise SystemExit(f"incompatible authoritative {{service}} network")
+destinations = {{"postgres": "/var/lib/postgresql/data", "meili": "/meili_data", "minio": "/data"}}
+mounts = data.get("Mounts", [])
+expected_mount = {{"Type": "volume", "Name": volume, "Destination": destinations[service], "RW": True}}
+if len(mounts) != 1 or any(mount.get(key) != value for mount in mounts for key, value in expected_mount.items()):
+    raise SystemExit(f"incompatible authoritative {{service}} volume")
+env = {{item.split("=", 1)[0]: item.split("=", 1)[1] for item in data.get("Config", {{}}).get("Env", []) if "=" in item}}
+required = {{"postgres": ("POSTGRES_USER", "POSTGRES_DB", "POSTGRES_PASSWORD"), "meili": ("MEILI_MASTER_KEY",), "minio": ("MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY")}}[service]
+if any(env.get(key) != os.environ.get(key) for key in required):
+    raise SystemExit(f"incompatible authoritative {{service}} credentials")
+' \"$service\" \"$expected_image\" \"$authoritative_network\" \"$volume\"
+            python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" \"$image_field\" created
+        fi
+    done
+}}
+"""
+
+
 def _deployment_command_authoritative(payload: dict[str, Any]) -> str:
     """Build a candidate-only transaction over one authoritative data-service state."""
     expected_commit = _expected_commit(payload)
@@ -2011,8 +2151,11 @@ def _deployment_command_authoritative(payload: dict[str, Any]) -> str:
     port_check = shlex.quote(_compose_backend_port_validation_script())
     runtime_check = shlex.quote(_runtime_validation_script(history_values))
     origin_check = shlex.quote(_remote_origin_check_script())
-    receipt_writer = shlex.quote(_receipt_writer())
+    receipt_writer_source = _receipt_writer()
+    receipt_writer = shlex.quote(receipt_writer_source)
     receipt_validate = shlex.quote(_receipt_validate())
+    minio_preflight = _minio_source_preflight_script()
+    reconciliation = _authoritative_reconciliation_script(receipt_writer_source)
     rollback_script = f"""rollback() {{
     status=$?
     if [ "$status" -ne 0 ]; then
@@ -2104,6 +2247,8 @@ trap rollback EXIT
     command = (
         "set -Eeuo pipefail; failed_step=bootstrap; route_active=0; route_switched=0; rollback_incomplete=0; cutover_committed=0; cleanup_failed=0; "
         "trap 'failed_step=\"$BASH_COMMAND\"' ERR; "
+        + minio_preflight
+        + " minio_source_preflight; "
         f"domain={domain}; expected={expected}; run_id={run_id}; "
         f"test -f /etc/caddy/Caddyfile; if [ ! -d {DEPLOY_PATH}/.git ]; then git clone {shlex.quote(DEPLOY_REPOSITORY)} {DEPLOY_PATH}; fi; "
         f"test -d {DEPLOY_PATH}/.git; if ! origin_url=$(git -C {DEPLOY_PATH} config --get remote.origin.url 2>/dev/null); then echo 'release blocked: origin lookup failed' >&2; exit 1; fi; test -n \"$origin_url\"; verified_origin=$(CITESPAN_ORIGIN_URL=\"$origin_url\" python3 -c {origin_check}); test \"$verified_origin\" = aayushman-singh/ufdr-analyzer; "
@@ -2138,10 +2283,12 @@ trap rollback EXIT
         "else\n"
         "authoritative_network=citespan-authoritative-network; authoritative_postgres=citespan-authoritative-postgres; authoritative_meili=citespan-authoritative-meili; authoritative_minio=citespan-authoritative-minio; "
         f"if [ -f \"$receipt\" ]; then python3 -c {receipt_validate} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\"; else python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\"; fi; "
+        + reconciliation
+        + " reconcile_authoritative_resources; "
         f"readiness_evidence=\"$backup_dir/readiness-evidence.log\"; umask 077; : > \"$readiness_evidence\"; chmod 600 \"$readiness_evidence\"; sanitize_probe_output() {{ local value=\"$1\"; value=${{value//$NEO4J_PASSWORD/[REDACTED]}}; value=${{value//$POSTGRES_PASSWORD/[REDACTED]}}; value=${{value//$MEILI_MASTER_KEY/[REDACTED]}}; value=${{value//$MINIO_ROOT_USER/[REDACTED]}}; value=${{value//$MINIO_ROOT_PASSWORD/[REDACTED]}}; printf '%s' \"$value\"; }}; if [ \"$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))[\"resources\"][\"network\"][\"created\"]))' \"$receipt\")\" -eq 0 ]; then if docker network inspect \"$authoritative_network\" >/dev/null 2>&1; then echo 'authoritative receipt does not own existing network' >&2; exit 1; fi; docker network create \"$authoritative_network\"; python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" network created; fi; docker network inspect \"$authoritative_network\" >/dev/null; "
         f"if [ \"$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))[\"resources\"][\"postgres\"][\"created\"]))' \"$receipt\")\" -eq 0 ]; then if docker inspect \"$authoritative_postgres\" >/dev/null 2>&1; then echo 'authoritative receipt does not own existing PostgreSQL container' >&2; exit 1; fi; docker run -d --name \"$authoritative_postgres\" --network \"$authoritative_network\" -e POSTGRES_USER=\"$POSTGRES_USER\" -e POSTGRES_DB=\"$POSTGRES_DB\" -e POSTGRES_PASSWORD=\"$POSTGRES_PASSWORD\" -v citespan-postgres-data:/var/lib/postgresql/data postgres:17-alpine; python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" postgres created; fi; test -n \"$(docker inspect -f '{{.Name}}' \"$authoritative_postgres\")\"; "
         f"if [ \"$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))[\"resources\"][\"meili\"][\"created\"]))' \"$receipt\")\" -eq 0 ]; then if docker inspect \"$authoritative_meili\" >/dev/null 2>&1; then echo 'authoritative receipt does not own Meilisearch container' >&2; exit 1; fi; docker run -d --name \"$authoritative_meili\" --network \"$authoritative_network\" -e MEILI_MASTER_KEY=\"$MEILI_MASTER_KEY\" -v citespan-meili-data:/meili_data getmeili/meilisearch:v1.15; python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" meili created; fi; test -n \"$(docker inspect -f '{{.Name}}' \"$authoritative_meili\")\"; "
-        f"if [ \"$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))[\"resources\"][\"minio\"][\"created\"]))' \"$receipt\")\" -eq 0 ]; then if docker inspect \"$authoritative_minio\" >/dev/null 2>&1; then echo 'authoritative receipt does not own MinIO container' >&2; exit 1; fi; docker run -d --name \"$authoritative_minio\" --network \"$authoritative_network\" -e MINIO_ROOT_USER=\"$MINIO_ROOT_USER\" -e MINIO_ROOT_PASSWORD=\"$MINIO_ROOT_PASSWORD\" -e MINIO_ACCESS_KEY=\"$MINIO_ROOT_USER\" -e MINIO_SECRET_KEY=\"$MINIO_ROOT_PASSWORD\" -v citespan-minio-data:/data minio/minio server /data; python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" minio created; fi; test -n \"$(docker inspect -f '{{.Name}}' \"$authoritative_minio\")\"; "
+        f"if [ \"$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))[\"resources\"][\"minio\"][\"created\"]))' \"$receipt\")\" -eq 0 ]; then if docker inspect \"$authoritative_minio\" >/dev/null 2>&1; then echo 'authoritative receipt does not own MinIO container' >&2; exit 1; fi; docker run -d --name \"$authoritative_minio\" --network \"$authoritative_network\" -e MINIO_ROOT_USER=\"$MINIO_ROOT_USER\" -e MINIO_ROOT_PASSWORD=\"$MINIO_ROOT_PASSWORD\" -e MINIO_ACCESS_KEY=\"$MINIO_ROOT_USER\" -e MINIO_SECRET_KEY=\"$MINIO_ROOT_PASSWORD\" -v citespan-minio-data:/data \"$minio_image\" server /data; python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" minio created; fi; test -n \"$(docker inspect -f '{{.Name}}' \"$authoritative_minio\")\"; "
         "failed_step=readiness-postgresql; postgres_ready=0; last_readiness_cause=; for readiness_attempt in $(seq 1 30); do set +e; readiness_output=$(docker exec \"$authoritative_postgres\" env PGPASSWORD=\"$POSTGRES_PASSWORD\" pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" 2>&1); readiness_status=$?; set -e; last_readiness_cause=$(sanitize_probe_output \"$readiness_output\"); printf '%s\n' \"service=postgres identity=$authoritative_postgres attempt=$readiness_attempt status=$readiness_status cause=$last_readiness_cause\" >> \"$readiness_evidence\"; if [ \"$readiness_status\" -eq 0 ] && printf '%s' \"$readiness_output\" | grep -q accepting; then postgres_ready=1; break; fi; if [ \"$readiness_status\" -eq 127 ] || printf '%s' \"$readiness_output\" | grep -Eqi 'not found|invalid|malformed|authentication|permission denied|wrong identity'; then echo \"readiness failed: PostgreSQL permanent probe fault; cause=$last_readiness_cause; see $readiness_evidence\" >&2; exit 1; fi; sleep 1; done; test \"$postgres_ready\" -eq 1 || { echo \"readiness failed: PostgreSQL timed out; last_cause=$last_readiness_cause; see $readiness_evidence\" >&2; exit 1; }; python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" postgres ready; "
         "failed_step=readiness-meilisearch; meili_ready=0; last_readiness_cause=; for readiness_attempt in $(seq 1 30); do set +e; readiness_output=$(docker exec \"$authoritative_meili\" sh -c 'wget --header=\"Authorization: Bearer $MEILI_MASTER_KEY\" -qO- http://127.0.0.1:7700/health' 2>&1); readiness_status=$?; set -e; last_readiness_cause=$(sanitize_probe_output \"$readiness_output\"); printf '%s\n' \"service=meili identity=$authoritative_meili attempt=$readiness_attempt status=$readiness_status cause=$last_readiness_cause\" >> \"$readiness_evidence\"; if [ \"$readiness_status\" -eq 0 ] && printf '%s' \"$readiness_output\" | grep -q available; then meili_ready=1; break; fi; if [ \"$readiness_status\" -eq 127 ] || printf '%s' \"$readiness_output\" | grep -Eqi 'not found|invalid|malformed|unauthorized|authentication|permission denied|wrong identity'; then echo \"readiness failed: Meilisearch permanent probe fault; cause=$last_readiness_cause; see $readiness_evidence\" >&2; exit 1; fi; sleep 1; done; test \"$meili_ready\" -eq 1 || { echo \"readiness failed: Meilisearch timed out; last_cause=$last_readiness_cause; see $readiness_evidence\" >&2; exit 1; }; python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" meili ready; "
         "failed_step=readiness-minio; minio_ready=0; last_readiness_cause=; for readiness_attempt in $(seq 1 30); do set +e; readiness_output=$(docker exec \"$authoritative_minio\" sh -c 'wget --user=\"$MINIO_ROOT_USER\" --password=\"$MINIO_ROOT_PASSWORD\" -qO- http://127.0.0.1:9000/minio/health/live' 2>&1); readiness_status=$?; set -e; last_readiness_cause=$(sanitize_probe_output \"$readiness_output\"); printf '%s\n' \"service=minio identity=$authoritative_minio attempt=$readiness_attempt status=$readiness_status cause=$last_readiness_cause\" >> \"$readiness_evidence\"; if [ \"$readiness_status\" -eq 0 ] && printf '%s' \"$readiness_output\" | grep -q -E 'OK|live|success'; then minio_ready=1; break; fi; if [ \"$readiness_status\" -eq 127 ] || printf '%s' \"$readiness_output\" | grep -Eqi 'not found|invalid|malformed|unauthorized|authentication|permission denied|wrong identity'; then echo \"readiness failed: MinIO permanent probe fault; cause=$last_readiness_cause; see $readiness_evidence\" >&2; exit 1; fi; sleep 1; done; test \"$minio_ready\" -eq 1 || { echo \"readiness failed: MinIO timed out; last_cause=$last_readiness_cause; see $readiness_evidence\" >&2; exit 1; }; python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" minio ready; fi\n"

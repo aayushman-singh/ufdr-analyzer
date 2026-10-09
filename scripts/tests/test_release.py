@@ -1299,7 +1299,22 @@ def test_generated_recovery_runs_real_bash_and_preserves_prior_state(bash_tmp_pa
         encoding="utf-8",
     )
     (bin_root / "git").write_text(
-        f"#!/bin/sh\nprintf '%s\\n' \"git $*\" >> \"$CALL_LOG\"\ncase \"$1\" in -C) shift 2;; esac\ncase \"$1\" in\n  config) echo git@github.com:aayushman-singh/ufdr-analyzer.git ;;\n  rev-parse) echo {EXPECTED_COMMIT} ;;\n  fetch|checkout) exit 0 ;;\n  *) exit 64 ;;\nesac\nexit 0\n",
+        f"#!/bin/sh\nprintf '%s\\n' \"git $*\" >> \"$CALL_LOG\"\n"
+        "checkout_path=\n"
+        "if [ \"$1\" = -C ]; then checkout_path=$2; shift 2; fi\n"
+        "case \"$1\" in\n"
+        "  clone)\n"
+        "    [ \"$2\" = --quiet ] && [ \"$3\" = --filter=blob:none ] && [ \"$4\" = --branch ] && "
+        f"[ \"$5\" = {release.MINIO_SOURCE_REVISION} ] && [ \"$6\" = --depth ] && [ \"$7\" = 1 ] && "
+        f"[ \"$8\" = {release.MINIO_SOURCE_REPOSITORY} ] || exit 64\n"
+        "    mkdir -p \"$9\" || exit 64\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  config) echo git@github.com:aayushman-singh/ufdr-analyzer.git ;;\n"
+        f"  rev-parse) case \"$checkout_path\" in */minio) echo {release.MINIO_SOURCE_COMMIT} ;; *) echo {EXPECTED_COMMIT} ;; esac ;;\n"
+        "  fetch|checkout) exit 0 ;;\n"
+        "  *) exit 64 ;;\n"
+        "esac\nexit 0\n",
         encoding="utf-8",
     )
     project_python = _bash_path(Path(PYTHON))
@@ -1382,6 +1397,9 @@ def test_generated_recovery_runs_real_bash_and_preserves_prior_state(bash_tmp_pa
         )
     compose_calls = [index for index, call in enumerate(calls) if "compose" in call]
     assert compose_calls, f"{failure} did not invoke Compose\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}\ncalls:\n{calls}"
+    assert any(f"pull {release.MINIO_BUILDER_IMAGE}" in call for call in calls)
+    assert any(f"pull {release.MINIO_RUNTIME_IMAGE}" in call for call in calls)
+    assert any(f"--tag {release.MINIO_IMAGE}" in call for call in calls)
     assert not any("volume rm" in call for call in calls)
     if failure == "pre_cutover":
         up_index = next(index for index, call in enumerate(calls) if "up -d --no-deps --build backend" in call)
@@ -1389,7 +1407,7 @@ def test_generated_recovery_runs_real_bash_and_preserves_prior_state(bash_tmp_pa
         assert "injected failure: pre_cutover" in result.stderr
         assert "injected failure: pre_cutover" in calls
     else:
-        https_index = next(index for index, call in enumerate(calls) if "https://" in call)
+        https_index = next(index for index, call in enumerate(calls) if "https://citespan.example" in call)
         assert compose_calls[0] < https_index
         assert any("down --remove-orphans" in call for call in calls)
         assert "injected failure: post_cutover" in result.stderr or "deployment failed at" in result.stderr
@@ -2414,6 +2432,246 @@ def test_deployment_command_uses_authoritative_data_services():
     assert "CITESPAN_SYNTHETIC_ONLY" in command
     assert "CITESPAN_SYNTHETIC_MARKER" in release._compose_override(valid_payload())
     assert "--no-deps --build backend" in command
+
+
+def test_minio_build_provenance_pins_official_source_and_base_images():
+    definition = release._minio_source_build_definition()
+
+    assert release.MINIO_SOURCE_REPOSITORY == "https://github.com/minio/minio.git"
+    assert release.MINIO_SOURCE_REVISION == "RELEASE.2025-10-15T17-29-55Z"
+    assert release.MINIO_SOURCE_COMMIT == "9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a"
+    assert "FROM " + release.MINIO_BUILDER_IMAGE in definition
+    assert "FROM " + release.MINIO_RUNTIME_IMAGE in definition
+    assert release.MINIO_BUILDER_IMAGE.endswith("@sha256:85dc1069ac644ea3c527b177303a406eb3358192816cd7f9e5848eb658851673")
+    assert release.MINIO_RUNTIME_IMAGE == "alpine:3.22.6@sha256:3e9b4b680bfc9fb5269227cffbd6d42be39fbf7c0b908123913864aa4447e764"
+    assert release.MINIO_BUILD_PROVENANCE["source_commit"] == release.MINIO_SOURCE_COMMIT
+    assert "minio/minio:latest" not in definition
+    assert "go build" in definition
+    assert "--branch RELEASE.2025-10-15T17-29-55Z" in release._minio_source_preflight_script()
+
+
+@pytest.mark.parametrize("commit", ["a" * 39, "a" * 41, "g" * 40, None])
+def test_immutable_source_commit_validation_rejects_non_full_hex(commit):
+    with pytest.raises(RuntimeError, match="immutable source commit"):
+        release._validate_immutable_source_commits({"minio": commit})
+
+
+def test_immutable_source_commit_validation_accepts_official_commit():
+    release._validate_immutable_source_commits({"minio": "9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a"})
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        ("MINIO_BUILDER_IMAGE", "golang:1.27.2-alpine3.24@sha256:" + "a" * 63),
+        ("MINIO_RUNTIME_IMAGE", "alpine:3.22.6@sha256:" + "a" * 63),
+        ("MINIO_RUNTIME_IMAGE", "alpine:latest@sha256:" + "a" * 64),
+    ],
+)
+def test_minio_image_identity_validation_rejects_mismatch_or_malformed_digest(
+    monkeypatch, name, value
+):
+    monkeypatch.setattr(release, name, value)
+
+    with pytest.raises(RuntimeError, match="immutable image identity"):
+        release._validate_immutable_minio_images()
+
+
+def test_minio_image_identity_validation_requires_exact_official_pairs():
+    release._validate_immutable_minio_images()
+
+
+def test_minio_preflight_rejects_revision_before_docker_resource_mutation(bash_tmp_path):
+    fixture = bash_tmp_path
+    bin_root = fixture / "bin"
+    bin_root.mkdir()
+    state = fixture / "docker-state"
+    (bin_root / "git").write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = clone ]; then mkdir -p \"$5/.git\"; exit 0; fi\n"
+        "if [ \"$1\" = -C ]; then echo wrong-commit; exit 0; fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    (bin_root / "docker").write_text(
+        f"#!/bin/sh\necho mutation >> '{_bash_path(state)}'\nexit 0\n",
+        encoding="utf-8",
+    )
+    for path in bin_root.iterdir():
+        path.chmod(0o755)
+    script = f"#!/usr/bin/env bash\nset -Eeuo pipefail\n{release._minio_source_preflight_script()}\nminio_source_preflight\n"
+    script_path = fixture / "preflight.sh"
+    script_path.write_text(script, encoding="utf-8")
+
+    result = subprocess.run(
+        [str(_git_bash_executable()), _bash_path(script_path)],
+        env={**os.environ, "PATH": f"{_bash_path(bin_root)}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode != 0
+    assert "verified revision mismatch" in result.stderr
+    assert not state.exists()
+
+
+def test_minio_preflight_accepts_full_official_revision_in_isolated_fixture(bash_tmp_path):
+    fixture = bash_tmp_path
+    bin_root = fixture / "bin"
+    bin_root.mkdir()
+    state = fixture / "docker-state"
+    (bin_root / "git").write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = clone ]; then mkdir -p \"$9/.git\"; exit 0; fi\n"
+        f"if [ \"$1\" = -C ]; then echo {release.MINIO_SOURCE_COMMIT}; exit 0; fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    (bin_root / "docker").write_text(
+        f"#!/bin/sh\necho \"$*\" >> '{_bash_path(state)}'\nexit 0\n",
+        encoding="utf-8",
+    )
+    for path in bin_root.iterdir():
+        path.chmod(0o755)
+    script = f"#!/usr/bin/env bash\nset -Eeuo pipefail\n{release._minio_source_preflight_script()}\nminio_source_preflight\n"
+    script_path = fixture / "preflight.sh"
+    script_path.write_text(script, encoding="utf-8")
+
+    result = subprocess.run(
+        [str(_git_bash_executable()), _bash_path(script_path)],
+        env={**os.environ, "PATH": f"{_bash_path(bin_root)}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "pull" in state.read_text(encoding="utf-8")
+    assert "build" in state.read_text(encoding="utf-8")
+
+
+def test_deployment_preflights_minio_before_authoritative_resource_mutation():
+    command = release._deployment_command(valid_payload())
+
+    preflight = command.index("minio_source_preflight")
+    network_mutation = command.index("docker network create")
+    postgres_mutation = command.index('docker run -d --name \"$authoritative_postgres\"')
+    assert preflight < network_mutation < postgres_mutation
+    assert "source build dependency" in command
+
+
+def test_deployment_reconciles_compatible_partial_authoritative_resources():
+    command = release._deployment_command(valid_payload())
+
+    assert "reconcile_authoritative_resources" in command
+    for resource in (
+        "citespan-authoritative-postgres",
+        "citespan-authoritative-meili",
+        "citespan-authoritative-minio",
+        "citespan-authoritative-network",
+        "citespan-postgres-data",
+        "citespan-meili-data",
+        "citespan-minio-data",
+    ):
+        assert resource in command
+    assert "incompatible authoritative" in command
+    reconcile = command.index("reconcile_authoritative_resources")
+    candidate = command.index("candidate_suffix=")
+    assert "docker rm \"$authoritative_" not in command[reconcile:candidate]
+    assert "grep -Fq" not in command[reconcile:candidate]
+
+
+@pytest.mark.parametrize("conflict", [None, "image", "network", "mount", "credentials"])
+def test_generated_reconciliation_executes_and_rejects_incompatible_resources(bash_tmp_path, conflict):
+    fixture = bash_tmp_path
+    bin_root = fixture / "bin"
+    bin_root.mkdir()
+    network = "citespan-authoritative-network"
+    containers = {
+        "postgres": ("citespan-authoritative-postgres", "postgres:17-alpine", "citespan-postgres-data", "/var/lib/postgresql/data"),
+        "meili": ("citespan-authoritative-meili", "getmeili/meilisearch:v1.15", "citespan-meili-data", "/meili_data"),
+        "minio": ("citespan-authoritative-minio", "citespan-minio-source:RELEASE.2025-10-15T17-29-55Z", "citespan-minio-data", "/data"),
+    }
+    credentials = {
+        "POSTGRES_USER": "ufdr_user",
+        "POSTGRES_DB": "ufdr_analyzer",
+        "POSTGRES_PASSWORD": "synthetic-postgres-password",
+        "MEILI_MASTER_KEY": "synthetic-meili-key",
+        "MINIO_ROOT_USER": "synthetic-minio-user",
+        "MINIO_ROOT_PASSWORD": "synthetic-minio-password",
+        "MINIO_ACCESS_KEY": "synthetic-minio-user",
+        "MINIO_SECRET_KEY": "synthetic-minio-password",
+    }
+    for service, (container, image, volume, destination) in containers.items():
+        env = [f"{key}={value}" for key, value in credentials.items() if key in {
+            "POSTGRES_USER", "POSTGRES_DB", "POSTGRES_PASSWORD"
+        } if service == "postgres"]
+        if service == "meili":
+            env = [f"MEILI_MASTER_KEY={credentials['MEILI_MASTER_KEY']}"]
+        if service == "minio":
+            env = [f"{key}={credentials[key]}" for key in ("MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY")]
+        record = {
+            "Config": {"Image": image, "Env": env},
+            "NetworkSettings": {"Networks": {network: {}}},
+            "Mounts": [{"Type": "volume", "Name": volume, "Destination": destination, "RW": True}],
+        }
+        if conflict == "image" and service == "postgres":
+            record["Config"]["Image"] = "postgres:wrong"
+        if conflict == "network" and service == "meili":
+            record["NetworkSettings"]["Networks"] = {network: {}, "unexpected": {}}
+        if conflict == "mount" and service == "minio":
+            record["Mounts"][0]["Destination"] = "/wrong"
+        if conflict == "credentials" and service == "postgres":
+            record["Config"]["Env"][2] = "POSTGRES_PASSWORD=wrong"
+        (fixture / f"inspect-{container}.json").write_text(json.dumps([record]), encoding="utf-8")
+    receipt = fixture / "receipt.json"
+    runtime = fixture / "runtime.env"
+    runtime.write_text("synthetic-runtime\n", encoding="utf-8")
+    receipt.write_text(json.dumps({"data_marker": "preserve", "resources": {name: {"created": True, "ready": True} for name in ("network", "postgres", "meili", "minio")}}), encoding="utf-8")
+    (bin_root / "docker").write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = network ] && [ \"$2\" = inspect ]; then exit 0; fi\n"
+        "if [ \"$1\" = inspect ]; then cat \"$FIXTURE_ROOT/inspect-$2.json\"; exit 0; fi\n"
+        "if [ \"$1\" = network ] && [ \"$2\" = create ]; then echo network-create >&2; exit 44; fi\n"
+        "echo unsupported-docker-command >&2; exit 45\n",
+        encoding="utf-8",
+    )
+    (bin_root / "python3").write_text(f"#!/bin/sh\nexec '{_bash_path(Path(PYTHON))}' \"$@\"\n", encoding="utf-8")
+    for path in bin_root.iterdir():
+        path.chmod(0o755)
+    command = release._authoritative_reconciliation_script(release._receipt_writer())
+    script = f"#!/usr/bin/env bash\nset -Eeuo pipefail\nauthoritative_network={network}\nauthoritative_postgres={containers['postgres'][0]}\nauthoritative_meili={containers['meili'][0]}\nauthoritative_minio={containers['minio'][0]}\nreceipt={_bash_path(receipt)}\nruntime={_bash_path(runtime)}\nCITESPAN_SYNTHETIC_MARKER={release.CANONICAL_DEMO_MARKER}\nminio_image={containers['minio'][1]}\nexport {' '.join(f'{key}={value}' for key, value in credentials.items())}\n{command}\nreconcile_authoritative_resources\n"
+    script_path = fixture / "reconcile.sh"
+    script_path.write_text(script, encoding="utf-8")
+    result = subprocess.run([str(_git_bash_executable()), _bash_path(script_path)], env={**os.environ, "PATH": f"{_bash_path(bin_root)}:{os.environ['PATH']}", "FIXTURE_ROOT": _bash_path(fixture)}, capture_output=True, text=True, timeout=20)
+    assert (result.returncode == 0) is (conflict is None)
+    if conflict is not None:
+        assert result.returncode != 0
+        assert "incompatible authoritative" in result.stderr
+    else:
+        state = json.loads(receipt.read_text(encoding="utf-8"))
+        assert state["data_marker"] == "preserve"
+        assert state["resources"] == {name: {"created": True, "ready": True} for name in ("network", "postgres", "meili", "minio")}
+
+
+def test_minio_preflight_has_no_fallback_or_mutable_image_reference():
+    definition = release._minio_source_build_definition()
+    command = release._deployment_command(valid_payload())
+
+    assert "||" not in definition
+    assert "minio/minio:" not in definition
+    assert "minio/minio:latest" not in command
+    assert "quay.io/minio" not in command
+
+
+def test_minio_preflight_reports_sanitized_build_input_failures():
+    script = release._minio_source_preflight_script()
+
+    assert "source build dependency unavailable" in script
+    assert "minio source checkout failed" in script
+    assert "minio source compilation failed" in script
+    assert "MINIO_ROOT_PASSWORD" not in script
 
 
 def test_deployment_command_reuses_trusted_identity_and_preserves_routes():
