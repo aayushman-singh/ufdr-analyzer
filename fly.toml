@@ -1,12 +1,13 @@
-# fly.toml — FastAPI backend for the ufdr-analyzer SLIM DEMO profile.
+# Legacy Fly.io compatibility configuration for the CiteSpan slim demo profile.
+# This file is not the current launch configuration. The current deployment uses
+# /opt/citespan on the authorized personal backend host.
 #
-# Slim profile = Postgres + Meilisearch + MinIO + FastAPI (this app) + Next.js (Vercel).
+# Slim profile = Postgres + Meilisearch + MinIO + FastAPI (this app) + Next.js.
 # Neo4j / Celery / Redis / nginx are intentionally NOT part of this profile.
 #
-# Build: this app's image is the existing backend Dockerfile. The build context
-# must be the REPO ROOT (the Dockerfile does `COPY backend/ .`), so deploy with:
-#
-#     flyctl deploy --dockerfile docker/services/Dockerfile.backend .
+# Historical build note only. This file is not an active release target. Do not
+# run Fly deployment commands from this file. The current release uses the
+# Contabo host path `/opt/citespan`.
 #
 # The container entrypoint is `uvicorn main:app` on port 8000 (see Dockerfile CMD).
 #
@@ -46,8 +47,8 @@ primary_region = "iad"
   # Graph reads use Postgres recursive CTE in the slim profile (no Neo4j).
   GRAPH_BACKEND = "postgres"
 
-  # Allowed credentialed-CORS origins. MUST list the deployed Vercel origin
-  # explicitly — wildcard "*" is rejected loudly by config.py.
+  # Historical CORS origin for the retired Fly/Vercel route. It is not the
+  # current launch URL. The active Contabo route is configured by release.py.
   CORS_ALLOWED_ORIGINS = "https://ufdr-analyzer.vercel.app"
 
   # Postgres connection (non-secret parts). Password is a secret (above).

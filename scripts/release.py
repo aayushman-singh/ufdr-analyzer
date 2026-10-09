@@ -171,10 +171,38 @@ PUBLIC_BRANDING_PATHS = {
     "backend/ingest/services/graph_export.py",
     "backend/ingest/services/report_service.py",
     "backend/main.py",
+    "backend/server.py",
     "docker/scripts/setup-dev.sh",
     "docker/scripts/setup-prod.sh",
+    "fly.toml",
     "frontend/electron-builder.json",
 }
+CURRENT_PUBLIC_DOCUMENTATION_PATHS = {
+    "README.md",
+    "DEPLOY.md",
+    "DEVELOPMENT.md",
+    "DECISIONS.md",
+    "backend/README.md",
+}
+HOSTED_DEMO_AI_TERMS = re.compile(
+    r"(?i)\b(?:llm|large language model|generative ai|ai planner|ai-powered)\b"
+)
+HOSTED_DEMO_AI_ACTIVE_MARKERS = re.compile(
+    r"(?i)\b(?:active|enabled|current|live|turns?|translates?|emits?|"
+    r"generates?|creates?|powers?|provides?|uses?|plans?)\b"
+)
+HOSTED_DEMO_AI_LIMITATIONS = re.compile(
+    r"(?i)\b(?:disabled|unavailable|not enabled|not a live|not current|"
+    r"not valid|not used|optional|incomplete|outside the hosted demo)\b"
+)
+HOSTED_DEMO_AI_LIMITATION_CLAUSES = re.compile(
+    r"(?i)(?:\b(?:it is\s+)?not a live large language model feature\b|"
+    r"\b(?:a\s+)?live large language model claim is not valid\b|"
+    r"\b(?:external(?:\s+or\s+live)?|live)\s+llm behavior is "
+    r"(?:not enabled|disabled|unavailable)(?: and unavailable)?\b|"
+    r"\boptional llm integration(?: code)? is incomplete and unavailable\b|"
+    r"\bllm-optional,\s*not required\b)"
+)
 RUNTIME_CONFIG_PATHS = (
     ".env",
     ".env.production",
@@ -895,14 +923,49 @@ def _branding_findings() -> list[str]:
     """Find old names in public product surfaces and unscoped AI claims."""
     findings: list[str] = []
     old_name = re.compile(r"\b(?:(?i:ForensicAI)|(?i:UFDR Analyzer)|UFDR Report)\b")
+    legacy_identifier_exceptions = {
+        "fly.toml": re.compile(
+            r'^\s*(?:app\s*=\s*"ufdr-analyzer-api"|'
+            r'CORS_ALLOWED_ORIGINS\s*=\s*"https://ufdr-analyzer\.vercel\.app"|'
+            r'POSTGRES_HOST\s*=\s*"ufdr-analyzer-db\.internal"|'
+            r'MEILI_URL\s*=\s*"http://ufdr-analyzer-meili\.internal:7700"|'
+            r'MINIO_ENDPOINT\s*=\s*"ufdr-analyzer-minio\.internal:9000")\s*$'
+        ),
+    }
     for name, text in _tracked_text():
         normalized_name = name.replace("\\", "/")
+        findings.extend(_hosted_demo_documentation_findings(normalized_name, text))
         if name not in PUBLIC_BRANDING_PATHS and not (
             normalized_name.startswith("frontend/app/")
             or normalized_name.startswith("frontend/components/")
         ):
             continue
         public_text = re.sub(r"(?s)/\*.*?\*/", "", text)
+        if normalized_name == "frontend/electron-builder.json":
+            try:
+                parsed_electron_config = json.loads(text)
+            except json.JSONDecodeError:
+                findings.append("frontend/electron-builder.json is malformed JSON")
+                continue
+            if not isinstance(parsed_electron_config, dict):
+                findings.append("frontend/electron-builder.json must contain a JSON object")
+                continue
+            if "productName" not in parsed_electron_config:
+                findings.append("frontend/electron-builder.json is missing productName")
+                continue
+            if parsed_electron_config["productName"] != "CiteSpan":
+                findings.append(
+                    "frontend/electron-builder.json productName must equal CiteSpan"
+                )
+                continue
+            if "appId" not in parsed_electron_config:
+                findings.append("frontend/electron-builder.json is missing appId")
+                continue
+            if parsed_electron_config["appId"] != "com.ufdr-analyzer.app":
+                findings.append(
+                    "frontend/electron-builder.json appId must equal com.ufdr-analyzer.app"
+                )
+                continue
         for line in public_text.splitlines():
             stripped = line.strip()
             comment_prefixes = ("//", "*", "/*", "*/")
@@ -910,7 +973,15 @@ def _branding_findings() -> list[str]:
                 comment_prefixes += ("#",)
             if stripped.startswith(comment_prefixes):
                 continue
-            if old_name.search(line):
+            legacy_identifier = (
+                re.search(r"(?i)\bufdr-analyzer(?:-[a-z0-9]+)*\b", line)
+                if normalized_name in legacy_identifier_exceptions
+                else None
+            )
+            legacy_allowed = legacy_identifier and legacy_identifier_exceptions.get(
+                normalized_name, re.compile(r"a^")
+            ).fullmatch(stripped)
+            if old_name.search(line) or (legacy_identifier and not legacy_allowed):
                 findings.append(f"old public product name remains in {name}")
                 break
     unscoped = (
@@ -925,6 +996,80 @@ def _branding_findings() -> list[str]:
         if path.is_file() and ai_claim.search(path.read_text(encoding="utf-8")):
             findings.append(f"unscoped public AI claim requires scope expansion: {name}")
     return findings
+
+
+def _hosted_demo_documentation_findings(
+    name: str, text: str
+) -> list[str]:
+    """Reject active AI claims in current public documentation.
+
+    Archived review transcripts and implementation files are excluded by the
+    caller. Limitation text is allowed when it clearly describes the hosted
+    deterministic demo contract.
+    """
+    if name not in CURRENT_PUBLIC_DOCUMENTATION_PATHS:
+        return []
+    findings: list[str] = []
+    for line_number, statement in _documentation_statements(text):
+        if not HOSTED_DEMO_AI_TERMS.search(statement):
+            continue
+        claim_text = HOSTED_DEMO_AI_LIMITATION_CLAUSES.sub(" ", statement)
+        claim_text = HOSTED_DEMO_AI_LIMITATIONS.sub(" ", claim_text)
+        if _has_nearby_active_ai_marker(claim_text):
+            findings.append(
+                f"active hosted AI claim in current documentation: {name}:{line_number}"
+            )
+    return findings
+
+
+def _documentation_statements(text: str) -> list[tuple[int, str]]:
+    """Return normalized statements with their first physical source line.
+
+    Markdown wraps paragraphs and list items across physical lines. The claim
+    scanner must classify the rendered statement, while retaining its source
+    location for a useful finding.
+    """
+    statements: list[tuple[int, str]] = []
+    parts: list[str] = []
+    start_line: int | None = None
+
+    def flush() -> None:
+        nonlocal parts, start_line
+        if not parts or start_line is None:
+            parts = []
+            start_line = None
+            return
+        rendered = re.sub(r"\s+", " ", " ".join(parts)).strip()
+        for statement in re.split(r"(?<=[.!?])\s+", rendered):
+            statement = statement.strip()
+            if statement:
+                statements.append((start_line, statement))
+        parts = []
+        start_line = None
+
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            flush()
+            continue
+        list_item = re.match(r"^(?:[-+*]|\d+[.)])\s+(.*)$", line)
+        if list_item:
+            flush()
+            line = list_item.group(1)
+        if start_line is None:
+            start_line = line_number
+        parts.append(line)
+    flush()
+    return statements
+
+
+def _has_nearby_active_ai_marker(statement: str) -> bool:
+    """Find an active marker attached to an AI or LLM term."""
+    for term in HOSTED_DEMO_AI_TERMS.finditer(statement):
+        window = statement[max(0, term.start() - 80) : term.end() + 80]
+        if HOSTED_DEMO_AI_ACTIVE_MARKERS.search(window):
+            return True
+    return False
 
 
 def _read_input() -> dict[str, Any]:
@@ -2156,10 +2301,38 @@ def _execute(payload: dict[str, Any]) -> dict[str, Any]:
 def _verify(payload: dict[str, Any]) -> dict[str, Any]:
     _provider_payload(payload)
     _check_payload_secrets(payload)
-    expected = _expected_commit(payload)
     observation = payload.get("observation")
     if not isinstance(observation, dict):
         raise RuntimeError("verification blocked: deployment observation is missing")
+    if (
+        observation.get("state") == "not_deployed"
+        or observation.get("complete") is False
+        or observation.get("observed") is False
+    ):
+        expected_initial = {
+            "action_key",
+            "complete",
+            "observed",
+            "state",
+            "external_identity",
+        }
+        if (
+            set(observation) != expected_initial
+            or observation.get("action_key") != _action(payload)
+            or observation.get("complete") is not False
+            or observation.get("observed") is not False
+            or observation.get("state") != "not_deployed"
+            or observation.get("external_identity") != f"{DEPLOY_HOST}:citespan"
+        ):
+            raise RuntimeError("verification blocked: invalid not_deployed observation")
+        return {
+            "action_key": _action(payload),
+            "complete": False,
+            "observed": False,
+            "state": "not_deployed",
+            "external_identity": f"{DEPLOY_HOST}:citespan",
+        }
+    expected = _expected_commit(payload)
     deployment_commit = observation.get("deployment_commit")
     if not isinstance(deployment_commit, str) or not deployment_commit:
         raise RuntimeError("verification blocked: observation has no deployed commit")

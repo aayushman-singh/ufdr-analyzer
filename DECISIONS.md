@@ -12,7 +12,7 @@ Autonomous calls made by the orchestrator. Per HANDOFF rule 1, the user is never
 | 2 | `.env` added to `.gitignore` immediately; live secrets left in local `.env` untouched but flagged for rotation. | `.env` held a live OpenRouter key + Neo4j Aura password and was tracked-eligible (`??`, not ignored). Stopping the leak is priority 0. I will NOT rotate keys myself (no creds), but flag loudly. | yes |
 | 3 | `config.py` sources all secrets from env via `load_dotenv` + `_require()`; non-secret connection params (host/port/dbname) keep dev defaults. Missing secret → raise loudly (no silent default). | Honors "strip hardcoded creds" + user's no-fallback rule. `database.py` already prefers `DATABASE_URL` env, so this composes. | yes |
 | 4 | Demo profile drops Neo4j + Celery/Redis + nginx; full-prod compose retained behind the original `docker-compose.yml`. Graph reads move to Postgres recursive CTE behind a `GRAPH_BACKEND` flag. | HANDOFF rule 2 deploy boundary — full stack won't run free-tier. | yes |
-| 5 | LLM demo path uses the NL→IR pipeline; if no LLM key present, a deterministic stub planner is used **only when `DEMO_MODE=1` is explicitly set**, and it logs loudly that it is a stub. | Hosted demo must work without leaking a real key; the stub is explicit opt-in, not a silent fallback. | yes |
+| 5 | The hosted demo uses the NL→IR pipeline with a deterministic stub planner when `DEMO_MODE=1` is explicitly set. Optional LLM integration is unavailable in the hosted release. | Hosted demo must work without leaking a real key; the deterministic planner is explicit and not a silent fallback. | yes |
 
 ## Codex review of headline (codex/phase-bde.md) — triage
 

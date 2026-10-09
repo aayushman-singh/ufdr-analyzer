@@ -1818,6 +1818,63 @@ def test_verify_does_not_infer_expected_commit_from_local_git():
         release._verify(payload)
 
 
+def test_verify_accepts_direct_not_deployed_observation_without_live_verifier():
+    with patch.object(release, "_ssh", return_value="NOT_DEPLOYED"), patch.object(
+        release, "_check_payload_secrets"
+    ):
+        observation = release._observe(valid_payload())
+    payload = {
+        **valid_payload(),
+        "observation": observation,
+    }
+
+    with patch.object(release, "_check_payload_secrets"), patch.object(
+        release, "_run_live_verifier", side_effect=AssertionError("must not run")
+    ) as verifier:
+        result = release._verify(payload)
+
+    assert result == payload["observation"]
+    verifier.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("action_key", "wrong-action"),
+        ("action_key", None),
+        ("external_identity", "root@other.example:citespan"),
+        ("external_identity", None),
+        ("complete", True),
+        ("observed", True),
+        ("state", "deployed"),
+        ("state", None),
+        ("deployment_commit", EXPECTED_COMMIT),
+        ("live_url", "https://citespan.example"),
+        ("deployment_id", "citespan-live"),
+        ("screenshots", ["home.png"]),
+        ("results", "cited results"),
+        ("proof", "proof.md"),
+    ],
+)
+def test_verify_rejects_malformed_or_fake_not_deployed_observation(field, value):
+    observation = {
+        "action_key": "citespan-release",
+        "complete": False,
+        "observed": False,
+        "state": "not_deployed",
+        "external_identity": "root@169.58.64.150:citespan",
+    }
+    if value is None:
+        observation.pop(field, None)
+    else:
+        observation[field] = value
+
+    with patch.object(release, "_check_payload_secrets"), pytest.raises(
+        RuntimeError, match="not_deployed"
+    ):
+        release._verify({**valid_payload(), "observation": observation})
+
+
 def test_prepare_does_not_require_provider_external_fields():
     payload = valid_payload()
     payload.pop("live_url")
@@ -2630,6 +2687,38 @@ print(json.dumps({{'before': before, 'after': after}}, sort_keys=True))
     assert state["after"] == state["before"]
 
 
+def test_restart_contract_reuses_authoritative_state_and_restores_live_route():
+    command = release._deployment_command(valid_payload())
+
+    for identity in (
+        "authoritative_network",
+        "authoritative_postgres",
+        "authoritative_meili",
+        "authoritative_minio",
+        "citespan-postgres-data",
+        "citespan-meili-data",
+        "citespan-minio-data",
+    ):
+        assert identity in command
+    assert "if [ -f \"$receipt\" ]; then" in command
+    assert 'docker start "$previous_backend"' in command
+    assert 'docker start "$previous_static"' in command
+    assert "BEGIN CITESPAN ROUTE" in command
+    assert 'cp -p "$caddy_backup" /etc/caddy/Caddyfile' in command
+    assert 'docker volume rm' not in command
+
+
+def test_restart_contract_fails_loudly_when_recovery_is_incomplete():
+    command = release._deployment_command(valid_payload())
+
+    assert "rollback_incomplete=0" in command
+    assert "recovery incomplete; see $recovery_log" in command
+    assert "recovery failed: restore route" in command
+    assert "recovery failed: restart prior backend" in command
+    assert "recovery failed: remove candidate services" in command
+    assert "exit 70" in command
+
+
 def test_demo_audit_preserves_multiple_users_and_product_rows_after_clean_flow(tmp_path):
     db_path = tmp_path / "redeploy-after-clean-flow.sqlite"
     setup = "from sqlmodel import SQLModel; from database import engine; import db_setup; SQLModel.metadata.create_all(engine)"
@@ -3092,6 +3181,118 @@ def test_prepare_reports_unscoped_rendered_ai_claims():
     assert result["branding_findings"]
 
 
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "An LLM turns the user question into a query plan.",
+        "The large language model generates the hosted query plan.",
+        "Generative AI powers the hosted demo planner.",
+        "The AI planner is active in the hosted release.",
+        "The deterministic planner uses an LLM in the hosted release.",
+    ],
+)
+def test_current_public_documentation_rejects_active_hosted_ai_claims(claim):
+    findings = release._hosted_demo_documentation_findings("README.md", claim)
+
+    assert findings == ["active hosted AI claim in current documentation: README.md:1"]
+
+
+def test_current_public_documentation_accepts_deterministic_hosted_limitations():
+    text = (
+        "The hosted demo uses a deterministic demo planner. "
+        "External LLM behavior is disabled and unavailable in the hosted release."
+    )
+
+    assert release._hosted_demo_documentation_findings("README.md", text) == []
+
+
+def test_current_public_documentation_accepts_deploy_demo_limits():
+    text = (
+        "The planner is deterministic demo behavior. "
+        "It is not a live large language model feature."
+    )
+
+    assert release._hosted_demo_documentation_findings("DEPLOY.md", text) == []
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "It is not a live large language model feature.",
+        "A live large language model claim is not valid.",
+        "External or live LLM behavior is not enabled.",
+        "The hosted planner uses deterministic demo behavior and external LLM behavior is unavailable.",
+    ],
+)
+def test_documentation_limitations_have_same_result_when_markdown_wraps(sentence):
+    wrapped = sentence.replace(" ", "\n", 2)
+
+    assert release._hosted_demo_documentation_findings("README.md", sentence) == []
+    assert release._hosted_demo_documentation_findings("README.md", wrapped) == []
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "An LLM turns the user question into a query plan.",
+        "An LLM powers the current hosted query.",
+        "The AI-powered planner is active in the hosted release.",
+    ],
+)
+def test_active_documentation_claims_have_same_finding_when_markdown_wraps(claim):
+    wrapped = claim.replace(" ", "\n", 2)
+
+    unwrapped = release._hosted_demo_documentation_findings("README.md", claim)
+    wrapped_findings = release._hosted_demo_documentation_findings("README.md", wrapped)
+
+    assert unwrapped == ["active hosted AI claim in current documentation: README.md:1"]
+    assert wrapped_findings == unwrapped
+
+
+def test_documentation_scans_each_sentence_when_limitation_and_active_claim_conflict():
+    text = "LLM behavior is disabled. An LLM powers the current hosted query."
+
+    assert release._hosted_demo_documentation_findings("README.md", text) == [
+        "active hosted AI claim in current documentation: README.md:1"
+    ]
+
+
+def test_documentation_does_not_allow_a_limitation_word_to_hide_an_active_claim():
+    text = "LLM behavior is disabled but an LLM powers the current hosted query."
+
+    assert release._hosted_demo_documentation_findings("README.md", text) == [
+        "active hosted AI claim in current documentation: README.md:1"
+    ]
+
+
+def test_documentation_ignores_unrelated_paragraphs_when_classifying_claims():
+    text = "A neutral product description.\n\nThe hosted demo uses a deterministic planner."
+
+    assert release._hosted_demo_documentation_findings("README.md", text) == []
+
+
+def test_documentation_normalizes_wrapped_list_items_without_merging_items():
+    text = "- The hosted planner is deterministic demo behavior and external LLM\n  behavior is unavailable.\n- An LLM powers the current hosted query."
+
+    assert release._hosted_demo_documentation_findings("README.md", text) == [
+        "active hosted AI claim in current documentation: README.md:3"
+    ]
+
+
+def test_archived_review_transcript_text_is_excluded_from_hosted_ai_scan():
+    text = "An LLM turns the investigator question into a query plan."
+
+    assert release._hosted_demo_documentation_findings("codex/phase-a.md", text) == []
+
+
+def test_current_approved_public_documentation_has_no_active_hosted_ai_claims():
+    findings = []
+    for name, text in release._tracked_text():
+        findings.extend(release._hosted_demo_documentation_findings(name, text))
+
+    assert findings == []
+
+
 def test_branding_scan_checks_report_service_legacy_title():
     with patch.object(
         release,
@@ -3122,6 +3323,116 @@ def test_branding_scan_allows_ufdr_file_format_reference():
         findings = release._branding_findings()
 
     assert findings == []
+
+
+def test_branding_scan_rejects_old_names_on_current_backend_and_release_surfaces():
+    with patch.object(
+        release,
+        "_tracked_text",
+        return_value=[
+            ("backend/server.py", '"UFDR Analyzer is starting"'),
+            ("fly.toml", 'description = "UFDR Analyzer demo"'),
+            (
+                "frontend/electron-builder.json",
+                '{"appId": "com.ufdr-analyzer.app", "productName": "UFDR Analyzer"}',
+            ),
+        ],
+    ):
+        findings = release._branding_findings()
+
+    assert findings == [
+        "old public product name remains in backend/server.py",
+        "old public product name remains in fly.toml",
+        "frontend/electron-builder.json productName must equal CiteSpan",
+    ]
+
+
+@pytest.mark.parametrize(
+    "electron_config",
+    [
+        '{"appId": "com.ufdr-analyzer.app", "productName": "CiteSpan"}',
+        '{\n  "productName": "CiteSpan",\n  "appId": "com.ufdr-analyzer.app"\n}',
+    ],
+)
+def test_branding_scan_accepts_valid_electron_config_formats(electron_config):
+    with patch.object(
+        release,
+        "_tracked_text",
+        return_value=[
+            ("frontend/electron-builder.json", electron_config),
+            (
+                "fly.toml",
+                'app = "ufdr-analyzer-api"\nCORS_ALLOWED_ORIGINS = "https://ufdr-analyzer.vercel.app"',
+            ),
+            (
+                "backend/server.py",
+                "CiteSpan startup script for UFDR forensic-format data",
+            ),
+        ],
+    ):
+        findings = release._branding_findings()
+
+    assert findings == []
+
+
+@pytest.mark.parametrize(
+    ("electron_config", "expected"),
+    [
+        (
+            '{"appId": "com.ufdr-analyzer.app", "productName": "CiteSpan"',
+            "frontend/electron-builder.json is malformed JSON",
+        ),
+        (
+            '{"appId": "com.ufdr-analyzer.app"}',
+            "frontend/electron-builder.json is missing productName",
+        ),
+        (
+            '{"appId": "com.ufdr-analyzer.app", "productName": "UFDR Analyzer"}',
+            "frontend/electron-builder.json productName must equal CiteSpan",
+        ),
+        (
+            '{"productName": "CiteSpan"}',
+            "frontend/electron-builder.json is missing appId",
+        ),
+        (
+            '{"appId": "com.ufdr-analyzer.app.extra", "productName": "CiteSpan"}',
+            "frontend/electron-builder.json appId must equal com.ufdr-analyzer.app",
+        ),
+    ],
+)
+def test_branding_scan_validates_electron_config_semantically(electron_config, expected):
+    with patch.object(
+        release,
+        "_tracked_text",
+        return_value=[("frontend/electron-builder.json", electron_config)],
+    ):
+        findings = release._branding_findings()
+
+    assert findings == [expected]
+
+
+def test_branding_scan_allows_stable_app_id_references_outside_config():
+    with patch.object(
+        release,
+        "_tracked_text",
+        return_value=[("frontend/app/page.tsx", 'const appId = "com.ufdr-analyzer.app";')],
+    ):
+        findings = release._branding_findings()
+
+    assert findings == []
+
+
+def test_branding_scan_rejects_unreviewed_legacy_identifier_context():
+    with patch.object(
+        release,
+        "_tracked_text",
+        return_value=[
+            ("fly.toml", 'description = "ufdr-analyzer-api public product"'),
+        ],
+    ):
+        findings = release._branding_findings()
+
+    assert findings == ["old public product name remains in fly.toml"]
 
 
 @pytest.mark.parametrize("old_name", ["ForensicAI", "forensicai", "ForensicAi"])
@@ -3189,6 +3500,10 @@ def test_corrected_product_documentation_passes_branding_scan():
         findings = release._branding_findings()
 
     assert findings == []
+
+
+def test_actual_approved_current_branding_surfaces_pass_branding_scan():
+    assert release._branding_findings() == []
 
 
 def test_branding_scan_allows_ufdr_format_and_repository_identity_in_product_documentation():

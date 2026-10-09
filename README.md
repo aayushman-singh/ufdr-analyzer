@@ -12,17 +12,19 @@
 
 A FastAPI backend that ingests a UFDR (forensic device extraction) into
 PostgreSQL + Meilisearch + MinIO, plus a Next.js frontend, and a headline
-**auditable natural-language query** path: an LLM turns an investigator's question
-into a *typed query plan* (not raw SQL), the plan is deterministically lowered to
-parameter-bound SQL, and every returned row carries a citation back to the exact
-evidence span that matched. The full prod ambition (Neo4j graph DB, Celery/Redis
-workers, nginx — eight containers) does not run on free hosting, so the **shipped,
-deployable target is a slimmed demo profile**: Postgres + Meilisearch + MinIO +
-FastAPI + Next.js, with graph reads served by a Postgres recursive CTE, inline
-ingest, one canonical synthetic UFDR pre-loaded, and upload disabled in hosted
-mode (`DEMO_MODE=1`, "Reset to sample" as the only mutation). Boot has been
-configured and statically validated but not yet verified on Docker/hosted infra —
-see [DEPLOY.md](DEPLOY.md) and [STATE.md](STATE.md).
+**auditable natural-language query** path. In the hosted synthetic demo, the
+deterministic demo planner maps a user's question to a constrained typed query
+plan. The query runs with parameter-bound SQL, and every returned row carries a
+citation back to the exact canonical synthetic evidence span that matched.
+External or live LLM behavior is not enabled in the hosted demo. Optional LLM
+integration code is incomplete and unavailable in the hosted release. The full
+prod ambition (Neo4j graph DB, Celery/Redis workers, nginx — eight containers)
+does not run on free hosting, so the **shipped, deployable target is a slimmed
+demo profile**: Postgres + Meilisearch + MinIO + FastAPI + Next.js, with graph
+reads served by a Postgres recursive CTE, inline ingest, one canonical synthetic
+UFDR pre-loaded, and upload disabled in hosted mode (`DEMO_MODE=1`, "Reset to
+sample" as the only mutation). See [DEPLOY.md](DEPLOY.md) for the hosted-demo
+limits.
 
 ## Architecture (slim demo profile)
 
@@ -38,33 +40,35 @@ flowchart LR
         MEILI[("Meilisearch<br/>full-text")]
         MINIO[("MinIO<br/>media objects")]
     end
-    LLM["LLM provider<br/>(OpenRouter / OpenAI-compatible)"]
+    PLANNER["Deterministic demo planner"]
 
     User --> FE
     FE -->|"NEXT_PUBLIC_API_URL<br/>HTTPS + CORS"| API
     API --> PG
     API --> MEILI
     API --> MINIO
-    API -->|"NL → QueryPlan IR"| LLM
+    API -->|"NL → QueryPlan IR"| PLANNER
 ```
 
 ## Headline feature: auditable NL → IR → cited results
 
 `POST /query/plan` (and `POST /query/plan/preview`, which plans without executing)
 make every step of a natural-language query inspectable — the property a forensic
-reviewer or a court actually needs. The LLM never writes SQL; it emits a typed
-`QueryPlan` (a strict Pydantic IR: targets, predicates, time range, sort, limit).
-That plan is **deterministically** lowered to per-table, parameter-bound SQL — same
-plan in, byte-identical SQL out — so the SQL shown in the UI is provably the SQL
-that ran. Because the IR cannot express raw SQL and every value becomes a bound
-parameter, prompt-injection cannot reach the database as code. Each result row is
-hydrated with a citation: the source table, row id, column, matched value, and the
-exact character span that explains the match.
+reviewer or a court actually needs. In the hosted demo, the deterministic planner
+maps the question to a typed `QueryPlan` (a strict Pydantic IR: targets,
+predicates, time range, sort, and limit). External or live LLM behavior is not
+enabled. The plan is **deterministically** lowered to per-table, parameter-bound
+SQL — same plan in, byte-identical SQL out — so the SQL shown in the UI is
+provably the SQL that ran. Because the IR cannot express raw SQL and every value
+becomes a bound parameter, prompt-injection cannot reach the database as code.
+Each result row is hydrated with a citation: the source table, row id, column,
+matched value, and the exact canonical synthetic evidence span that explains the
+match.
 
 ```mermaid
 flowchart TD
     Q["NL question<br/>(investigator)"]
-    P["Planner<br/>(LLM, validated • or DEMO stub)"]
+    P["Planner<br/>(deterministic demo)"]
     IR["QueryPlan IR<br/>(typed Pydantic — no raw SQL)"]
     C["Compiler<br/>(deterministic lowering)"]
     SQL["Parameter-bound SQL<br/>(injection-proof)"]
@@ -134,8 +138,8 @@ CiteSpan is an evidence analysis tool that:
 - **Visualization**: Cytoscape.js (networks), Chart.js (analytics)
 - **State Management**: React Query + Zustand
 
-### **AI & Processing**
-- **Natural Language**: OpenAI API / Hugging Face
+### **Analysis & Processing**
+- **Natural Language**: Deterministic hosted demo planner; optional LLM integration is unavailable in the hosted release
 - **Entity Recognition**: spaCy
 - **PDF Generation**: ReportLab
 - **File Processing**: xmltodict, python-multipart
@@ -261,6 +265,9 @@ npm run electron:build -- --win --mac --linux
   }
 }
 ```
+
+The Electron app ID remains `com.ufdr-analyzer.app` as a legacy technical
+identifier. This preserves installed-app identity, user data, and updates.
 
 ### **🎯 Electron Features**
 

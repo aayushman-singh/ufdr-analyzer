@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Backend startup script for UFDR Analyzer
+Backend startup script for CiteSpan
 """
+
 import uvicorn
-from main import app
 
 if __name__ == "__main__":
     uvicorn.run(
@@ -15,5 +15,5 @@ if __name__ == "__main__":
         # Configure for large uploads (30GB+)
         limit_max_requests=1000,
         timeout_keep_alive=30,
-        limit_concurrency=10
+        limit_concurrency=10,
     )
