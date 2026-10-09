@@ -1428,8 +1428,62 @@ def test_execute_deploys_to_authorized_host_and_returns_remote_commit():
     assert result["complete"] is True
     assert result["deployment_commit"] == EXPECTED_COMMIT
     assert result["external_identity"] == "root@169.58.64.150:citespan"
-    assert any(argv[0] == "ssh" and any("169.58.64.150" in item for item in argv) for argv, _ in calls)
+    assert any(any("169.58.64.150" in item for item in argv) for argv, _ in calls)
     assert all("deployment_result" not in json.dumps(argv) for argv, _ in calls)
+
+
+def test_ssh_uses_path_resolved_executable_and_preserves_authorized_arguments():
+    ssh_path = Path(__file__).resolve()
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "ok\n", "")
+
+    with patch.object(release, "SSH_KEY", Path(__file__)), patch.object(
+        release.shutil, "which", return_value=str(ssh_path)
+    ), patch.object(release.subprocess, "run", side_effect=fake_run):
+        assert release._ssh("remote command") == "ok"
+
+    argv = calls[0][0]
+    assert argv[0] == str(ssh_path)
+    assert argv[1] == "-i"
+    assert os.path.normcase(os.path.normpath(argv[2])) == os.path.normcase(
+        os.path.normpath(str(Path(__file__).resolve()))
+    )
+    assert argv[3:] == [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "root@169.58.64.150",
+        "remote command",
+    ]
+    assert "everything" not in repr(calls)
+
+
+def test_ssh_uses_windows_standard_openSSH_when_path_lookup_fails():
+    standard_path = Path(__file__).resolve()
+
+    with patch.object(release, "SSH_KEY", Path(__file__)), patch.object(
+        release.shutil, "which", return_value=None
+    ), patch.object(release.os, "name", "nt"), patch.object(
+        release, "_windows_ssh_path", return_value=standard_path
+    ), patch.object(
+        release.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "ok\n", "")
+    ) as run:
+        assert release._ssh("remote command") == "ok"
+
+    assert run.call_args.args[0][0] == str(standard_path)
+
+
+def test_ssh_missing_executable_fails_with_controlled_diagnostic():
+    with patch.object(release, "SSH_KEY", Path(__file__)), patch.object(
+        release.shutil, "which", return_value=None
+    ), patch.object(release.os, "name", "posix"), patch.object(
+        release.subprocess, "run", side_effect=AssertionError("subprocess must not run")
+    ), pytest.raises(RuntimeError, match="OpenSSH is unavailable"):
+        release._ssh("remote command")
 
 
 def test_observe_fails_loudly_when_external_host_cannot_be_observed():
@@ -3070,6 +3124,30 @@ def test_branding_scan_allows_ufdr_file_format_reference():
     assert findings == []
 
 
+@pytest.mark.parametrize("old_name", ["ForensicAI", "forensicai", "ForensicAi"])
+def test_branding_scan_rejects_old_brand_case_insensitively(old_name):
+    with patch.object(
+        release,
+        "_tracked_text",
+        return_value=[("frontend/app/page.tsx", f"<title>{old_name}</title>")],
+    ):
+        findings = release._branding_findings()
+
+    assert findings == ["old public product name remains in frontend/app/page.tsx"]
+
+
+@pytest.mark.parametrize("old_name", ["UFDR Analyzer", "ufdr analyzer", "Ufdr Analyzer"])
+def test_branding_scan_rejects_ufdr_analyzer_case_insensitively(old_name):
+    with patch.object(
+        release,
+        "_tracked_text",
+        return_value=[("frontend/app/page.tsx", f"<title>{old_name}</title>")],
+    ):
+        findings = release._branding_findings()
+
+    assert findings == ["old public product name remains in frontend/app/page.tsx"]
+
+
 @pytest.mark.parametrize("name", ["codex/phase-a.md", "codex/phase-bde.md", "codex/v4-merge-gate.txt"])
 def test_branding_scan_ignores_archived_review_transcript(name):
     with patch.object(
@@ -3080,6 +3158,12 @@ def test_branding_scan_ignores_archived_review_transcript(name):
         findings = release._branding_findings()
 
     assert findings == []
+
+
+@pytest.mark.parametrize("name", ["codex/phase-a.md", "codex/phase-bde.md", "codex/v4-merge-gate.txt"])
+def test_archived_review_transcripts_are_byte_identical_to_approved_git_blobs(name):
+    expected = subprocess.check_output(["git", "show", f"HEAD:{name}"])
+    assert (release.ROOT / name).read_bytes() == expected
 
 
 def test_branding_scan_ignores_unlisted_codex_documentation():
@@ -3128,6 +3212,17 @@ def test_branding_scan_allows_lowercase_ufdr_report_file_format_reference():
         release,
         "_tracked_text",
         return_value=[("codex/v4-merge-gate.txt", "an ingested UFDR report")],
+    ):
+        findings = release._branding_findings()
+
+    assert findings == []
+
+
+def test_branding_scan_allows_legitimate_lowercase_ufdr_report_terminology_on_current_surface():
+    with patch.object(
+        release,
+        "_tracked_text",
+        return_value=[("backend/ingest/services/report_service.py", "an ingested UFDR report")],
     ):
         findings = release._branding_findings()
 

@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -893,7 +894,7 @@ def _critical_dependency_findings() -> list[str]:
 def _branding_findings() -> list[str]:
     """Find old names in public product surfaces and unscoped AI claims."""
     findings: list[str] = []
-    old_name = re.compile(r"\b(?:ForensicAI|(?i:UFDR Analyzer)|UFDR Report)\b")
+    old_name = re.compile(r"\b(?:(?i:ForensicAI)|(?i:UFDR Analyzer)|UFDR Report)\b")
     for name, text in _tracked_text():
         normalized_name = name.replace("\\", "/")
         if name not in PUBLIC_BRANDING_PATHS and not (
@@ -1073,6 +1074,26 @@ def _require_project_python(command: str) -> None:
         )
 
 
+def _windows_ssh_path() -> Path | None:
+    system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
+    if not system_root:
+        return None
+    return Path(system_root) / "System32" / "OpenSSH" / "ssh.exe"
+
+
+def _ssh_executable() -> Path:
+    path_candidate = shutil.which("ssh")
+    if path_candidate:
+        path = Path(path_candidate)
+        if path.is_file():
+            return path.resolve()
+    if os.name == "nt":
+        standard_path = _windows_ssh_path()
+        if standard_path is not None and standard_path.is_file():
+            return standard_path.resolve()
+    raise RuntimeError("release blocked: OpenSSH is unavailable")
+
+
 def _ssh(command: str) -> str:
     try:
         key_exists = SSH_KEY.is_file()
@@ -1081,7 +1102,7 @@ def _ssh(command: str) -> str:
     if not key_exists:
         raise RuntimeError(f"release blocked: SSH key is missing: {SSH_KEY}")
     argv = [
-        "ssh",
+        str(_ssh_executable()),
         "-i",
         SSH_KEY.as_posix(),
         "-o",
