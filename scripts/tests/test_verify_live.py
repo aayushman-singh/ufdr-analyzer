@@ -144,12 +144,17 @@ class _FakePage:
             "planner": "stub",
             "rows": [
                 {
+                    "source_table": "aleappartifact",
+                    "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
                     "citations": [
                         {
-                            "snippet": "bank transfer",
-                            "matched_value": "bank",
+                            "source_table": "aleappartifact",
+                            "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
+                            "column": "filename",
+                            "snippet": "whatsapp_messages.csv",
+                            "matched_value": "whatsapp",
                             "char_start": 0,
-                            "char_end": 4,
+                            "char_end": 8,
                         }
                     ]
                 }
@@ -187,7 +192,7 @@ class _FakePage:
             "#run-id": _FakeLocator(verify_live.CANONICAL_DEMO_RUN_ID),
             "#question": _FakeLocator(actions=self.actions, action=selector),
             "[data-testid='cited-result-row']": _FakeLocator(texts=["row"]),
-            ".cite": _FakeLocator(texts=["bank"]),
+        ".cite": _FakeLocator(texts=["whatsapp"]),
             "text=chars ": _FakeLocator(texts=["chars 0-4"]),
         }
         return values.get(selector, _FakeLocator())
@@ -330,7 +335,7 @@ def test_browser_flow_proves_clean_session_and_cited_evidence(tmp_path):
     )
 
     assert result["query_response"]["planner"] == "stub"
-    assert result["query_response"]["rows"][0]["citations"][0]["matched_value"] == "bank"
+    assert result["query_response"]["rows"][0]["citations"][0]["matched_value"] == "whatsapp"
     assert result["upload_status"] == 403
     assert result["ingestion_statuses"] == {
         "/api/ingest/": 403,
@@ -506,12 +511,17 @@ def test_citation_validation_requires_evidence_spans_and_offsets():
             "planner": "stub",
             "rows": [
                 {
+                    "source_table": "aleappartifact",
+                    "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
                     "citations": [
                         {
-                            "snippet": "bank transfer",
-                            "matched_value": "bank",
+                            "source_table": "aleappartifact",
+                            "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
+                            "column": "category",
+                            "snippet": "WhatsApp messages",
+                            "matched_value": "WhatsApp",
                             "char_start": 0,
-                            "char_end": 4,
+                            "char_end": 8,
                         }
                     ]
                 }
@@ -523,7 +533,16 @@ def test_citation_validation_requires_evidence_spans_and_offsets():
 def test_citation_validation_rejects_results_without_evidence_spans():
     with pytest.raises(RuntimeError, match="evidence spans"):
         verify_live._validate_cited_response(
-            {"planner": "stub", "rows": [{"citations": []}]}
+            {
+                "planner": "stub",
+                "rows": [
+                    {
+                        "source_table": "aleappartifact",
+                        "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
+                        "citations": [],
+                    }
+                ],
+            }
         )
 
 
@@ -563,7 +582,7 @@ def test_live_verification_validates_the_observed_query_response():
     source = (ROOT / "scripts" / "verify_live.py").read_text(encoding="utf-8")
 
     assert "query_response" in source
-    assert "_validate_cited_response(query_response)" in source
+    assert "_validate_cited_response(query_response, run_id)" in source
     assert "visible evidence spans do not match" in source
 
 
@@ -579,12 +598,17 @@ def test_proof_writer_returns_exact_durable_paths_and_draft(tmp_path):
             "planner": "stub",
             "rows": [
                 {
+                    "source_table": "aleappartifact",
+                    "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
                     "citations": [
                         {
-                            "snippet": "bank transfer",
-                            "matched_value": "bank",
+                            "source_table": "aleappartifact",
+                            "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
+                            "column": "category",
+                            "snippet": "WhatsApp messages",
+                            "matched_value": "WhatsApp",
                             "char_start": 0,
-                            "char_end": 4,
+                            "char_end": 8,
                         }
                     ]
                 }
@@ -617,12 +641,17 @@ def test_proof_writer_does_not_write_when_proof_is_incomplete(tmp_path):
         "planner": "stub",
         "rows": [
             {
+                "source_table": "aleappartifact",
+                "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
                 "citations": [
                     {
-                        "snippet": "bank",
-                        "matched_value": "bank",
+                        "source_table": "aleappartifact",
+                        "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
+                        "column": "category",
+                        "snippet": "WhatsApp messages",
+                        "matched_value": "WhatsApp",
                         "char_start": 0,
-                        "char_end": 4,
+                        "char_end": 8,
                     }
                 ]
             }
@@ -647,12 +676,17 @@ def test_proof_writer_rejects_missing_screenshot_files(tmp_path):
         "planner": "stub",
         "rows": [
             {
+                "source_table": "aleappartifact",
+                "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
                 "citations": [
                     {
-                        "snippet": "bank",
-                        "matched_value": "bank",
+                        "source_table": "aleappartifact",
+                        "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
+                        "column": "category",
+                        "snippet": "WhatsApp messages",
+                        "matched_value": "WhatsApp",
                         "char_start": 0,
-                        "char_end": 4,
+                        "char_end": 8,
                     }
                 ]
             }
@@ -672,3 +706,114 @@ def test_proof_writer_rejects_missing_screenshot_files(tmp_path):
                 "/api/ingest/aleapp-structure": 403,
             },
         )
+
+
+def _canonical_artifact_response(**citation_overrides):
+    citation = {
+        "source_table": "aleappartifact",
+        "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
+        "column": "category",
+        "snippet": "WhatsApp messages",
+        "matched_value": "WhatsApp",
+        "char_start": 0,
+        "char_end": 8,
+    }
+    citation.update(citation_overrides)
+    return {
+        "planner": "stub",
+        "rows": [
+            {
+                "source_table": "aleappartifact",
+                "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
+                "citations": [citation],
+            }
+        ],
+    }
+
+
+def test_citation_validation_rejects_internally_consistent_invented_row():
+    response = _canonical_artifact_response(
+        source_table="message",
+        row_id="99999999-9999-4999-8999-999999999999",
+        column="content",
+        snippet="invented evidence",
+        matched_value="invented",
+        char_end=8,
+    )
+    response["rows"][0]["source_table"] = "message"
+    response["rows"][0]["row_id"] = "99999999-9999-4999-8999-999999999999"
+    with pytest.raises(RuntimeError, match="unknown canonical evidence row"):
+        verify_live._validate_cited_response(response)
+
+
+def test_citation_validation_rejects_altered_canonical_content():
+    with pytest.raises(RuntimeError, match="snippet does not equal canonical evidence"):
+        verify_live._validate_cited_response(
+            _canonical_artifact_response(snippet="WhatsApp altered")
+        )
+
+
+def test_citation_validation_accepts_canonical_artifact_columns_and_compact_uuid():
+    artifact_id = verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID.replace("-", "")
+    response = {
+        "planner": "stub",
+        "rows": [
+            {
+                "source_table": "aleappartifact",
+                "row_id": artifact_id,
+                "citations": [
+                    {
+                        "source_table": "aleappartifact",
+                        "row_id": artifact_id,
+                        "column": "filename",
+                        "snippet": "whatsapp_messages.csv",
+                        "matched_value": "whatsapp",
+                        "char_start": 0,
+                        "char_end": 8,
+                    },
+                    {
+                        "source_table": "aleappartifact",
+                        "row_id": artifact_id,
+                        "column": "file_path",
+                        "snippet": "/synthetic/whatsapp_messages.csv",
+                        "matched_value": "whatsapp",
+                        "char_start": 11,
+                        "char_end": 19,
+                    },
+                ],
+            }
+        ],
+    }
+    verify_live._validate_cited_response(response)
+
+
+def test_citation_validation_rejects_wrong_run_or_case_identity():
+    with pytest.raises(RuntimeError, match="canonical evidence manifest"):
+        verify_live._validate_cited_response(
+            _canonical_artifact_response(), expected_run_id="wrong-run"
+        )
+
+
+def test_citation_validation_rejects_invalid_offsets_and_mismatched_snippets():
+    with pytest.raises(RuntimeError, match="outside its snippet"):
+        verify_live._validate_cited_response(
+            _canonical_artifact_response(char_start=20, char_end=21)
+        )
+    with pytest.raises(RuntimeError, match="does not match its character span"):
+        verify_live._validate_cited_response(
+            _canonical_artifact_response(matched_value="messages")
+        )
+
+
+def test_citation_validation_fails_closed_when_manifest_is_missing_or_ambiguous(monkeypatch):
+    monkeypatch.setattr(verify_live, "CANONICAL_EVIDENCE_MANIFEST", None)
+    with pytest.raises(RuntimeError, match="canonical evidence manifest"):
+        verify_live._validate_cited_response(_canonical_artifact_response())
+
+    monkeypatch.setattr(
+        verify_live,
+        "CANONICAL_EVIDENCE_MANIFEST",
+        {"run_id": verify_live.CANONICAL_DEMO_RUN_ID, "case_id": verify_live.CANONICAL_DEMO_RUN_ID, "rows": {}},
+    )
+    with pytest.raises(RuntimeError, match="canonical evidence manifest"):
+        verify_live._validate_cited_response(_canonical_artifact_response())

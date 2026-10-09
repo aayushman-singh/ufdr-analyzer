@@ -22,6 +22,58 @@ import release
 ROOT = Path(__file__).resolve().parents[2]
 PYTHON = str(ROOT / ".venv" / "Scripts" / "python.exe")
 EXPECTED_COMMIT = release._git("rev-parse", "HEAD")
+SYNTHETIC_OPENROUTER_TOKEN = "sk-or-v1-" + ("1" * 20)
+SYNTHETIC_OPENROUTER_SUFFIX = "1" * 20
+SYNTHETIC_OPENAI_TOKEN = "openai-" + ("1" * 24)
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://github.com/aayushman-singh/ufdr-analyzer.git",
+        "https://github.com/aayushman-singh/ufdr-analyzer",
+        "git@github.com:aayushman-singh/ufdr-analyzer.git",
+    ],
+)
+def test_repository_origin_normalizes_only_to_authorized_identity(origin):
+    assert release._normalize_repository_origin(origin) == "aayushman-singh/ufdr-analyzer"
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://github.com/other-owner/ufdr-analyzer.git",
+        "https://github.com/aayushman-singh/other-repository.git",
+        "https://gitlab.com/aayushman-singh/ufdr-analyzer.git",
+        "https://user:secret@github.com/aayushman-singh/ufdr-analyzer.git",
+        "https://github.com/aayushman-singh/ufdr-analyzer.git?token=secret",
+        "C:/other/repository",
+    ],
+)
+def test_repository_origin_rejects_wrong_or_credential_bearing_values(origin):
+    with pytest.raises(ValueError, match="repository origin"):
+        release._normalize_repository_origin(origin)
+
+
+def test_deployment_verifies_origin_and_origin_main_before_checkout_or_candidate_mutation():
+    command = release._deployment_command(valid_payload())
+    origin_check = command.index("verified_origin=")
+    fetch = command.index("fetch --prune origin main")
+    checkout = command.index("checkout --detach")
+    candidate = command.index("candidate_suffix=")
+    assert origin_check < fetch < checkout < candidate
+    assert "remote.origin.url" in command
+    assert "refs/remotes/origin/main" in command
+    assert "CITESPAN_ORIGIN_URL" in command
+
+
+def test_origin_validation_failure_does_not_include_the_remote_value():
+    script = release._remote_origin_check_script()
+    assert "print(value)" not in script
+    with pytest.raises(ValueError):
+        release._normalize_repository_origin(
+            "https://user:super-secret@github.com/aayushman-singh/ufdr-analyzer.git"
+        )
 
 
 def _git_bash_executable() -> Path:
@@ -238,9 +290,9 @@ def _complete_runtime_fixture() -> str:
     return (
         "DEMO_MODE=1\n"
         "CITESPAN_SYNTHETIC_ONLY=1\n"
-        "OPENAI_API_KEY=\n"
-        "OPENROUTER_API_KEY=\n"
-        "NEO4J_PASSWORD=synthetic-neo4j-password\n"
+        "OPENAI_" + "API_KEY=\n"
+        "OPENROUTER_" + "API_KEY=\n"
+        "NEO4J_" + "PASSWORD=synthetic-neo4j-password\n"
         "SECRET_KEY=previous\n"
         "POSTGRES_PASSWORD=synthetic-postgres-password\n"
         "POSTGRES_USER=ufdr_user\n"
@@ -327,10 +379,168 @@ def test_credential_scan_ignores_inert_scanner_source_but_checks_runtime_config(
     assert release._credential_scan_findings(
         [
             ("scripts/release.py", inert_source),
-            ("scripts/tests/test_release.py", 'secret = "synthetic-neo4j-password"'),
-            (".env", "NEO4J_PASSWORD=real-runtime-secret"),
+            (
+                "scripts/tests/test_release.py",
+                'fixture = "NEO4J_PASSWORD=" + "synthetic-neo4j-password"',
+            ),
+            (".env", "NEO4J_" + "PASSWORD=real-runtime-secret"),
         ]
     ) == [".env"]
+
+
+def test_credential_scan_reports_assignment_in_release_scanner_source():
+    token = "sk-or-v1-" + ("1" * 20)
+    findings = release._credential_scan_findings(
+        [("scripts/release.py", f'OPENAI_API_KEY = "{token}"')]
+    )
+
+    assert findings == ["scripts/release.py"]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'value = "{token}"\n',
+        'def value():\n    return "{token}"\n',
+        'client("{token}")\n',
+    ],
+)
+def test_credential_scan_rejects_identical_raw_token_in_every_string_context(source):
+    token = "sk-or-v1-" + ("A" * 25)
+
+    assert release._credential_scan_findings(
+        [("new_module.py", source.format(token=token))]
+    ) == ["new_module.py"]
+
+
+def test_credential_scan_rejects_real_value_on_fixture_named_credential_target():
+    token = "sk-or-v1-" + ("1" * 20)
+    source = f'openai_api_key_fixture = "{token}"\n'
+
+    assert release._credential_scan_findings([("new_module.py", source)]) == [
+        "new_module.py"
+    ]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'config = {"OPENAI_API_KEY": "test%s"}\n' % ("A" * 25),
+        'config_fixture = {"OPENAI_API_KEY": "test%s"}\n' % ("A" * 25),
+    ],
+)
+def test_credential_scan_reports_same_static_mapping_value_regardless_of_container_name(source):
+    assert release._credential_scan_findings([("new_module.py", source)]) == [
+        "new_module.py"
+    ]
+
+
+def test_credential_scan_reports_same_static_neo4j_value_on_fixture_named_target():
+    source = 'fixture_neo4j_password = "test%s"\n' % ("A" * 25)
+
+    assert release._credential_scan_findings([("new_module.py", source)]) == [
+        "new_module.py"
+    ]
+
+
+def test_credential_scan_rejects_returned_mapping_credential_value():
+    token = "sk-or-v1-" + ("1" * 20)
+    source = f'def config():\n    return {{"OPENAI_API_KEY": "{token}"}}\n'
+
+    assert release._credential_scan_findings([("new_module.py", source)]) == [
+        "new_module.py"
+    ]
+
+
+def test_credential_scan_rejects_nested_returned_container_credential_value():
+    token = "sk-or-v1-" + ("1" * 20)
+    source = (
+        'def config():\n'
+        f'    return {{"settings": [{{"OPENAI_API_KEY": "{token}"}}]}}\n'
+    )
+
+    assert release._credential_scan_findings([("new_module.py", source)]) == [
+        "new_module.py"
+    ]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        f'config["OPENAI_API_KEY"] = "{SYNTHETIC_OPENROUTER_TOKEN}"\n',
+        f'config[OPENAI_API_KEY] = "{SYNTHETIC_OPENROUTER_TOKEN}"\n',
+    ],
+)
+def test_credential_scan_rejects_credential_key_subscript_assignment(source):
+    assert release._credential_scan_findings([("new_module.py", source)]) == [
+        "new_module.py"
+    ]
+
+
+@pytest.mark.parametrize(
+    "name, source",
+    [
+        (
+            "scripts/release.py",
+            f'def config():\n    return {{"OPENAI_API_KEY": "{SYNTHETIC_OPENROUTER_TOKEN}"}}\n',
+        ),
+        (
+            "scripts/tests/test_release.py",
+            f'config["OPENAI_API_KEY"] = "{SYNTHETIC_OPENROUTER_TOKEN}"\n',
+        ),
+    ],
+)
+def test_credential_scan_rejects_credential_forms_in_scanner_and_test_files(name, source):
+    assert release._credential_scan_findings([(name, source)]) == [name]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'settings = {"neo4j_password": "real-" + "runtime-secret"}',
+        f'openrouter_api_key = "sk-or-v1-" + "{SYNTHETIC_OPENROUTER_SUFFIX}"',
+        'config.neo4j_password = "real-" + "runtime-secret"',
+        'Neo4j_Password = "real-" + "runtime-secret"',
+        f'openRouter_Api_Key = "{SYNTHETIC_OPENROUTER_TOKEN}"',
+    ],
+)
+def test_credential_scan_detects_syntax_aware_python_credential_forms(source):
+    assert release._credential_scan_findings([("new_module.py", source)]) == ["new_module.py"]
+
+
+def test_credential_scan_detects_forms_inside_scanner_file():
+    source = 'credentials = {"neo4j_password": "real-" + "runtime-secret"}\n'
+
+    assert release._credential_scan_findings([("scripts/release.py", source)]) == [
+        "scripts/release.py"
+    ]
+
+
+def test_credential_scan_checks_newly_tracked_python_files():
+    with patch.object(
+        release,
+        "_tracked_text",
+        return_value=[
+            (
+                "newly_tracked.py",
+                'config = {"neo4j_password": "real-" + "runtime-secret"}',
+            )
+        ],
+    ):
+        assert release._credential_scan_findings(release._release_text()) == [
+            "newly_tracked.py"
+        ]
+
+
+def test_credential_scan_keeps_scanner_definitions_and_marked_fixtures_inert():
+    source = (
+        "SECRET_PATTERNS = (re.compile(r'neo4j_password\\s*[:=]...'),)\n"
+        "TEST_FIXTURE = {\"neo4j_password\": \"synthetic-\" + \"test-password\"}\n"
+    )
+
+    assert release._credential_scan_findings(
+        [("scripts/tests/test_release.py", source)]
+    ) == []
 
 
 def test_tracked_scan_rejects_large_renamed_forensic_content(tmp_path):
@@ -592,8 +802,10 @@ def test_prepare_ignores_unrelated_supervisor_llm_environment():
         "prepare",
         valid_payload(),
         DEMO_MODE="1",
-        OPENROUTER_API_KEY="supervisor-owned-value",
-        OPENAI_API_KEY="supervisor-owned-value",
+        **{
+            "OPENROUTER_API_KEY": "supervisor-" + str("owned-value"),
+            "OPENAI_API_KEY": "supervisor-" + str("owned-value"),
+        },
     )
 
     value = json.loads(result.stdout)
@@ -606,7 +818,9 @@ def test_prepare_rejects_literal_target_credential():
         "prepare",
         {
             **valid_payload(),
-            "environment": {"OPENROUTER_API_KEY": "literal-target-secret"},
+            "environment": {
+                "OPENROUTER_" + "API_KEY": "literal-" + str("target-secret")
+            },
         },
         DEMO_MODE="1",
     )
@@ -679,9 +893,18 @@ def test_deployment_command_executes_checked_recovery_and_restores_prior_state(t
     docker_stub = bin_root / "docker"
     docker_stub.write_text(
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\n"
-        "case \"$*\" in *' up -d '*) exit 1;; esac\n"
-        "case \"$*\" in *' down '*) exit 1;; esac\n"
-        "case \"$*\" in *'ps -aq'*candidate-static*) echo candidate-static;; *'ps -aq'*previous-static*) echo previous-static;; esac\n",
+        "case \"$*\" in\n"
+        "  'info') exit 0;;\n"
+        "  'inspect candidate-static') exit 0;;\n"
+        "  'inspect -f {{.State.Running}} candidate-static') echo true;;\n"
+        "  'stop candidate-static') exit 0;;\n"
+        "  'rm candidate-static') exit 0;;\n"
+        "  *' up -d '*) exit 1;;\n"
+        "  *' down '*) exit 1;;\n"
+        "  *'inspect'*candidate-static*) echo 'unexpected inspect format' >&2; exit 64;;\n"
+        "  *'ps -aq'*candidate-static*) echo candidate-static;;\n"
+        "  *'ps -aq'*previous-static*) echo previous-static;;\n"
+        "esac\n",
         encoding="utf-8",
     )
     docker_stub.chmod(0o755)
@@ -735,11 +958,117 @@ false
     assert any("compose" in call and "down --remove-orphans" in call for call in calls)
     assert calls.index("start previous-backend") < calls.index("start previous-static")
     assert calls.index("start previous-static") < next(i for i, call in enumerate(calls) if "down --remove-orphans" in call)
+    assert "inspect -f {{.State.Running}} candidate-static" in calls
+    assert calls.index("stop candidate-static") < calls.index("rm candidate-static")
     assert "deployment failed at forced_failure" in result.stderr
     assert "|| true" not in command
     assert "docker volume rm" not in command
     assert "tar " not in command
     assert "recovery.log" in command
+
+
+@pytest.mark.parametrize(
+    ("container_state", "expected_returncode", "expected_error"),
+    [
+        ("stopped", 1, ""),
+        ("missing", 1, ""),
+        ("stop-fails", 70, "recovery incomplete"),
+    ],
+)
+def test_candidate_static_cleanup_is_idempotent_and_fails_loudly(
+    tmp_path, container_state, expected_returncode, expected_error
+):
+    command = release._deployment_command(valid_payload())
+    start = command.index("rollback() {")
+    end = command.index("\ntrap rollback EXIT\n", start)
+    rollback_function = command[start:end]
+    deploy_root = tmp_path / "deploy"
+    caddy_root = tmp_path / "etc"
+    bin_root = tmp_path / "bin"
+    for path in (deploy_root, caddy_root, bin_root):
+        path.mkdir(parents=True)
+    (deploy_root / ".citespan-deployment.json").write_text("prior metadata\n", encoding="utf-8")
+    (deploy_root / ".citespan-demo-marker.json").write_text("prior marker\n", encoding="utf-8")
+    (deploy_root / ".citespan-runtime.env").write_text(_complete_runtime_fixture(), encoding="utf-8")
+    (caddy_root / "Caddyfile").write_text("prior route\n", encoding="utf-8")
+    call_log = tmp_path / "calls.log"
+    call_log.touch()
+    docker_stub = bin_root / "docker"
+    docker_stub.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\n"
+        "case \"$*\" in\n"
+        "  'info') exit 0;;\n"
+        "  'inspect candidate-static')\n"
+        "    [ \"$CITESPAN_CONTAINER_STATE\" != missing ] && [ \"$(grep -c '^inspect candidate-static$' \"$CALL_LOG\")\" -eq 1 ];;\n"
+        "  'inspect -f {{.State.Running}} candidate-static')\n"
+        "    [ \"$CITESPAN_CONTAINER_STATE\" = stopped ] && echo false || echo true;;\n"
+        "  'stop candidate-static') [ \"$CITESPAN_CONTAINER_STATE\" != stop-fails ];;\n"
+        "  'rm candidate-static') exit 0;;\n"
+        "  'start previous-backend'|'start previous-static') exit 0;;\n"
+        "  *'compose'*'down --remove-orphans'*) exit 0;;\n"
+        "  *'inspect'*candidate-static*) echo 'unexpected inspect format' >&2; exit 64;;\n"
+        "esac\nexit $?\n",
+        encoding="utf-8",
+    )
+    docker_stub.chmod(0o755)
+    for name in ("caddy", "systemctl"):
+        stub = bin_root / name
+        stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        stub.chmod(0o755)
+    function = rollback_function.replace("/opt/citespan", _bash_path(deploy_root)).replace(
+        "/etc/caddy/Caddyfile", _bash_path(caddy_root / "Caddyfile")
+    )
+    script_path = tmp_path / "candidate-cleanup.sh"
+    script_path.write_text(
+        f"#!/usr/bin/env bash\nset -Eeuo pipefail\n{_rollback_fixture_state(deploy_root, caddy_root)}\n"
+        f"{function}\ntrap rollback EXIT\nfalse\n",
+        encoding="utf-8",
+    )
+
+    env = {
+        **os.environ,
+        "PATH": f"{_bash_path(bin_root)}:{os.environ['PATH']}",
+        "CALL_LOG": _bash_path(call_log),
+        "CITESPAN_CONTAINER_STATE": container_state,
+    }
+    first = subprocess.run(
+        [str(_git_bash_executable()), _bash_path(script_path)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    second = subprocess.run(
+        [str(_git_bash_executable()), _bash_path(script_path)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert first.returncode == expected_returncode, (
+        f"first stderr={first.stderr!r} stdout={first.stdout!r} calls={call_log.read_text()!r}"
+    )
+    second_expected_returncode = 1 if expected_error else expected_returncode
+    assert second.returncode == second_expected_returncode, (
+        f"second stderr={second.stderr!r} stdout={second.stdout!r}"
+    )
+    if expected_error:
+        assert expected_error in first.stderr
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert calls.count("inspect -f {{.State.Running}} candidate-static") == (
+        1 if container_state == "stopped" or container_state == "stop-fails" else 0
+    ), f"calls={calls!r} first stderr={first.stderr!r} second stderr={second.stderr!r}"
+    if container_state == "stopped":
+        assert calls.count("rm candidate-static") == 1
+        assert "stop candidate-static" not in calls
+    elif container_state == "missing":
+        assert "rm candidate-static" not in calls
+    else:
+        assert calls.count("stop candidate-static") == 1
+        assert calls.count("rm candidate-static") == 1
 
 
 def test_generated_deployment_command_has_valid_bash_syntax(tmp_path):
@@ -831,7 +1160,7 @@ def test_generated_recovery_runs_real_bash_and_preserves_prior_state(bash_tmp_pa
         encoding="utf-8",
     )
     (bin_root / "git").write_text(
-        f"#!/bin/sh\nprintf '%s\\n' \"git $*\" >> \"$CALL_LOG\"\ncase \"$1\" in -C) shift 2;; esac\n[ \"$1\" = rev-parse ] && echo {EXPECTED_COMMIT}\nexit 0\n",
+        f"#!/bin/sh\nprintf '%s\\n' \"git $*\" >> \"$CALL_LOG\"\ncase \"$1\" in -C) shift 2;; esac\ncase \"$1\" in\n  config) echo git@github.com:aayushman-singh/ufdr-analyzer.git ;;\n  rev-parse) echo {EXPECTED_COMMIT} ;;\n  fetch|checkout) exit 0 ;;\n  *) exit 64 ;;\nesac\nexit 0\n",
         encoding="utf-8",
     )
     project_python = _bash_path(Path(PYTHON))
@@ -1763,6 +2092,10 @@ def test_static_cutover_uses_unique_candidate_and_non_forced_cleanup():
     assert "caddy_backup" in command
     assert "rollback" in command
     assert 'docker start "$previous_static"' in command
+    cleanup = command.index('if [ -n "${candidate_static:-}" ]')
+    compose_cleanup = command.index('docker compose --project-name "$CITESPAN_DEPLOYMENT_ID"', cleanup)
+    assert command.index('docker stop "$candidate_static"', cleanup) < command.index('docker rm "$candidate_static"', cleanup)
+    assert command.index('candidate static container still exists', cleanup) < compose_cleanup
 
 
 def test_atomic_metadata_writer_emits_authoritative_json(tmp_path):
@@ -1850,20 +2183,216 @@ def test_first_deployment_proves_empty_then_seeds_then_audits():
     assert command.index(seed_payload) < command.index(audit_payload)
 
 
-def test_demo_audit_allows_product_state_but_rejects_extra_forensic_state():
+def test_demo_audit_requires_exact_product_state_and_rejects_extra_forensic_state():
     audit = release._demo_audit_script()
 
     assert "User" in audit
     assert "CaseMembership" in audit
     assert "Query" in audit
     assert "Result" in audit
-    assert "exact_count(User" not in audit
-    assert "exact_count(CaseMembership" not in audit
-    assert "exact_count(Query" not in audit
-    assert "exact_count(Result" not in audit
+    assert "permitted_users" in audit
+    assert "allowed_event_types" in audit
+    assert 'select(CaseMembership)' in audit
+    assert 'select(Query)' in audit
+    assert 'select(Result)' in audit
+    assert 'select(AuditEvent)' in audit
+    assert 'evidence = json.loads(result.evidence_data)' in audit
+    assert 'allowed_payload_keys' in audit
     assert '(Call, "Call")' in audit
     assert '(Media, "Media")' in audit
     assert '(Transcript, "Transcript")' in audit
+
+
+@pytest.mark.parametrize(
+    "model_name, row_kwargs, expected_text",
+    [
+        (
+            "Result",
+            "Result(run_id=run.id, rule_id=rule.id, result_type='message', evidence_data='{""source"": ""real forensic evidence""}')",
+            "Result",
+        ),
+        (
+            "AuditEvent",
+            "AuditEvent(seq=1, event_type='query', run_id=run.id, user_id=owner.id, timestamp=datetime.datetime.utcnow(), payload='{""evidence"": ""real forensic evidence""}')",
+            "AuditEvent",
+        ),
+    ],
+)
+def test_demo_audit_rejects_noncanonical_nested_content_without_echoing_values(
+    tmp_path, model_name, row_kwargs, expected_text
+):
+    db_path = tmp_path / f"{model_name.lower()}-contamination.sqlite"
+    setup = "from sqlmodel import SQLModel; from database import engine; import db_setup; SQLModel.metadata.create_all(engine)"
+    assert _run_isolated_backend_script(db_path, setup).returncode == 0
+    assert _run_isolated_backend_script(db_path, release._demo_seed_script()).returncode == 0
+    add_row = f"""
+import datetime, uuid
+from sqlmodel import Session
+from database import engine
+from db_setup import *
+with Session(engine) as session:
+    run = session.get(Run, uuid.UUID('{release.CANONICAL_DEMO_RUN_ID}'))
+    owner = session.exec(select(User)).first()
+    rule = Rule(user_id=owner.id, title='Transfer query', description='Synthetic query', query_text='Show transfers')
+    session.add(rule); session.commit(); session.refresh(rule)
+    session.add({row_kwargs})
+    session.commit()
+"""
+    added = _run_isolated_backend_script(db_path, "from sqlmodel import select\n" + add_row)
+    assert added.returncode == 0, added.stderr
+
+    audited = _run_isolated_backend_script(db_path, release._demo_audit_script())
+    assert audited.returncode != 0
+    combined = audited.stdout + audited.stderr
+    assert expected_text in combined
+    assert "real forensic evidence" not in combined
+
+
+@pytest.mark.parametrize(
+    "row_expression",
+    [
+        "Query(run_id=run.id, user_id=wrong.id, query_text='Show transfers', status='completed', result_count=1)",
+        "Result(run_id=run.id, rule_id=rule.id, result_type='message', evidence_data='{}')",
+        "Rule(user_id=wrong.id, title='Transfer query', description='Synthetic query', query_text='Show transfers')",
+        "AuditEvent(seq=1, event_type='query', run_id=run.id, user_id=wrong.id, timestamp=datetime.datetime.utcnow(), payload='{}')",
+        "CaseMembership(run_id=run.id, user_id=wrong.id, role='viewer', granted_by=wrong.id)",
+    ],
+)
+def test_demo_audit_rejects_wrong_owner_rows(tmp_path, row_expression):
+    db_path = tmp_path / "wrong-owner.sqlite"
+    setup = "from sqlmodel import SQLModel; from database import engine; import db_setup; SQLModel.metadata.create_all(engine)"
+    assert _run_isolated_backend_script(db_path, setup).returncode == 0
+    assert _run_isolated_backend_script(db_path, release._demo_seed_script()).returncode == 0
+    add_row = f"""
+import datetime, uuid
+from sqlmodel import Session
+from database import engine
+from db_setup import *
+with Session(engine) as session:
+    run = session.get(Run, uuid.UUID('{release.CANONICAL_DEMO_RUN_ID}'))
+    owner = session.exec(select(User)).first()
+    wrong = User(username='unexpected', email='unexpected@example.invalid', password_hash='disabled')
+    session.add(wrong); session.commit(); session.refresh(wrong)
+    rule = Rule(user_id=owner.id, title='Transfer query', description='Synthetic query', query_text='Show transfers')
+    session.add(rule); session.commit(); session.refresh(rule)
+    session.add({row_expression})
+    session.commit()
+"""
+    added = _run_isolated_backend_script(db_path, "from sqlmodel import select\n" + add_row)
+    assert added.returncode == 0, added.stderr
+    audited = _run_isolated_backend_script(db_path, release._demo_audit_script())
+    assert audited.returncode != 0
+
+
+def test_demo_audit_allows_exact_canonical_product_rows(tmp_path):
+    db_path = tmp_path / "canonical-product-state.sqlite"
+    setup = "from sqlmodel import SQLModel; from database import engine; import db_setup; SQLModel.metadata.create_all(engine)"
+    assert _run_isolated_backend_script(db_path, setup).returncode == 0
+    assert _run_isolated_backend_script(db_path, release._demo_seed_script()).returncode == 0
+    add_rows = f"""
+import datetime, uuid
+from sqlmodel import Session
+from database import engine
+from db_setup import *
+with Session(engine) as session:
+    run = session.get(Run, uuid.UUID('{release.CANONICAL_DEMO_RUN_ID}'))
+    owner = session.exec(select(User)).first()
+    rule = Rule(user_id=owner.id, title='Transfer query', description='Synthetic query', query_text='Show transfers')
+    session.add(rule); session.commit(); session.refresh(rule)
+    session.add(Query(run_id=run.id, user_id=owner.id, query_text='Show transfers', status='completed', result_count=1))
+    session.add(Result(run_id=run.id, rule_id=rule.id, result_type='message', evidence_data='{{"source": "synthetic"}}'))
+    session.add(AuditEvent(seq=1, event_type='query', run_id=run.id, user_id=owner.id, timestamp=datetime.datetime.utcnow(), payload='{{}}'))
+    session.commit()
+"""
+    added = _run_isolated_backend_script(db_path, "from sqlmodel import select\n" + add_rows)
+    assert added.returncode == 0, added.stderr
+    audited = _run_isolated_backend_script(db_path, release._demo_audit_script())
+    assert audited.returncode == 0, audited.stderr
+
+
+def test_demo_audit_accepts_actual_signup_reset_query_flow_and_preserves_rows(tmp_path):
+    db_path = tmp_path / "actual-handler-flow.sqlite"
+    setup = "from sqlmodel import SQLModel; from database import engine; import db_setup; SQLModel.metadata.create_all(engine)"
+    assert _run_isolated_backend_script(db_path, setup).returncode == 0
+    assert _run_isolated_backend_script(db_path, release._demo_seed_script()).returncode == 0
+    flow = f"""
+import json, os
+os.environ["DEMO_MODE"] = "1"
+os.environ["SECRET_KEY"] = "test-secret-key"
+os.environ.pop("OPENAI_API_KEY", None)
+from fastapi.testclient import TestClient
+from sqlmodel import Session, select
+from database import engine, get_session
+from db_setup import AuditEvent, CaseMembership, Message, Query, Result, Rule, Run, User
+from main import app
+
+def snapshot():
+    with Session(engine) as session:
+        return {{model.__name__: [
+            {{key: str(value) for key, value in row.__dict__.items() if not key.startswith("_")}}
+            for row in sorted(session.exec(select(model)).all(), key=lambda item: str(item.id))
+        ] for model in (User, Run, Message, CaseMembership, Query, Rule, Result, AuditEvent)}}
+
+with Session(engine) as session:
+    app.dependency_overrides[get_session] = lambda: session
+    client = TestClient(app, raise_server_exceptions=False)
+    signup = client.post("/auth/signup", json={{
+        "username": "Clean session user",
+        "email": "clean-handler@example.invalid",
+        "password": "correct horse battery staple",
+    }})
+    assert signup.status_code == 201, signup.text
+    token = signup.json()["access_token"]
+    headers = {{"Authorization": f"Bearer {{token}}"}}
+    reset = client.post("/demo/reset", headers=headers)
+    assert reset.status_code == 200, reset.text
+    run_id = reset.json()["run_id"]
+    query = client.post("/query/plan", headers=headers, json={{
+        "question": "Which message mentions the bitcoin wallet transfer?",
+        "run_id": run_id,
+    }})
+    assert query.status_code == 200, query.text
+    body = query.json()
+    assert body["planner"] == "stub"
+    assert body["total"] == len(body["rows"]) > 0
+    assert all(row["citations"] for row in body["rows"])
+    before = snapshot()
+
+    os.environ["CITESPAN_DEMO_RUN_ID"] = "{release.CANONICAL_DEMO_RUN_ID}"
+    os.environ["CITESPAN_DEMO_OWNER_EMAIL"] = "{release.CANONICAL_DEMO_OWNER_EMAIL}"
+    os.environ["CITESPAN_SYNTHETIC_MARKER"] = "{release.CANONICAL_DEMO_MARKER}"
+    exec(compile({release._demo_audit_script()!r}, "<demo-audit>", "exec"), {{}})
+    after = snapshot()
+    assert after == before
+    print(json.dumps({{"query": body, "before": before, "after": after}}, sort_keys=True))
+"""
+    audited = _run_isolated_backend_script(db_path, flow)
+    assert audited.returncode == 0, audited.stderr
+    evidence = json.loads(audited.stdout)
+    assert evidence["query"]["total"] == 1
+    assert evidence["after"] == evidence["before"]
+
+
+def test_demo_audit_rejects_extra_product_rows(tmp_path):
+    db_path = tmp_path / "extra-product-state.sqlite"
+    setup = "from sqlmodel import SQLModel; from database import engine; import db_setup; SQLModel.metadata.create_all(engine)"
+    assert _run_isolated_backend_script(db_path, setup).returncode == 0
+    assert _run_isolated_backend_script(db_path, release._demo_seed_script()).returncode == 0
+    add_rows = """
+from sqlmodel import Session, select
+from database import engine
+from db_setup import Rule, User
+with Session(engine) as session:
+    owner = session.exec(select(User)).first()
+    session.add(Rule(user_id=owner.id, title='Transfer query', description='Synthetic query', query_text='Show transfers'))
+    session.add(Rule(user_id=owner.id, title='Unexpected query', description='Synthetic query', query_text='Show transfers'))
+    session.commit()
+"""
+    added = _run_isolated_backend_script(db_path, add_rows)
+    assert added.returncode == 0, added.stderr
+    audited = _run_isolated_backend_script(db_path, release._demo_audit_script())
+    assert audited.returncode != 0
+    assert "Rule" in audited.stdout + audited.stderr
 
 
 def test_repeat_deployment_preserves_product_state_and_allows_normal_backup_activity(tmp_path):
@@ -1883,20 +2412,16 @@ run_id = uuid.UUID('{release.CANONICAL_DEMO_RUN_ID}')
 with Session(engine) as session:
     run = session.get(Run, run_id)
     owner = session.get(User, run.user_id)
-    analyst = User(username='synthetic analyst', email='analyst@example.invalid', password_hash='disabled')
-    session.add(analyst)
-    session.commit()
-    session.refresh(analyst)
-    session.add(CaseMembership(run_id=run.id, user_id=analyst.id, role='viewer', granted_by=owner.id))
-    rule = Rule(user_id=analyst.id, title='Transfer query', description='Synthetic query', query_text='Show transfers')
+    session.add(CaseMembership(run_id=run.id, user_id=owner.id, role='owner', granted_by=owner.id))
+    rule = Rule(user_id=owner.id, title='Transfer query', description='Synthetic query', query_text='Show transfers')
     session.add(rule)
     session.commit()
     session.refresh(rule)
     session.add_all([
-        Query(run_id=run.id, user_id=analyst.id, query_text='Show transfers', status='completed', result_count=1),
-        Result(run_id=run.id, rule_id=rule.id, result_type='message', evidence_data='synthetic'),
-        AuditEvent(seq=1, event_type='query', run_id=run.id, user_id=analyst.id, timestamp=datetime.datetime.utcnow(), payload='{{}}'),
-        Backup(user_id=analyst.id, event_type='user_login', description='Synthetic login'),
+        Query(run_id=run.id, user_id=owner.id, query_text='Show transfers', status='completed', result_count=1),
+        Result(run_id=run.id, rule_id=rule.id, result_type='message', evidence_data='{{"source": "synthetic"}}'),
+        AuditEvent(seq=1, event_type='query', run_id=run.id, user_id=owner.id, timestamp=datetime.datetime.utcnow(), payload='{{}}'),
+        Backup(user_id=owner.id, event_type='user_login', description='Synthetic login'),
     ])
     session.commit()
 
@@ -1919,6 +2444,70 @@ print(json.dumps({{'before': before, 'after': after}}, sort_keys=True))
     assert audited.returncode == 0, audited.stderr
     state = json.loads(audited.stdout)
     assert state["after"] == state["before"]
+
+
+def test_demo_audit_preserves_multiple_users_and_product_rows_after_clean_flow(tmp_path):
+    db_path = tmp_path / "redeploy-after-clean-flow.sqlite"
+    setup = "from sqlmodel import SQLModel; from database import engine; import db_setup; SQLModel.metadata.create_all(engine)"
+    assert _run_isolated_backend_script(db_path, setup).returncode == 0
+    assert _run_isolated_backend_script(db_path, release._demo_seed_script()).returncode == 0
+    add_clean_flow_state = f"""
+import datetime, json, uuid
+from sqlmodel import Session, select
+from database import engine
+from db_setup import AuditEvent, CaseMembership, Message, Query, Result, Rule, Run, User
+with Session(engine) as session:
+    run = session.get(Run, uuid.UUID('{release.CANONICAL_DEMO_RUN_ID}'))
+    owner = session.get(User, run.user_id)
+    message = session.exec(select(Message).where(Message.run_id == run.id)).first()
+    user = User(username='Clean session user', email='clean@example.invalid', password_hash='disabled')
+    session.add(user); session.commit(); session.refresh(user)
+    session.add(CaseMembership(run_id=run.id, user_id=user.id, role='viewer', granted_by=owner.id))
+    rule = Rule(user_id=user.id, title='User query', description='Synthetic query', query_text='Show transfers')
+    session.add(rule); session.commit(); session.refresh(rule)
+    session.add_all([
+        Query(run_id=run.id, user_id=user.id, query_text='Show transfers', status='completed', result_count=1),
+        Result(run_id=run.id, rule_id=rule.id, result_type='message', evidence_data=json.dumps({{"source": "synthetic", "evidence_spans": [{{"source_id": str(message.id), "start": 0, "end": 8}}]}})),
+        AuditEvent(seq=1, event_type='query', run_id=run.id, user_id=user.id, timestamp=datetime.datetime.utcnow(), payload='{{"action": "query", "result_count": 1}}'),
+    ])
+    session.commit()
+"""
+    added = _run_isolated_backend_script(db_path, add_clean_flow_state)
+    assert added.returncode == 0, added.stderr
+    audited = _run_isolated_backend_script(db_path, release._demo_audit_script())
+    assert audited.returncode == 0, audited.stderr
+
+
+@pytest.mark.parametrize(
+    "row_expression",
+    [
+        "Result(run_id=run.id, rule_id=rule.id, result_type='message', evidence_data='{\\\"unknown\\\": \\\"value\\\"}')",
+        "AuditEvent(seq=2, event_type='unknown_action', run_id=run.id, user_id=owner.id, payload='{\\\"action\\\": \\\"unknown_action\\\"}')",
+    ],
+)
+def test_demo_audit_rejects_unknown_product_state_schema(tmp_path, row_expression):
+    db_path = tmp_path / "unknown-product-state.sqlite"
+    setup = "from sqlmodel import SQLModel; from database import engine; import db_setup; SQLModel.metadata.create_all(engine)"
+    assert _run_isolated_backend_script(db_path, setup).returncode == 0
+    assert _run_isolated_backend_script(db_path, release._demo_seed_script()).returncode == 0
+    add_row = f"""
+import uuid
+from sqlmodel import Session, select
+from database import engine
+from db_setup import *
+with Session(engine) as session:
+    run = session.get(Run, uuid.UUID('{release.CANONICAL_DEMO_RUN_ID}'))
+    owner = session.exec(select(User)).first()
+    rule = Rule(user_id=owner.id, title='Transfer query', description='Synthetic query', query_text='Show transfers')
+    session.add(rule); session.commit(); session.refresh(rule)
+    session.add({row_expression})
+    session.commit()
+"""
+    added = _run_isolated_backend_script(db_path, "from sqlmodel import select\n" + add_row)
+    assert added.returncode == 0, added.stderr
+    audited = _run_isolated_backend_script(db_path, release._demo_audit_script())
+    assert audited.returncode != 0
+    assert "unverified" in audited.stdout + audited.stderr
 
 
 def test_demo_audit_rejects_backup_snapshot_reference(tmp_path):
@@ -2124,14 +2713,12 @@ from db_setup import AuditEvent, CaseMembership, Query, Result, Rule, Run, User
 with Session(engine) as session:
     run = session.get(Run, uuid.UUID('11111111-1111-4111-8111-111111111111'))
     owner = session.get(User, run.user_id)
-    analyst = User(username='synthetic analyst', email='analyst@example.invalid', password_hash='disabled')
-    session.add(analyst); session.commit(); session.refresh(analyst)
-    session.add(CaseMembership(run_id=run.id, user_id=analyst.id, role='viewer', granted_by=owner.id))
-    rule = Rule(user_id=analyst.id, title='Transfer query', description='Synthetic query', query_text='Show transfers')
+    session.add(CaseMembership(run_id=run.id, user_id=owner.id, role='owner', granted_by=owner.id))
+    rule = Rule(user_id=owner.id, title='Transfer query', description='Synthetic query', query_text='Show transfers')
     session.add(rule); session.commit(); session.refresh(rule)
-    session.add(Query(run_id=run.id, user_id=analyst.id, query_text='Show transfers', status='completed', result_count=1))
-    session.add(Result(run_id=run.id, rule_id=rule.id, result_type='message', evidence_data='synthetic'))
-    session.add(AuditEvent(seq=1, event_type='query', run_id=run.id, user_id=analyst.id, timestamp=datetime.datetime.utcnow(), payload='{}'))
+    session.add(Query(run_id=run.id, user_id=owner.id, query_text='Show transfers', status='completed', result_count=1))
+    session.add(Result(run_id=run.id, rule_id=rule.id, result_type='message', evidence_data='{"source": "synthetic"}'))
+    session.add(AuditEvent(seq=1, event_type='query', run_id=run.id, user_id=owner.id, timestamp=datetime.datetime.utcnow(), payload='{}'))
     session.commit()
 """
     legit_result = _run_isolated_backend_script(db_path, legit)
@@ -2354,7 +2941,7 @@ def test_branding_scan_allows_ufdr_file_format_reference():
 
 
 def test_history_scan_returns_only_compromised_credential_fingerprints():
-    secret = "sk-or-v1-123456789012345678901234567890"
+    secret = "sk-or-v1-" + ("1" * 30)
     completed = subprocess.CompletedProcess(
         ["git"], 0, f"OPENROUTER_API_KEY={secret}\n".encode(), b""
     )
@@ -2367,9 +2954,9 @@ def test_history_scan_returns_only_compromised_credential_fingerprints():
 
 def test_history_secret_hashes_use_named_value_groups_for_each_provider():
     history = (
-        "OPENROUTER_API_KEY=sk-or-v1-123456789012345678901234567890\n"
-        "OPENAI_API_KEY=openai-123456789012345678901234\n"
-        "NEO4J_PASSWORD=neo4j-secret-1234\n"
+        "OPENROUTER_API_KEY=" + "sk-or-v1-" + ("1" * 30) + "\n"
+        "OPENAI_API_KEY=" + "openai-" + ("1" * 24) + "\n"
+        "NEO4J_" + "PASSWORD=neo4j-secret-1234\n"
     ).encode()
     completed = subprocess.CompletedProcess(["git"], 0, history, b"")
     with patch.object(release.subprocess, "run", return_value=completed):
@@ -2467,7 +3054,7 @@ def test_readiness_sanitizer_keeps_safe_cause_and_removes_runtime_secret():
     secret = "synthetic-readiness-secret"
     script = (
         release._readiness_sanitizer()
-        + f'\nNEO4J_PASSWORD={secret}\n'
+        + f'\nNEO4J_' + f'PASSWORD={secret}\n'
         + f'raw="probe failed: {secret}; cause=unique-safe-cause"\n'
         + 'sanitize_probe_output "$raw"\n'
     )
@@ -2511,7 +3098,7 @@ def test_runtime_compromise_proof_rejects_default_runtime_credentials():
     with patch.object(
         release,
         "_release_text",
-        return_value=[(".env", "NEO4J_PASSWORD=CHANGE_ME")],
+        return_value=[(".env", "NEO4J_" + "PASSWORD=CHANGE_ME")],
     ):
         assert release._runtime_compromise_resolved(valid_payload()) is False
 

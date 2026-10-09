@@ -147,8 +147,8 @@ def test_text_search_returns_cited_rows(session, run_id):
     assert row.citations, "match must carry a citation"
     cite = row.citations[0]
     assert cite.column == "content"
-    assert cite.matched_value == "bitcoin"
-    assert row.preview[cite.char_start : cite.char_end].lower() == "bitcoin"
+    assert cite.matched_value == "Bitcoin"
+    assert cite.snippet[cite.char_start : cite.char_end] == cite.matched_value
 
 
 def test_participant_search_across_tables(session, run_id):

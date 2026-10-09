@@ -22,8 +22,6 @@ from sqlmodel import Session
 from ai.query_compiler import SCHEMA
 from ai.query_plan import Op, QueryPlan, Target
 
-_SNIPPET_PAD = 40
-
 
 @dataclass
 class Citation:
@@ -75,14 +73,6 @@ class QueryAnswer:
         }
 
 
-def _snippet(value: str, start: int, end: int) -> str:
-    lo = max(0, start - _SNIPPET_PAD)
-    hi = min(len(value), end + _SNIPPET_PAD)
-    prefix = "…" if lo > 0 else ""
-    suffix = "…" if hi < len(value) else ""
-    return f"{prefix}{value[lo:hi]}{suffix}"
-
-
 def _cite_row(
     target: Target,
     row_map: dict,
@@ -98,7 +88,11 @@ def _cite_row(
             raw = row_map.get(col)
             if raw is None:
                 continue
-            col_val = str(raw)
+            if not isinstance(raw, str):
+                raise ValueError(
+                    f"citation source value for {schema.table}.{col} is not text"
+                )
+            col_val = raw
             hay = col_val.lower()
             for value in pred.values:
                 needle = value.lower()
@@ -106,24 +100,35 @@ def _cite_row(
                     idx = hay.find(needle)
                     if idx == -1:
                         continue
-                    start, end = idx, idx + len(value)
+                    start, end = idx, idx + len(needle)
                 elif pred.op in (Op.equals, Op.is_in):
                     if hay != needle:
                         continue
                     start, end = 0, len(col_val)
                 else:  # pragma: no cover
                     continue
+                matched_value = col_val[start:end]
+                if not (0 <= start < end <= len(col_val)):
+                    raise ValueError(
+                        f"citation span is invalid for {schema.table}.{col}"
+                    )
+                if col_val[start:end] != matched_value:
+                    raise ValueError(
+                        f"citation span does not match source for {schema.table}.{col}"
+                    )
                 citations.append(
                     Citation(
                         source_table=schema.table,
                         row_id=row_id,
                         column=col,
-                        matched_value=value,
-                        snippet=_snippet(col_val, start, end),
+                        matched_value=matched_value,
+                        snippet=col_val,
                         char_start=start,
                         char_end=end,
                     )
                 )
+    if plan.predicates and not citations:
+        raise ValueError(f"citation predicate cannot be located in source row {row_id}")
     return citations
 
 

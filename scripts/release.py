@@ -8,6 +8,7 @@ non-zero exit code. No secret value is printed.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import codecs
 import hashlib
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -56,19 +58,18 @@ DEPLOYMENT_METADATA = f"{DEPLOY_PATH}/.citespan-deployment.json"
 DEMO_MARKER = f"{DEPLOY_PATH}/.citespan-demo-marker.json"
 EXTERNAL_PROOF_ROOT = Path.home() / ".citespan" / "release-proof"
 CANONICAL_DEMO_RUN_ID = "11111111-1111-4111-8111-111111111111"
+CANONICAL_DEMO_ARTIFACT_ROW_ID = "22222222-2222-4222-8222-222222222222"
+CANONICAL_DEMO_MESSAGE_ROW_IDS = (
+    "33333333-3333-4333-8333-333333333333",
+    "44444444-4444-4444-8444-444444444444",
+)
 CANONICAL_DEMO_FILE_NAME = "demo_synthetic.ufdr"
 CANONICAL_DEMO_OWNER_EMAIL = "citespan-demo-owner@example.invalid"
 CANONICAL_DEMO_MARKER = "citespan-synthetic-demo-v1"
 SECRET_PATTERNS = (
     re.compile(r"sk-or-v1-[A-Za-z0-9_-]{20,}"),
     re.compile(r"(?i)(openrouter|openai)_api_key\s*[:=]\s*['\"]?(?!REPLACE_WITH|CHANGE_ME|CHANGEME)[A-Za-z0-9_-]{20,}"),
-    re.compile(r"(?i)neo4j_password\s*[:=]\s*(?!os\.getenv\b|[-$])['\"]?(?!\*{3}REDACTED)[^\s'\"]{8,}"),
-)
-INERT_CREDENTIAL_SCANNER_SOURCES = frozenset(
-    {
-        "scripts/release.py",
-        "scripts/tests/test_release.py",
-    }
+    re.compile(r"(?i)neo4j_password\s*[:=]\s*(?!os\.getenv\b|[-$]|%[A-Za-z])['\"]?(?!\*{3}REDACTED)[^\s'\"]{8,}"),
 )
 FORENSIC_EXTENSIONS = {
     ".ufdr", ".zip", ".tar", ".gz", ".tgz", ".7z", ".rar", ".db", ".sqlite",
@@ -189,6 +190,53 @@ def _git(*args: str) -> str:
         ["git", *args], cwd=ROOT, check=True, capture_output=True
     )
     return _decode_utf8(result.stdout, "git stdout").strip()
+
+
+def _normalize_repository_origin(value: str) -> str:
+    """Accept only unambiguous GitHub transport forms for this repository."""
+    if not isinstance(value, str) or not value or any(char.isspace() for char in value):
+        raise ValueError("release blocked: repository origin is invalid")
+    if value.startswith("git@"):
+        match = re.fullmatch(r"git@([^:]+):([^/]+)/([^/]+?)(?:\.git)?", value)
+        if not match or match.group(1).lower() != "github.com":
+            raise ValueError("release blocked: repository origin is not the authorized GitHub repository")
+        owner, repository = match.group(2), match.group(3)
+    else:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme.lower() not in {"https", "ssh"}
+            or parsed.hostname is None
+            or parsed.hostname.lower() != "github.com"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("release blocked: repository origin is not the authorized GitHub repository")
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) != 2:
+            raise ValueError("release blocked: repository origin is not the authorized GitHub repository")
+        owner, repository = parts
+        if repository.endswith(".git"):
+            repository = repository[:-4]
+    if owner != "aayushman-singh" or repository != "ufdr-analyzer":
+        raise ValueError("release blocked: repository origin is not the authorized repository")
+    return "aayushman-singh/ufdr-analyzer"
+
+
+def _remote_origin_check_script() -> str:
+    """Return the remote-side origin normalizer without exposing its input."""
+    return (
+        "import os, re; from urllib.parse import urlsplit; "
+        "value=os.environ.get('CITESPAN_ORIGIN_URL',''); "
+        "scp=re.fullmatch(r'git@([^:]+):([^/]+)/([^/]+?)(?:\\.git)?', value); "
+        "parsed=None if scp else urlsplit(value); "
+        "path=[] if parsed is None else parsed.path.strip('/').split('/'); "
+        "parts=scp.groups() if scp else (parsed.hostname, path[0], path[1][:-4] if path[1].endswith('.git') else path[1]) if len(path)==2 else None; "
+        "valid=bool(parts) and parts[0].lower()=='github.com' and parts[1]=='aayushman-singh' and parts[2]=='ufdr-analyzer' and (bool(scp) or (parsed.scheme.lower() in {'https','ssh'} and parsed.username is None and parsed.password is None and parsed.port is None and not parsed.query and not parsed.fragment)); "
+        "(_ for _ in ()).throw(SystemExit(1)) if not valid else print('aayushman-singh/ufdr-analyzer')"
+    )
 
 
 def _decode_utf8(value: bytes, stream: str) -> str:
@@ -332,15 +380,127 @@ def _release_text() -> list[tuple[str, str]]:
 
 
 def _credential_scan_findings(values: list[tuple[str, str]]) -> list[str]:
-    """Find credential values without treating scanner fixtures as runtime data."""
+    """Find credential values while excluding inert Python string syntax."""
     findings = []
     for name, text in values:
         normalized_name = name.replace("\\", "/")
-        if normalized_name in INERT_CREDENTIAL_SCANNER_SOURCES:
-            continue
-        if any(pattern.search(text) for pattern in SECRET_PATTERNS):
+        scan_text = _credential_scan_text(normalized_name, text)
+        if any(pattern.search(scan_text) for pattern in SECRET_PATTERNS):
             findings.append(name)
     return findings
+
+
+def _credential_scan_text(name: str, text: str) -> str:
+    """Return complete source plus narrowly reviewed static credential evidence."""
+    if not name.endswith(".py"):
+        return text
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return text
+
+    evidence: list[str] = []
+    for node in ast.walk(tree):
+        targets: list[ast.expr] = []
+        value: ast.expr | None = None
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        elif isinstance(node, ast.Return):
+            value = node.value
+        if value is None or _is_inert_scanner_definition(node, targets):
+            continue
+
+        for target in targets:
+            key = _credential_name(target)
+            static_value = _static_string_value(value)
+            if key is not None and static_value is not None:
+                evidence.append(f"{key}={static_value}")
+
+        for key, item in _credential_mapping_entries(value):
+            static_value = _static_string_value(item)
+            if static_value is not None and not _is_reviewed_inert_python_value(
+                name, key, static_value
+            ):
+                evidence.append(f"{key}={static_value}")
+
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            assignment_targets = targets or [node.target]
+            for target in assignment_targets:
+                if not isinstance(target, ast.Subscript):
+                    continue
+                key = _credential_subscript_name(target.slice)
+                static_value = _static_string_value(value)
+                if key is not None and static_value is not None:
+                    evidence.append(f"{key}={static_value}")
+    return text + "\n" + "\n".join(evidence)
+
+
+def _credential_name(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name) and SECRET_KEYS.search(node.id):
+        return node.id
+    if isinstance(node, ast.Attribute) and SECRET_KEYS.search(node.attr):
+        return node.attr
+    if isinstance(node, (ast.Tuple, ast.List)):
+        for element in node.elts:
+            name = _credential_name(element)
+            if name is not None:
+                return name
+    return None
+
+
+def _is_inert_scanner_definition(node: ast.AST, targets: list[ast.expr]) -> bool:
+    if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+        return False
+    names = {target.id.lower() for target in targets if isinstance(target, ast.Name)}
+    return bool(names & {"secret_patterns", "secret_keys"})
+
+
+def _is_reviewed_inert_python_value(name: str, key: str, value: str) -> bool:
+    return (
+        name.replace("\\", "/"),
+        key,
+        value,
+    ) == ("scripts/tests/test_release.py", "neo4j_password", "synthetic-test-password")
+
+
+def _credential_mapping_entries(node: ast.AST) -> list[tuple[str, ast.expr]]:
+    entries: list[tuple[str, ast.expr]] = []
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Dict):
+            continue
+        for key, value in zip(child.keys, child.values):
+            credential_name = _credential_subscript_name(key)
+            if credential_name is not None:
+                entries.append((credential_name, value))
+    return entries
+
+
+def _credential_subscript_name(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value if SECRET_KEYS.search(node.value) else None
+    return _credential_name(node)
+
+
+def _static_string_value(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _static_string_value(node.left)
+        right = _static_string_value(node.right)
+        if left is not None and right is not None:
+            return left + right
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for value in node.values:
+            if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+                return None
+            parts.append(value.value)
+        return "".join(parts)
+    return None
 
 
 def _history_credential_findings() -> list[str]:
@@ -1162,9 +1322,9 @@ with Session(engine) as session:
     )
     session.add(run)
     session.add_all([
-        Message(run_id=run_id, sender="+15551234567", receiver="+15559876543", timestamp=datetime.datetime(2025, 3, 10, 14), content="Can you send the bitcoin wallet address for the transfer?"),
-        Message(run_id=run_id, sender="+15559876543", receiver="+15551234567", timestamp=datetime.datetime(2025, 3, 10, 16), content="Use the bank transfer reference for the synthetic sample."),
-        AleappArtifact(run_id=run_id, artifact_type="csv", filename="whatsapp_messages.csv", file_path="/synthetic/whatsapp_messages.csv", category="WhatsApp messages", row_count=1, data=json.dumps({"message": "The synthetic WhatsApp message confirms the bank transfer reference."}, sort_keys=True)),
+        Message(id=uuid.UUID("33333333-3333-4333-8333-333333333333"), run_id=run_id, sender="+15551234567", receiver="+15559876543", timestamp=datetime.datetime(2025, 3, 10, 14), content="Can you send the bitcoin wallet address for the transfer?"),
+        Message(id=uuid.UUID("44444444-4444-4444-8444-444444444444"), run_id=run_id, sender="+15559876543", receiver="+15551234567", timestamp=datetime.datetime(2025, 3, 10, 16), content="Use the bank transfer reference for the synthetic sample."),
+        AleappArtifact(id=uuid.UUID("22222222-2222-4222-8222-222222222222"), run_id=run_id, artifact_type="csv", filename="whatsapp_messages.csv", file_path="/synthetic/whatsapp_messages.csv", category="WhatsApp messages", row_count=1, data=json.dumps({"message": "The synthetic WhatsApp message confirms the bank transfer reference."}, sort_keys=True)),
     ])
     session.commit()
     assert run.ufdr_file_name == "demo_synthetic.ufdr"
@@ -1218,7 +1378,7 @@ canonical_artifact = {
     "data": json.dumps({"message": "The synthetic WhatsApp message confirms the bank transfer reference."}, sort_keys=True),
 }
 
-def exact_count(model, expected, label):
+def canonical_count(model, expected, label):
     rows = session.exec(select(model)).all()
     if len(rows) != expected:
         raise RuntimeError(f"existing deployment does not match exact canonical sample; non-canonical {label} count: {len(rows)}")
@@ -1228,21 +1388,22 @@ with Session(engine) as session:
     owner = session.exec(select(User).where(User.email == owner_email)).first()
     if owner is None:
         raise RuntimeError("existing deployment is missing the canonical demo owner")
-    runs = exact_count(Run, 1, "Run")
+    runs = canonical_count(Run, 1, "Run")
     run = runs[0]
     if run.id != canonical or run.user_id != owner.id or run.ufdr_file_name != "demo_synthetic.ufdr" or run.status != "complete" or run.file_content_hash is not None or run.original_file_path is not None:
-        raise RuntimeError("existing deployment contains an invalid canonical run relationship")
+        raise RuntimeError("existing deployment contains an unverified canonical run relationship")
     metadata = json.loads(run.extraction_metadata or "{}")
     if metadata != {"citespan_marker": marker, "owner_email": owner_email, "sample_id": "canonical-v1", "synthetic_only": True}:
         raise RuntimeError("existing deployment contains unverified forensic data")
-    messages = exact_count(Message, 2, "Message")
+    messages = canonical_count(Message, 2, "Message")
     observed_messages = tuple((item.sender, item.receiver, item.content) for item in sorted(messages, key=lambda item: item.timestamp))
     if any(item.run_id != canonical for item in messages) or observed_messages != canonical_messages:
-        raise RuntimeError("existing deployment contains non-canonical message contents")
-    artifacts = exact_count(AleappArtifact, 1, "AleappArtifact")
+        raise RuntimeError("existing deployment contains unverified message contents")
+    canonical_message_ids = {str(item.id) for item in messages}
+    artifacts = canonical_count(AleappArtifact, 1, "AleappArtifact")
     observed_artifacts = [{key: getattr(item, key) for key in canonical_artifact} for item in artifacts]
     if any(item.run_id != canonical for item in artifacts) or observed_artifacts != [canonical_artifact]:
-        raise RuntimeError("existing deployment contains non-canonical artifacts")
+        raise RuntimeError("existing deployment contains unverified artifacts")
     backups = session.exec(select(Backup)).all()
     forensic_backup_terms = ("snapshot", "forensic", "ufdr", "e01", "aff4", "sqlite", "artifact")
     for backup in backups:
@@ -1250,14 +1411,148 @@ with Session(engine) as session:
         snapshot_path = (backup.snapshot_path or "").lower()
         if backup.snapshot_path or any(term in description for term in forensic_backup_terms):
             raise RuntimeError("existing deployment contains an unverified Backup snapshot or forensic reference")
-    # User, CaseMembership, Query, Result, Rule, AuditEvent, and Backup are
-    # product state. The exact audit applies only to forensic evidence.
+    users = session.exec(select(User)).all()
+    permitted_users = {user.id for user in users}
+    if owner.id not in permitted_users:
+        raise RuntimeError("existing deployment contains an unverified canonical owner reference")
+    for user in users:
+        if not isinstance(user.id, uuid.UUID) or not isinstance(user.username, str) or not isinstance(user.email, str) or not isinstance(user.password_hash, str) or not isinstance(user.is_admin, bool):
+            raise RuntimeError("existing deployment contains an unverified User row")
+    if owner.username != "CiteSpan demo owner" or owner.email != owner_email or owner.password_hash != "release-owner-disabled" or owner.is_admin is not False:
+        raise RuntimeError("existing deployment contains an unverified canonical demo owner")
+
+    authorized_users = {owner.id}
+    memberships = session.exec(select(CaseMembership)).all()
+    for membership in memberships:
+        if membership.run_id != canonical or membership.user_id not in permitted_users:
+            raise RuntimeError("existing deployment contains an unverified CaseMembership")
+        if membership.role == "owner":
+            if membership.user_id != owner.id or membership.granted_by != owner.id:
+                raise RuntimeError("existing deployment contains an unverified CaseMembership")
+        elif membership.role == "viewer":
+            if membership.user_id == owner.id or membership.granted_by != owner.id:
+                raise RuntimeError("existing deployment contains an unverified CaseMembership")
+            authorized_users.add(membership.user_id)
+        else:
+            raise RuntimeError("existing deployment contains an unverified CaseMembership")
+    rules = session.exec(select(Rule)).all()
+    if len(rules) > 1:
+        raise RuntimeError("existing deployment contains an unverified Rule")
+    rule_ids = set()
+    for rule in rules:
+        if rule.user_id not in authorized_users or not isinstance(rule.title, str) or not isinstance(rule.description, str) or not isinstance(rule.query_text, str) or not isinstance(rule.is_template, bool):
+            raise RuntimeError("existing deployment contains an unverified Rule")
+        rule_ids.add(rule.id)
+
+    queries = session.exec(select(Query)).all()
+    for query in queries:
+        if query.run_id != canonical or query.user_id not in authorized_users or not isinstance(query.query_text, str) or query.status not in {"pending", "completed", "failed"} or not isinstance(query.result_count, int) or query.result_count < 0:
+            raise RuntimeError("existing deployment contains an unverified Query")
+        for field in (query.intent, query.parameters, query.results_summary, query.error_message):
+            if field is not None and not isinstance(field, str):
+                raise RuntimeError("existing deployment contains an unverified Query schema")
+
+    results = session.exec(select(Result)).all()
+    for result in results:
+        if result.run_id != canonical or result.rule_id not in rule_ids or result.result_type != "message" or (result.confidence_score is not None and not isinstance(result.confidence_score, (int, float))):
+            raise RuntimeError("existing deployment contains an unverified Result")
+        try:
+            evidence = json.loads(result.evidence_data)
+        except (TypeError, json.JSONDecodeError):
+            raise RuntimeError("existing deployment contains an unverified Result row")
+        if not isinstance(evidence, dict) or evidence.get("source") != "synthetic" or not set(evidence).issubset({"source", "citations", "evidence_spans"}):
+            raise RuntimeError("existing deployment contains an unverified Result row")
+        for key in ("citations", "evidence_spans"):
+            values = evidence.get(key, [])
+            if not isinstance(values, list) or any(not isinstance(item, dict) or not set(item).issubset({"kind", "id", "source_id", "start", "end"}) or any(not isinstance(value, (str, int)) for value in item.values()) for item in values):
+                raise RuntimeError("existing deployment contains an unverified Result row")
+            for item in values:
+                if item.get("kind") is not None and item["kind"] != "message":
+                    raise RuntimeError("existing deployment contains an unverified Result evidence reference")
+                for reference_key in ("id", "source_id"):
+                    if reference_key in item and item[reference_key] not in canonical_message_ids:
+                        raise RuntimeError("existing deployment contains an unverified Result evidence reference")
+
+    events = session.exec(select(AuditEvent)).all()
+    allowed_event_types = {"query", "ingest", "export", "user_login", "user_signup", "demo_reset"}
+    legacy_payload_keys = {"action", "result_count", "sample_id", "synthetic_only", "status", "run_id", "user_id"}
+    query_payload_keys = {"question", "planner", "plan", "sql", "total", "row_ids"}
+    allowed_payload_keys = legacy_payload_keys | query_payload_keys
+    canonical_evidence_ids = {
+        str(value).replace("-", "")
+        for value in (canonical_message_ids | {str(item.id) for item in artifacts})
+    }
+
+    def fail_event():
+        raise RuntimeError("existing deployment contains an unverified AuditEvent")
+
+    def validate_query_payload(payload, event):
+        if set(payload) != query_payload_keys or event.event_type != "query":
+            fail_event()
+        question = payload["question"]
+        if not isinstance(question, str) or not question.strip() or payload["planner"] != "stub":
+            fail_event()
+        if not isinstance(payload["sql"], str) or not payload["sql"].lstrip().upper().startswith("SELECT"):
+            fail_event()
+        if not isinstance(payload["total"], int) or payload["total"] < 0:
+            fail_event()
+        row_ids = payload["row_ids"]
+        if not isinstance(row_ids, list) or len(row_ids) != payload["total"] or len(set(row_ids)) != len(row_ids):
+            fail_event()
+        if any(not isinstance(row_id, str) or row_id.replace("-", "") not in canonical_evidence_ids for row_id in row_ids):
+            fail_event()
+        try:
+            from ai.planner import _stub_plan
+            from ai.query_plan import QueryPlan
+            expected_plan = _stub_plan(question)
+            observed_plan = QueryPlan.model_validate(payload["plan"])
+            if observed_plan.model_dump(mode="json") != expected_plan.model_dump(mode="json"):
+                fail_event()
+            if observed_plan.compile().rendered_sql != payload["sql"]:
+                fail_event()
+        except Exception as exc:
+            if isinstance(exc, RuntimeError):
+                raise
+            fail_event()
+    for event in events:
+        if event.event_type not in allowed_event_types or (event.run_id is not None and event.run_id != canonical) or (event.user_id is not None and event.user_id not in authorized_users):
+            fail_event()
+        if event.user_id is not None and event.user_id != owner.id and event.user_id not in authorized_users:
+            fail_event()
+        try:
+            payload = json.loads(event.payload or "{}")
+        except (TypeError, json.JSONDecodeError):
+            fail_event()
+        if not isinstance(payload, dict) or not set(payload).issubset(allowed_payload_keys):
+            fail_event()
+        if query_payload_keys & set(payload):
+            validate_query_payload(payload, event)
+            continue
+        if payload.get("action") is not None and payload["action"] not in allowed_event_types:
+            fail_event()
+        if payload.get("sample_id") is not None and payload["sample_id"] != "canonical-v1":
+            fail_event()
+        if payload.get("synthetic_only") is not None and payload["synthetic_only"] is not True:
+            fail_event()
+        if payload.get("result_count") is not None and (not isinstance(payload["result_count"], int) or payload["result_count"] < 0):
+            fail_event()
+        if payload.get("status") is not None and payload["status"] not in {"pending", "completed", "failed"}:
+            fail_event()
+        if payload.get("run_id") is not None and payload["run_id"] != str(canonical):
+            fail_event()
+        if payload.get("user_id") is not None and payload["user_id"] not in {str(value) for value in permitted_users}:
+            fail_event()
+        if any(not isinstance(value, (str, int, bool, type(None))) for value in payload.values()):
+            fail_event()
+
+    # These tables carry no canonical hosted-demo rows. Any existing row is
+    # unsafe because its full content cannot be matched to the sample.
     for model, label in (
         (EntityIndex, "EntityIndex"), (Transcript, "Transcript"),
         (Call, "Call"), (Contact, "Contact"), (Media, "Media"),
         (AleappReport, "AleappReport"),
     ):
-        exact_count(model, 0, label)
+        canonical_count(model, 0, label)
 """
 
 
@@ -1385,6 +1680,7 @@ def _deployment_command_authoritative(payload: dict[str, Any]) -> str:
     run_id = shlex.quote(_demo_run_id(payload))
     port_check = shlex.quote(_compose_backend_port_validation_script())
     runtime_check = shlex.quote(_runtime_validation_script(history_values))
+    origin_check = shlex.quote(_remote_origin_check_script())
     receipt_writer = shlex.quote(_receipt_writer())
     receipt_validate = shlex.quote(_receipt_validate())
     rollback_script = f"""rollback() {{
@@ -1441,6 +1737,25 @@ def _deployment_command_authoritative(payload: dict[str, Any]) -> str:
                 echo 'recovery failed: restart prior static' >&2
                 rollback_incomplete=1
             fi
+            if [ -n "${{candidate_static:-}}" ]; then
+                if ! docker info >/dev/null 2>&1; then
+                    echo 'recovery failed: Docker unavailable while removing candidate static container' >&2
+                    rollback_incomplete=1
+                elif docker inspect "$candidate_static" >/dev/null 2>&1; then
+                    if [ "$(docker inspect -f '{{{{.State.Running}}}}' "$candidate_static")" = true ] && ! docker stop "$candidate_static" >/dev/null; then
+                        echo 'recovery failed: stop candidate static container' >&2
+                        rollback_incomplete=1
+                    fi
+                    if ! docker rm "$candidate_static" >/dev/null; then
+                        echo 'recovery failed: remove candidate static container' >&2
+                        rollback_incomplete=1
+                    fi
+                    if docker inspect "$candidate_static" >/dev/null 2>&1; then
+                        echo 'recovery failed: candidate static container still exists' >&2
+                        rollback_incomplete=1
+                    fi
+                fi
+            fi
             if [ -n "${{compose_override:-}}" ] && ! docker compose --project-name "$CITESPAN_DEPLOYMENT_ID" --env-file {DEPLOY_PATH}/.citespan-runtime.env -f {DEPLOY_PATH}/{DEMO_COMPOSE} -f "$compose_override" down --remove-orphans; then
                 echo 'recovery failed: remove candidate services' >&2
                 rollback_incomplete=1
@@ -1461,6 +1776,7 @@ trap rollback EXIT
         "trap 'failed_step=\"$BASH_COMMAND\"' ERR; "
         f"domain={domain}; expected={expected}; run_id={run_id}; "
         f"test -f /etc/caddy/Caddyfile; if [ ! -d {DEPLOY_PATH}/.git ]; then git clone {shlex.quote(DEPLOY_REPOSITORY)} {DEPLOY_PATH}; fi; "
+        f"test -d {DEPLOY_PATH}/.git; if ! origin_url=$(git -C {DEPLOY_PATH} config --get remote.origin.url 2>/dev/null); then echo 'release blocked: origin lookup failed' >&2; exit 1; fi; test -n \"$origin_url\"; verified_origin=$(CITESPAN_ORIGIN_URL=\"$origin_url\" python3 -c {origin_check}); test \"$verified_origin\" = aayushman-singh/ufdr-analyzer; "
         f"export CITESPAN_SYNTHETIC_MARKER={shlex.quote(CANONICAL_DEMO_MARKER)}; "
         f"deployment_metadata={DEPLOYMENT_METADATA}; demo_marker={DEMO_MARKER}; receipt={DEPLOY_PATH}/.citespan-authoritative-receipt.json; backup_dir={DEPLOY_PATH}/.citespan-backups/$(date -u +%Y%m%d%H%M%S%N); mkdir -p \"$backup_dir\"; "
         f"runtime={DEPLOY_PATH}/.citespan-runtime.env; if [ ! -f \"$runtime\" ]; then umask 077; neo4j_password=$(openssl rand -hex 32); postgres_password=$(openssl rand -hex 32); meili_master_key=$(openssl rand -hex 32); minio_root_user=$(openssl rand -hex 16); minio_root_password=$(openssl rand -hex 32); secret_key=$(openssl rand -hex 32); temporary_runtime=$(mktemp \"$runtime.XXXXXX\"); printf 'DEMO_MODE=1\\nCITESPAN_SYNTHETIC_ONLY=1\\nOPENAI_API_KEY=\\nOPENROUTER_API_KEY=\\nNEO4J_PASSWORD=%s\\nPOSTGRES_USER=ufdr_user\\nPOSTGRES_DB=ufdr_analyzer\\nPOSTGRES_PASSWORD=%s\\nMEILI_MASTER_KEY=%s\\nMINIO_ROOT_USER=%s\\nMINIO_ROOT_PASSWORD=%s\\nMINIO_ACCESS_KEY=%s\\nMINIO_SECRET_KEY=%s\\nSECRET_KEY=%s\\n' \"$neo4j_password\" \"$postgres_password\" \"$meili_master_key\" \"$minio_root_user\" \"$minio_root_password\" \"$minio_root_user\" \"$minio_root_password\" \"$secret_key\" > \"$temporary_runtime\"; chmod 600 \"$temporary_runtime\"; mv -f \"$temporary_runtime\" \"$runtime\"; fi; python3 -c {runtime_check} \"$runtime\"; set -a; . \"$runtime\"; set +a; "
@@ -1484,7 +1800,7 @@ trap rollback EXIT
         + rollback_script
         + "history_hash_count=$(printf '%s\\n' " + shlex.quote(history_hashes) + " | wc -w); "
         + history_check
-        + f"git -C {DEPLOY_PATH} fetch --prune origin {expected_commit}; git -C {DEPLOY_PATH} checkout --detach --force {expected_commit}; "
+        + f"git -C {DEPLOY_PATH} fetch --prune origin main; test \"$(git -C {DEPLOY_PATH} rev-parse refs/remotes/origin/main)\" = {expected}; git -C {DEPLOY_PATH} fetch --prune origin {expected_commit}; test \"$(git -C {DEPLOY_PATH} rev-parse FETCH_HEAD)\" = {expected}; git -C {DEPLOY_PATH} checkout --detach --force {expected_commit}; "
         f"test \"$(git -C {DEPLOY_PATH} rev-parse HEAD)\" = {expected_commit}; "
         "if [ -n \"$previous_deployment_id\" ]; then\n"
         "test -n \"$authoritative_network\"; test -n \"$authoritative_postgres\"; test -n \"$authoritative_meili\"; test -n \"$authoritative_minio\"; "

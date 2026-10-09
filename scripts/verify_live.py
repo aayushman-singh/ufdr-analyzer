@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,51 @@ ROOT = Path(__file__).resolve().parents[1]
 EXTERNAL_PROOF_ROOT = Path.home() / ".citespan" / "release-proof"
 PLAYWRIGHT_BROWSERS_PATH = ROOT / ".venv" / "playwright-browsers"
 CANONICAL_DEMO_RUN_ID = "11111111-1111-4111-8111-111111111111"
+CANONICAL_DEMO_ARTIFACT_ROW_ID = "22222222-2222-4222-8222-222222222222"
+CANONICAL_DEMO_MESSAGE_ROW_IDS = (
+    "33333333-3333-4333-8333-333333333333",
+    "44444444-4444-4444-8444-444444444444",
+)
+CANONICAL_EVIDENCE_MANIFEST = {
+    "run_id": CANONICAL_DEMO_RUN_ID,
+    "case_id": CANONICAL_DEMO_RUN_ID,
+    "rows": {
+        ("aleappartifact", CANONICAL_DEMO_ARTIFACT_ROW_ID): {
+            "columns": {
+                "filename": "whatsapp_messages.csv",
+                "file_path": "/synthetic/whatsapp_messages.csv",
+                "category": "WhatsApp messages",
+                "data": json.dumps(
+                    {
+                        "message": "The synthetic WhatsApp message confirms the bank transfer reference."
+                    },
+                    sort_keys=True,
+                ),
+            }
+        },
+        ("message", CANONICAL_DEMO_MESSAGE_ROW_IDS[0]): {
+            "columns": {
+                "content": "Can you send the bitcoin wallet address for the transfer?"
+            }
+        },
+        ("message", CANONICAL_DEMO_MESSAGE_ROW_IDS[1]): {
+            "columns": {
+                "content": "Use the bank transfer reference for the synthetic sample."
+            }
+        },
+    },
+}
+
+
+def _canonical_content_digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+for _canonical_row in CANONICAL_EVIDENCE_MANIFEST["rows"].values():
+    _canonical_row["digests"] = {
+        column: _canonical_content_digest(content)
+        for column, content in _canonical_row["columns"].items()
+    }
 
 
 def _record_private_failure(step: str, exc: BaseException, state: dict[str, object]) -> Path:
@@ -45,32 +91,84 @@ def _sanitize_failure_text(value: str) -> str:
     )
 
 
-def _validate_cited_response(response: dict) -> None:
-    """Require actual rows with valid, in-snippet evidence spans."""
+def _validate_cited_response(response: dict, expected_run_id: str = CANONICAL_DEMO_RUN_ID) -> None:
+    """Require citations to match the closed canonical synthetic evidence manifest."""
+    manifest = CANONICAL_EVIDENCE_MANIFEST
+    if (
+        not isinstance(manifest, dict)
+        or not isinstance(manifest.get("run_id"), str)
+        or not isinstance(manifest.get("case_id"), str)
+        or not isinstance(manifest.get("rows"), dict)
+        or not manifest["rows"]
+        or expected_run_id != manifest["run_id"]
+        or manifest["case_id"] != manifest["run_id"]
+    ):
+        raise RuntimeError("canonical evidence manifest has an invalid run or case identity")
     if response.get("planner") != "stub":
         raise RuntimeError("query result does not identify the deterministic demo planner")
     rows = response.get("rows")
     if not isinstance(rows, list) or not rows:
         raise RuntimeError("query result has no cited result rows")
+    seen_rows: set[tuple[str, str]] = set()
     for row in rows:
-        citations = row.get("citations") if isinstance(row, dict) else None
+        if not isinstance(row, dict):
+            raise RuntimeError("query result contains an invalid evidence row")
+        source_table = row.get("source_table")
+        raw_row_id = row.get("row_id")
+        if not isinstance(source_table, str) or not isinstance(raw_row_id, str):
+            raise RuntimeError("query result contains an invalid evidence row identity")
+        try:
+            normalized_row_id = str(uuid.UUID(raw_row_id))
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise RuntimeError("query result contains an invalid evidence row identity") from exc
+        row_key = (source_table, normalized_row_id)
+        canonical_row = manifest["rows"].get(row_key)
+        if canonical_row is None:
+            raise RuntimeError("query result references an unknown canonical evidence row")
+        if row_key in seen_rows:
+            raise RuntimeError("query result contains a duplicate canonical evidence row")
+        seen_rows.add(row_key)
+        citations = row.get("citations")
         if not isinstance(citations, list) or not citations:
             raise RuntimeError("query result has no evidence spans")
         for citation in citations:
+            if not isinstance(citation, dict):
+                raise RuntimeError("query citation is not an object")
             snippet = citation.get("snippet")
             matched_value = citation.get("matched_value")
             start = citation.get("char_start")
             end = citation.get("char_end")
+            column = citation.get("column")
+            citation_source_table = citation.get("source_table")
+            citation_raw_row_id = citation.get("row_id")
+            if not isinstance(citation_source_table, str) or not isinstance(citation_raw_row_id, str):
+                raise RuntimeError("query citation has invalid evidence span metadata")
+            try:
+                citation_key = (citation_source_table, str(uuid.UUID(citation_raw_row_id)))
+            except (ValueError, AttributeError, TypeError) as exc:
+                raise RuntimeError("query citation has invalid evidence span metadata") from exc
             if (
                 not isinstance(snippet, str)
                 or not isinstance(matched_value, str)
                 or not isinstance(start, int)
                 or not isinstance(end, int)
+                or not isinstance(column, str)
+                or citation_key != row_key
             ):
                 raise RuntimeError("query citation has invalid evidence span metadata")
-            if start < 0 or end <= start or end > len(snippet):
+            canonical_content = canonical_row["columns"].get(column)
+            canonical_digest = canonical_row.get("digests", {}).get(column)
+            if (
+                not isinstance(canonical_content, str)
+                or not isinstance(canonical_digest, str)
+                or canonical_digest != _canonical_content_digest(canonical_content)
+            ):
+                raise RuntimeError("query citation references a non-canonical evidence column")
+            if snippet != canonical_content:
+                raise RuntimeError("query citation snippet does not equal canonical evidence content")
+            if start < 0 or end <= start or end > len(canonical_content):
                 raise RuntimeError("query citation evidence span is outside its snippet")
-            if snippet[start:end] != matched_value:
+            if canonical_content[start:end] != matched_value:
                 raise RuntimeError("query citation evidence text does not match its character span")
 
 
@@ -95,7 +193,7 @@ def _write_proof_artifacts(
     """Write durable proof and the draft only after browser proof passes."""
     if complete is not True:
         raise RuntimeError("live proof is not complete")
-    _validate_cited_response(observed_response)
+    _validate_cited_response(observed_response, CANONICAL_DEMO_RUN_ID)
     if upload_status != 403:
         raise RuntimeError("live proof requires the server-side upload mutation to return HTTP 403")
     if ingestion_statuses != {
@@ -266,7 +364,7 @@ def _run_browser_flow(playwright, live_url: str, run_id: str, question: str, out
         page.get_by_text("Cited Results", exact=True).wait_for()
         if query_response is None:
             raise RuntimeError("query response was not observed from the visible query action")
-        _validate_cited_response(query_response)
+        _validate_cited_response(query_response, run_id)
         if page.get_by_text(re.compile(r"planner: deterministic demo planner")).count() == 0:
             raise RuntimeError("query result does not identify the deterministic demo planner")
         if page.locator("[data-testid='cited-result-row']").count() == 0:
