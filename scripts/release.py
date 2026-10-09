@@ -212,6 +212,21 @@ RUNTIME_CONFIG_PATHS = (
 )
 SECRET_KEYS = re.compile(r"(?i)(api[_-]?key|password|secret|token)")
 SAFE_SECRET_REFERENCES = ("$", "os.getenv", "env:", "secret:", "vault:", "REPLACE_WITH", "CHANGE_ME")
+REQUIRED_RUNTIME_SECRET_KEYS = {
+    "NEO4J_PASSWORD",
+    "POSTGRES_PASSWORD",
+    "MEILI_MASTER_KEY",
+    "MINIO_ROOT_USER",
+    "MINIO_ROOT_PASSWORD",
+    "MINIO_ACCESS_KEY",
+    "MINIO_SECRET_KEY",
+    "SECRET_KEY",
+}
+PLACEHOLDER_SECRET = re.compile(
+    r"(?i)^(?:change[_-]?me|replace[_-]?(?:with|me)|"
+    r"your[_-](?:[a-z0-9]+[_-])*(?:key|secret)(?:[_-][a-z0-9]+)*[_-]here|placeholder|"
+    r"<[^<>\r\n]+>|\$\{[^{}\r\n]+\}|\{\{[^{}\r\n]+\}\})$"
+)
 
 
 def _git(*args: str) -> str:
@@ -594,6 +609,7 @@ def _runtime_validation_script(history_hashes: list[str]) -> str:
     hashes = repr(tuple(history_hashes))
     return f"""import hashlib
 import os
+import re
 import stat
 import sys
 from pathlib import Path
@@ -627,9 +643,25 @@ if values[\"DEMO_MODE\"] != \"1\" or values[\"CITESPAN_SYNTHETIC_ONLY\"] != \"1\
     raise ValueError(\"runtime env does not enforce synthetic demo mode\")
 if values[\"POSTGRES_USER\"] != \"ufdr_user\" or values[\"POSTGRES_DB\"] != \"ufdr_analyzer\":
     raise ValueError(\"runtime env has invalid PostgreSQL identity\")
+placeholder_secret = re.compile(
+    r\"(?i)^(?:change[_-]?me|replace[_-]?(?:with|me)|\"
+    r\"your[_-](?:[a-z0-9]+[_-])*(?:key|secret)(?:[_-][a-z0-9]+)*[_-]here|placeholder)$\"
+)
+
+def is_placeholder(value):
+    value = value.strip()
+    return bool(placeholder_secret.fullmatch(value)) or (
+        len(value) > 2
+        and value[0] == \"<\"
+        and value[-1] == \">\"
+        and \"<\" not in value[1:-1]
+        and \">\" not in value[1:-1]
+    ) or value.startswith(\"$\" + chr(123)) and value.endswith(chr(125)) or value.startswith(chr(123) * 2) and value.endswith(chr(125) * 2)
 for key in (\"NEO4J_PASSWORD\", \"POSTGRES_PASSWORD\", \"MEILI_MASTER_KEY\", \"MINIO_ROOT_USER\", \"MINIO_ROOT_PASSWORD\", \"SECRET_KEY\"):
     if not values[key]:
         raise ValueError(f\"runtime env has an empty {{key}}\")
+    if is_placeholder(values[key]):
+        raise ValueError(f\"runtime env has a placeholder value for {{key}}\")
 if values[\"OPENAI_API_KEY\"] or values[\"OPENROUTER_API_KEY\"]:
     raise ValueError(\"runtime env enables external AI credentials\")
 if values[\"MINIO_ACCESS_KEY\"] != values[\"MINIO_ROOT_USER\"] or values[\"MINIO_SECRET_KEY\"] != values[\"MINIO_ROOT_PASSWORD\"]:
@@ -1207,6 +1239,77 @@ def _check_payload_secrets(payload: dict[str, Any]) -> None:
         raise RuntimeError("release blocked: secret_rotation is provider-owned and must not be supplied")
 
 
+def _check_payload_runtime_placeholders(payload: dict[str, Any]) -> None:
+    """Reject unsafe values in nested provider runtime configuration."""
+
+    def normalize_key(value: Any) -> str:
+        return re.sub(r"[^A-Z0-9]", "_", str(value).upper()).strip("_")
+
+    def required_key(value: Any) -> bool:
+        return normalize_key(value) in REQUIRED_RUNTIME_SECRET_KEYS
+
+    def secret_key(value: Any) -> bool:
+        return bool(SECRET_KEYS.search(str(value)))
+
+    def safe_component(value: Any) -> str:
+        component = re.sub(r"[^A-Za-z0-9_.-]", "_", str(value))
+        return component[:80] or "field"
+
+    def path_for(path: tuple[str, ...]) -> str:
+        return ".".join(path) or "payload"
+
+    def inspect_value(value: Any, field: Any, path: tuple[str, ...]) -> None:
+        is_required = required_key(field)
+        is_secret = secret_key(field)
+        if is_required and (not isinstance(value, str) or not value.strip()):
+            raise RuntimeError(
+                "release blocked: runtime configuration has a malformed required "
+                f"secret at {path_for(path)}"
+            )
+        if (is_required or is_secret) and isinstance(value, str) and PLACEHOLDER_SECRET.fullmatch(value.strip()):
+            raise RuntimeError(
+                "release blocked: runtime configuration contains a placeholder at "
+                f"{path_for(path)}"
+            )
+
+    def inspect_assignment(value: str, path: tuple[str, ...]) -> None:
+        if "=" not in value:
+            return
+        field, assigned = value.split("=", 1)
+        if not field or not (required_key(field) or secret_key(field)):
+            return
+        inspect_value(assigned, field, path + (safe_component(field),))
+
+    visited: set[int] = set()
+
+    def visit(value: Any, path: tuple[str, ...] = (), field: Any = None) -> None:
+        if isinstance(value, dict):
+            identity = id(value)
+            if identity in visited:
+                return
+            visited.add(identity)
+            for child_field, child_value in value.items():
+                child_path = path + (safe_component(child_field),)
+                inspect_value(child_value, child_field, child_path)
+                visit(child_value, child_path, child_field)
+            return
+        if isinstance(value, list):
+            identity = id(value)
+            if identity in visited:
+                return
+            visited.add(identity)
+            for index, child_value in enumerate(value):
+                child_path = path + (f"[{index}]",)
+                if isinstance(child_value, str):
+                    inspect_assignment(child_value, child_path)
+                visit(child_value, child_path, field)
+            return
+        if isinstance(value, str) and field is not None:
+            inspect_assignment(value, path)
+
+    visit(payload)
+
+
 def _require_project_python(command: str) -> None:
     expected = PROJECT_PYTHON.resolve()
     try:
@@ -1255,13 +1358,56 @@ def _ssh(command: str) -> str:
         "-o",
         "StrictHostKeyChecking=accept-new",
         DEPLOY_HOST,
-        command,
+        "bash",
+        "-seuo",
+        "pipefail",
     ]
-    result = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, check=False)
+    try:
+        result = subprocess.run(
+            argv,
+            input=command.encode("utf-8"),
+            cwd=ROOT,
+            capture_output=True,
+            text=False,
+            check=False,
+        )
+    except OSError as exc:
+        detail = _sanitize_ssh_diagnostic(str(exc), command)
+        raise RuntimeError(
+            f"remote deployment process could not start: {detail}"
+        ) from exc
+    stdout = _decode_ssh_output(result.stdout, "stdout", result.returncode)
+    stderr = _decode_ssh_output(result.stderr, "stderr", result.returncode)
     if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "no remote error output"
-        raise RuntimeError(f"remote deployment command failed: {detail}")
-    return result.stdout.strip()
+        detail = _sanitize_ssh_diagnostic(
+            stderr.strip() or stdout.strip() or "no remote error output",
+            command,
+        )
+        raise RuntimeError(
+            f"remote deployment command failed (exit code {result.returncode}): {detail}"
+        )
+    return stdout.strip()
+
+
+def _decode_ssh_output(value: bytes, stream: str, returncode: int) -> str:
+    try:
+        return value.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        outcome = (
+            f"remote deployment command failed (exit code {returncode}): "
+            if returncode
+            else "remote deployment output is invalid: "
+        )
+        raise RuntimeError(f"{outcome}{stream} is not valid UTF-8") from exc
+
+
+def _sanitize_ssh_diagnostic(detail: str, command: str) -> str:
+    """Remove the submitted script and known secret values from SSH diagnostics."""
+    sanitized = detail.replace(command, "<submitted script>")
+    if command.strip() != command:
+        sanitized = sanitized.replace(command.strip(), "<submitted script>")
+    sanitized = sanitized.replace(SSH_KEY.as_posix(), "<configured SSH key>")
+    return _sanitize_failure_text(sanitized)
 
 
 def _runtime_compromise_resolved(payload: dict[str, Any]) -> bool:
@@ -2091,6 +2237,7 @@ def _observation_command() -> str:
 def _prepare(payload: dict[str, Any]) -> dict[str, Any]:
     action = _provider_payload(payload)
     _check_payload_secrets(payload)
+    _check_payload_runtime_placeholders(payload)
     demo_mode = _enforce_hosted_demo_mode(payload)
     release_text = _release_text()
     for name in _credential_scan_findings(release_text):

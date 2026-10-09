@@ -28,12 +28,17 @@ export function DashboardLayout() {
   const [chatInput, setChatInput] = useState("")
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>(mockChatMessages)
   const [isSending, setIsSending] = useState(false)
+  const hostedDemo = process.env.NEXT_PUBLIC_DEMO_MODE === "1"
 
   const handleSendMessage = async () => {
     const trimmedInput = chatInput.trim()
     if (!trimmedInput || isSending) return
 
-    // Retrieve the run_id from local storage for the API call.
+    if (hostedDemo) {
+      window.location.assign("/query-plan")
+      return
+    }
+
     const runId = localStorage.getItem("run_id")
     if (!runId) {
       alert("Error: No active analysis session found. Please upload a file first.")
@@ -42,15 +47,12 @@ export function DashboardLayout() {
 
     setIsSending(true)
 
-  
     const userMessage: ChatMessage = {
-      id: Date.now(), // Use a more unique ID
+      id: Date.now(),
       type: "user",
       message: trimmedInput,
       timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
     }
-
-  
     const loadingMessageId = Date.now() + 1
     const loadingMessage: ChatMessage = {
       id: loadingMessageId,
@@ -64,15 +66,14 @@ export function DashboardLayout() {
     setChatInput("")
 
     try {
-    
       const response = await authedFetch(`${API_BASE_URL}/query/execute`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           query: trimmedInput,
           run_id: runId,
-          user_id: null, // Will default to system user
-          provider: "openrouter", // Changed from "openrouter" to supported provider
+          user_id: null,
+          provider: "openrouter",
           generate_insights: true,
           max_insight_results: 50,
           max_response_results: 100,
@@ -85,7 +86,6 @@ export function DashboardLayout() {
       }
 
       const data = await response.json()
-
       const aiResponse: ChatMessage = {
         id: loadingMessageId,
         type: "assistant",
@@ -95,8 +95,6 @@ export function DashboardLayout() {
         result_count: data.result_count,
         timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       }
-
-      
       setChatMessages(prev => prev.map(msg => (msg.id === loadingMessageId ? aiResponse : msg)))
     } catch (error: unknown) {
       console.error("Failed to fetch query response:", error)

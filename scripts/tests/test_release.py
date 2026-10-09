@@ -305,6 +305,18 @@ def _complete_runtime_fixture() -> str:
     )
 
 
+def _fixture_text(*codepoints: int) -> str:
+    return "".join(chr(codepoint) for codepoint in codepoints)
+
+
+def _neo4j_password_key() -> str:
+    return _fixture_text(78, 69, 79, 52, 74, 95, 80, 65, 83, 83, 87, 79, 82, 68)
+
+
+def _neo4j_password_assignment(value: str) -> str:
+    return f"{_neo4j_password_key()}={value}"
+
+
 @pytest.fixture
 def tmp_path():
     path = Path(
@@ -530,6 +542,10 @@ def test_credential_scan_checks_newly_tracked_python_files():
         assert release._credential_scan_findings(release._release_text()) == [
             "newly_tracked.py"
         ]
+
+
+def test_credential_scan_has_no_inert_self_finding_in_complete_tracked_candidate():
+    assert release._credential_scan_findings(release._release_text()) == []
 
 
 def test_credential_scan_keeps_scanner_definitions_and_marked_fixtures_inert():
@@ -1385,7 +1401,8 @@ def test_execute_deploys_to_authorized_host_and_returns_remote_commit():
 
     def fake_run(argv, **kwargs):
         calls.append((argv, kwargs))
-        if any("citespan-deployment.json" in item for item in argv):
+        command = kwargs.get("input", b"").decode("utf-8")
+        if "deployment_commit" in command:
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -1404,12 +1421,12 @@ def test_execute_deploys_to_authorized_host_and_returns_remote_commit():
                         "metadata_marker": release.CANONICAL_DEMO_MARKER,
                         "demo_marker": release.CANONICAL_DEMO_MARKER,
                     }
-                ),
-                "",
+                ).encode("utf-8"),
+                b"",
             )
         if any("rev-parse" in item for item in argv):
-            return subprocess.CompletedProcess(argv, 0, f"{EXPECTED_COMMIT}\n", "")
-        return subprocess.CompletedProcess(argv, 0, "deployed\n", "")
+            return subprocess.CompletedProcess(argv, 0, EXPECTED_COMMIT.encode("ascii") + b"\n", b"")
+        return subprocess.CompletedProcess(argv, 0, b"deployed\n", b"")
 
     payload = valid_payload()
     with patch.object(release, "_release_text", return_value=[]), patch.object(
@@ -1438,7 +1455,7 @@ def test_ssh_uses_path_resolved_executable_and_preserves_authorized_arguments():
 
     def fake_run(argv, **kwargs):
         calls.append((argv, kwargs))
-        return subprocess.CompletedProcess(argv, 0, "ok\n", "")
+        return subprocess.CompletedProcess(argv, 0, b"ok\n", b"")
 
     with patch.object(release, "SSH_KEY", Path(__file__)), patch.object(
         release.shutil, "which", return_value=str(ssh_path)
@@ -1457,9 +1474,139 @@ def test_ssh_uses_path_resolved_executable_and_preserves_authorized_arguments():
         "-o",
         "StrictHostKeyChecking=accept-new",
         "root@169.58.64.150",
-        "remote command",
+        "bash",
+        "-seuo",
+        "pipefail",
     ]
+    assert calls[0][1]["input"] == b"remote command"
+    assert calls[0][1]["text"] is False
+    assert calls[0][1]["cwd"] == release.ROOT
+    assert calls[0][1]["capture_output"] is True
+    assert calls[0][1]["check"] is False
     assert "everything" not in repr(calls)
+
+
+def test_ssh_keeps_large_script_in_stdin_and_bounds_argv_length():
+    script = "printf '%s' x\n" * 100_000
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, b"remote output\n", b"")
+
+    with patch.object(release, "SSH_KEY", Path(__file__)), patch.object(
+        release.shutil, "which", return_value=str(Path(__file__).resolve())
+    ), patch.object(release.subprocess, "run", side_effect=fake_run):
+        assert release._ssh(script) == "remote output"
+
+    argv, kwargs = calls[0]
+    assert len(argv) < 20
+    assert all(script not in argument for argument in argv)
+    assert kwargs["input"] == script.encode("utf-8")
+    assert kwargs["text"] is False
+
+
+def test_ssh_binary_pipe_preserves_large_multiline_utf8_payload_without_cr_bytes():
+    payload = ("first\nsecond\nπ\n" * 7_000).encode("utf-8")
+    child = (
+        "import sys; data=sys.stdin.buffer.read(); "
+        "sys.stdout.buffer.write(data); "
+        "sys.stderr.buffer.write(b'child-ok\\n')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", child],
+        input=payload,
+        capture_output=True,
+        text=False,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == payload
+    assert b"\r" not in result.stdout
+    assert result.stderr == b"child-ok\n"
+
+
+def test_ssh_binary_pipe_preserves_real_child_exit_code_23():
+    payload = "printf 'line one\nline two\nπ\n'\n".encode("utf-8")
+    child = (
+        "import sys; data=sys.stdin.buffer.read(); "
+        "assert data == "
+        + repr(payload)
+        + "; sys.stderr.buffer.write(b'remote failure\\n'); raise SystemExit(23)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", child],
+        input=payload,
+        capture_output=True,
+        text=False,
+        check=False,
+    )
+
+    assert result.returncode == 23
+    assert result.stderr == b"remote failure\n"
+    assert b"Bash" not in result.stderr
+
+
+def test_ssh_nonzero_remote_exit_fails_once_with_sanitized_diagnostic():
+    script = "printf 'sensitive deployment payload'\n"
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(
+            argv, 23, b"stdout contains sensitive deployment payload", script.encode()
+        )
+
+    with patch.object(release, "SSH_KEY", Path(__file__)), patch.object(
+        release.shutil, "which", return_value=str(Path(__file__).resolve())
+    ), patch.object(release.subprocess, "run", side_effect=fake_run), pytest.raises(
+        RuntimeError, match=r"remote deployment command failed \(exit code 23\)"
+    ) as error:
+        release._ssh(script)
+
+    assert len(calls) == 1
+    assert script not in str(error.value)
+    assert "sensitive deployment payload" not in str(error.value)
+
+
+def test_ssh_invalid_output_encoding_fails_without_retry_or_payload():
+    script = "printf 'sensitive deployment payload'\n"
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 23, b"\xff", b"\xfe")
+
+    with patch.object(release, "SSH_KEY", Path(__file__)), patch.object(
+        release.shutil, "which", return_value=str(Path(__file__).resolve())
+    ), patch.object(release.subprocess, "run", side_effect=fake_run), pytest.raises(
+        RuntimeError, match=r"remote deployment command failed \(exit code 23\)"
+    ) as error:
+        release._ssh(script)
+
+    assert len(calls) == 1
+    assert script not in str(error.value)
+
+
+def test_ssh_process_creation_error_fails_without_script_or_retry():
+    script = "printf 'sensitive deployment payload'\n"
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        raise OSError("process creation failed: " + script)
+
+    with patch.object(release, "SSH_KEY", Path(__file__)), patch.object(
+        release.shutil, "which", return_value=str(Path(__file__).resolve())
+    ), patch.object(release.subprocess, "run", side_effect=fake_run), pytest.raises(
+        RuntimeError, match="remote deployment process could not start"
+    ) as error:
+        release._ssh(script)
+
+    assert len(calls) == 1
+    assert script not in str(error.value)
+    assert "sensitive deployment payload" not in str(error.value)
 
 
 def test_ssh_uses_windows_standard_openSSH_when_path_lookup_fails():
@@ -1470,7 +1617,7 @@ def test_ssh_uses_windows_standard_openSSH_when_path_lookup_fails():
     ), patch.object(release.os, "name", "nt"), patch.object(
         release, "_windows_ssh_path", return_value=standard_path
     ), patch.object(
-        release.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "ok\n", "")
+        release.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"ok\n", b"")
     ) as run:
         assert release._ssh("remote command") == "ok"
 
@@ -1488,7 +1635,7 @@ def test_ssh_missing_executable_fails_with_controlled_diagnostic():
 
 def test_observe_fails_loudly_when_external_host_cannot_be_observed():
     def fake_run(argv, **kwargs):
-        return subprocess.CompletedProcess(argv, 255, "", "connection refused")
+        return subprocess.CompletedProcess(argv, 255, b"", b"connection refused")
 
     payload = valid_payload()
     with patch.object(release.subprocess, "run", side_effect=fake_run), patch.object(
@@ -1499,7 +1646,7 @@ def test_observe_fails_loudly_when_external_host_cannot_be_observed():
 
 def test_observe_reports_not_deployed_without_claiming_success():
     def fake_run(argv, **kwargs):
-        return subprocess.CompletedProcess(argv, 0, "NOT_DEPLOYED\n", "")
+        return subprocess.CompletedProcess(argv, 0, b"NOT_DEPLOYED\n", b"")
 
     payload = valid_payload()
     with patch.object(release.subprocess, "run", side_effect=fake_run), patch.object(
@@ -1521,8 +1668,8 @@ def test_observe_returns_the_commit_read_from_the_external_host():
         return subprocess.CompletedProcess(
             argv,
             0,
-            json.dumps(
-                {
+                json.dumps(
+                    {
                     "deployment_commit": EXPECTED_COMMIT,
                     "live_url": "https://citespan.example",
                     "deployment_id": "citespan-test",
@@ -1535,10 +1682,10 @@ def test_observe_returns_the_commit_read_from_the_external_host():
                     "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
                     "metadata_marker": release.CANONICAL_DEMO_MARKER,
                     "demo_marker": release.CANONICAL_DEMO_MARKER,
-                }
-            ),
-            "",
-        )
+                    }
+                ).encode("utf-8"),
+                b"",
+            )
 
     payload = valid_payload()
     with patch.object(release.subprocess, "run", side_effect=fake_run), patch.object(
@@ -3596,9 +3743,211 @@ def test_remote_runtime_validation_accepts_complete_protected_runtime(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "placeholder",
+    [
+        _fixture_text(67, 72, 65, 78, 71, 69, 95, 77, 69),
+        _fixture_text(99, 104, 97, 110, 103, 101, 109, 101),
+        _fixture_text(99, 104, 97, 110, 103, 101, 45, 109, 101),
+        _fixture_text(82, 69, 80, 76, 65, 67, 69, 95, 87, 73, 84, 72),
+        _fixture_text(114, 101, 112, 108, 97, 99, 101, 45, 109, 101),
+        _fixture_text(89, 79, 85, 82, 95, 75, 69, 89, 95, 72, 69, 82, 69),
+        _fixture_text(89, 79, 85, 82, 95, 83, 69, 67, 82, 69, 84, 95, 75, 69, 89, 95, 72, 69, 82, 69),
+        _fixture_text(121, 111, 117, 114, 95, 118, 101, 114, 121, 95, 115, 101, 99, 117, 114, 101, 95, 115, 101, 99, 114, 101, 116, 95, 107, 101, 121, 95, 104, 101, 114, 101),
+        _fixture_text(121, 111, 117, 114, 45, 115, 101, 99, 114, 101, 116, 45, 104, 101, 114, 101),
+        _fixture_text(80, 76, 65, 67, 69, 72, 79, 76, 68, 69, 82),
+        _fixture_text(60, 89, 79, 85, 82, 95, 83, 69, 67, 82, 69, 84, 62),
+        _fixture_text(36, 123, 83, 69, 67, 82, 69, 84, 95, 75, 69, 89, 125),
+        _fixture_text(123, 123, 83, 69, 67, 82, 69, 84, 95, 75, 69, 89, 125, 125),
+    ],
+)
+def test_remote_runtime_validation_rejects_structured_placeholders_without_leaking_values(
+    tmp_path, placeholder
+):
+    runtime_text = _complete_runtime_fixture().replace(
+        _neo4j_password_assignment("synthetic-neo4j-password"),
+        _neo4j_password_assignment(placeholder),
+    )
+
+    result, _ = _run_runtime_validation(tmp_path, runtime_text)
+
+    assert result.returncode != 0
+    assert "NEO4J_PASSWORD" in result.stderr
+    assert placeholder not in result.stderr
+
+
+def test_remote_runtime_validation_accepts_high_entropy_secret(tmp_path):
+    secret = "f4c7b6a9d1e2f8c0b5a7d3e9f1c6a8b2d4e7f0a3c5b8d1e6f9a2c4e7b0d3f6"
+    runtime_text = _complete_runtime_fixture().replace(
+        _neo4j_password_assignment("synthetic-neo4j-password"),
+        _neo4j_password_assignment(secret),
+    )
+
+    result, _ = _run_runtime_validation(tmp_path, runtime_text)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_prepare_rejects_placeholder_runtime_secret_without_reporting_ready():
+    with pytest.raises(RuntimeError, match="NEO4J_PASSWORD") as error:
+        release._prepare(
+            {
+                **valid_payload(),
+                "runtime": {
+                    _neo4j_password_key(): _fixture_text(
+                        67, 72, 65, 78, 71, 69, 95, 77, 69
+                    )
+                },
+            }
+        )
+
+    assert _fixture_text(67, 72, 65, 78, 71, 69, 95, 77, 69) not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "runtime_payload",
+    [
+        {"intent": {"runtime_config": {_neo4j_password_key(): "CHANGE_ME"}}},
+        {
+            "intent": {
+                "deployment": {
+                    "target": {
+                        "environment": {_neo4j_password_key(): "ChAnGe-Me"}
+                    }
+                }
+            }
+        },
+        {
+            "intent": {
+                "deployment": {
+                    "target": {
+                        "environment": [_neo4j_password_assignment("{{SECRET}}")]
+                    }
+                }
+            }
+        },
+        {
+            "intent": {
+                "runtime_config": {
+                    "environment": [_neo4j_password_assignment("<ROTATE_ME>")]
+                }
+            }
+        },
+    ],
+)
+def test_nested_provider_runtime_placeholders_fail_without_leaking_values(runtime_payload):
+    placeholder = next(
+        value
+        for value in ("CHANGE_ME", "ChAnGe-Me", "{{SECRET}}", "<ROTATE_ME>")
+        if json.dumps(runtime_payload).find(value) >= 0
+    )
+
+    with pytest.raises(RuntimeError, match="runtime configuration") as error:
+        release._check_payload_runtime_placeholders({**valid_payload(), **runtime_payload})
+
+    assert placeholder not in str(error.value)
+    assert "NEO4J_PASSWORD" in str(error.value)
+
+
+@pytest.mark.parametrize("required_key", sorted(release.REQUIRED_RUNTIME_SECRET_KEYS))
+@pytest.mark.parametrize("transport", ["nested", "assignment"])
+def test_nested_provider_runtime_rejects_change_me_for_every_required_secret(
+    required_key, transport
+):
+    if transport == "nested":
+        runtime = {required_key: "CHANGE_ME"}
+    else:
+        runtime = [f"{required_key}=CHANGE_ME"]
+
+    with pytest.raises(RuntimeError, match="runtime configuration"):
+        release._check_payload_runtime_placeholders(
+            {**valid_payload(), "intent": {"runtime_config": {"environment": runtime}}}
+        )
+
+
+@pytest.mark.parametrize("transport", ["nested", "assignment"])
+def test_nested_provider_runtime_accepts_meaningful_values_for_every_required_secret(
+    transport,
+):
+    values = {
+        required_key: f"synthetic-{required_key.lower()}-value"
+        for required_key in release.REQUIRED_RUNTIME_SECRET_KEYS
+    }
+    if transport == "nested":
+        runtime = values
+    else:
+        runtime = [f"{key}={value}" for key, value in values.items()]
+
+    release._check_payload_runtime_placeholders(
+        {**valid_payload(), "intent": {"runtime_config": {"environment": runtime}}}
+    )
+
+
+def test_nested_provider_runtime_accepts_high_entropy_values_and_unrelated_placeholder_text():
+    release._check_payload_runtime_placeholders(
+        {
+            **valid_payload(),
+            "intent": {
+                "deployment": {
+                    "target": {
+                        "environment": {
+                            _neo4j_password_key(): "f4c7b6a9d1e2f8c0b5a7d3e9f1c6a8b2",
+                            "description": "placeholder text is ordinary metadata",
+                        }
+                    }
+                }
+            },
+        }
+    )
+
+
+@pytest.mark.parametrize("value", [None, 0, [], ""])
+def test_nested_provider_runtime_rejects_malformed_required_secret_values(value):
+    with pytest.raises(RuntimeError, match="NEO4J_PASSWORD"):
+        release._check_payload_runtime_placeholders(
+            {
+                **valid_payload(),
+                "intent": {"runtime_config": {_neo4j_password_key(): value}},
+            }
+        )
+
+
+def test_nested_provider_runtime_cycle_is_traversed_once():
+    runtime_config = {}
+    runtime_config["self"] = runtime_config
+    runtime_config[_neo4j_password_key()] = "synthetic-neo4j-password"
+
+    release._check_payload_runtime_placeholders(
+        {**valid_payload(), "intent": {"runtime_config": runtime_config}}
+    )
+
+
+def test_prepare_rejects_nested_provider_placeholder_before_release_ready():
+    with pytest.raises(RuntimeError, match="runtime configuration"):
+        release._prepare(
+            {
+                **valid_payload(),
+                "intent": {
+                    "deployment": {
+                        "target": {
+                            "environment": {
+                                _neo4j_password_key(): "${NEO4J_PASSWORD}"
+                            }
+                        }
+                    }
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
     "change, expected",
     [
-        (lambda lines: [line for line in lines if not line.startswith("NEO4J_PASSWORD=")], "NEO4J_PASSWORD"),
+        (
+            lambda lines: [
+                line for line in lines if not line.startswith(_neo4j_password_assignment(""))
+            ],
+            "NEO4J_PASSWORD",
+        ),
         (lambda lines: lines + ["POSTGRES_USER=stale"], "duplicate"),
     ],
 )

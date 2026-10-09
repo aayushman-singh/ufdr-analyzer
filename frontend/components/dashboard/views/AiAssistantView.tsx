@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Bot, ChevronDown, ChevronUp, Database, Send } from "lucide-react"
 import { ChatMessage, predefinedQuestions } from "../data"
+import Link from "next/link"
 
 interface AiAssistantViewProps {
   chatMessages: ChatMessage[]
@@ -23,6 +24,7 @@ export function AiAssistantView({
   setChatInput,
   handleSendMessage,
 }: AiAssistantViewProps) {
+  const hostedDemo = process.env.NEXT_PUBLIC_DEMO_MODE === "1"
   const [expandedResultsId, setExpandedResultsId] = useState<number | null>(null)
   const chatContainerRef = useRef<HTMLDivElement>(null)
 
@@ -59,7 +61,10 @@ export function AiAssistantView({
               </CardTitle>
             </CardHeader>
             <div className="border-b bg-info/10 px-6 py-3 text-sm text-muted-foreground">
-              Demo limit: CiteSpan uses a deterministic planner over synthetic data. It does not run a live large language model.
+              Demo limit: CiteSpan uses a deterministic planner over synthetic data. External LLM behavior is disabled.
+              {hostedDemo && (
+                <> Use <Link className="underline" href="/query-plan">Query Plan</Link> after Reset to sample.</>
+              )}
             </div>
             <CardContent className="flex flex-1 flex-col overflow-hidden p-0">
               {/* The ref is attached to the scrollable div here */}
@@ -143,12 +148,12 @@ export function AiAssistantView({
                     value={chatInput}
                     onChange={e => setChatInput(e.target.value)}
                     onKeyPress={e => e.key === "Enter" && !isSending && handleSendMessage()}
-                    disabled={isSending}
+                    disabled={isSending || hostedDemo}
                     className="flex-1"
                   />
                   <Button
                     onClick={handleSendMessage}
-                    disabled={isSending}
+                    disabled={isSending || hostedDemo}
                     variant="signal"
                   >
                     <Send className="h-4 w-4" />

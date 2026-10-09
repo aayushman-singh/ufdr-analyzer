@@ -18,6 +18,7 @@ from database import get_session
 from db_setup import Query, User
 from ai.llm_client import LLMClient
 from ai.query_executor import QueryExecutor
+from config import DEMO_MODE
 from ingest.services.auth_service import require_user
 from ingest.services.case_access import authorize_run
 from ingest.utils.logger import get_logger
@@ -129,6 +130,15 @@ async def execute_query(
     """
     start_time = time.time()
     logger.info(f"Executing query: '{request.query}' for run_id: {request.run_id}")
+
+    if DEMO_MODE:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "The legacy external-AI query route is disabled in demo mode. "
+                "Use the deterministic Query Plan flow."
+            ),
+        )
 
     # Validate run_id format (400 on garbage) before any authorization/DB work.
     try:

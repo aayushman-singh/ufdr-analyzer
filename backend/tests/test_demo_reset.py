@@ -20,6 +20,7 @@ from sqlmodel import Session, SQLModel, create_engine, select  # noqa: E402
 import db_setup  # noqa: E402,F401
 from db_setup import AleappArtifact, AleappReport, Message, Run, User  # noqa: E402
 import main as backend_main  # noqa: E402
+from ingest.routers import query as query_router  # noqa: E402
 from main import (  # noqa: E402
     CANONICAL_DEMO_ARTIFACT,
     CANONICAL_DEMO_FILE_NAME,
@@ -232,6 +233,49 @@ def test_demo_mode_blocks_every_registered_ingest_route_before_handler_access(
 def test_demo_mode_keeps_canonical_reset_outside_ingestion_boundary():
     assert not _demo_data_request_blocked("/demo/reset")
     assert _demo_data_request_blocked("/api/ingest/aleapp-structure")
+
+
+def test_demo_mode_blocks_legacy_query_before_llm_client_construction(monkeypatch):
+    class MustNotConstruct:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("legacy LLM client was constructed in demo mode")
+
+    monkeypatch.setattr(query_router, "DEMO_MODE", True)
+    monkeypatch.setattr(query_router, "LLMClient", MustNotConstruct)
+
+    with pytest.raises(Exception) as error:
+        asyncio.run(
+            query_router.execute_query(
+                query_router.ExecuteQueryRequest(
+                    query="show messages",
+                    run_id=str(CANONICAL_DEMO_RUN_ID),
+                ),
+                session=None,
+                auth_user=None,
+                meili_client=None,
+            )
+        )
+
+    assert getattr(error.value, "status_code", None) == 403
+    assert "external-AI" in str(error.value.detail)
+
+
+def test_hosted_dashboard_uses_honest_query_plan_redirect():
+    dashboard = (
+        BACKEND.parent / "frontend/components/dashboard/DashboardLayout.tsx"
+    ).read_text(encoding="utf-8")
+    assistant = (
+        BACKEND.parent / "frontend/components/dashboard/views/AiAssistantView.tsx"
+    ).read_text(encoding="utf-8")
+
+    assert 'const hostedDemo = process.env.NEXT_PUBLIC_DEMO_MODE === "1"' in dashboard
+    assert "if (hostedDemo)" in dashboard
+    assert 'window.location.assign("/query-plan")' in dashboard
+    assert "/query/execute" in dashboard
+    assert "query: trimmedInput" in dashboard
+    assert "Query Plan" in assistant
+    assert "external llm behavior is disabled" in assistant.lower()
+    assert "disabled={isSending || hostedDemo}" in assistant
 
 
 def test_generate_pdf_uses_citespan_title_and_preserves_report_content(
