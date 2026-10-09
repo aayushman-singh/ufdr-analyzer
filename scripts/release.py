@@ -50,6 +50,7 @@ AUTHENTIC_REGISTRY_METADATA = {
     ),
 }
 SSH_KEY = Path.home() / ".ssh" / "everything"
+SSH_TIMEOUT_SECONDS = 1800
 DEPLOY_HOST = "root@169.58.64.150"
 DEPLOY_PATH = "/opt/citespan"
 DEPLOY_REPOSITORY = "https://github.com/aayushman-singh/ufdr-analyzer.git"
@@ -270,6 +271,34 @@ REQUIRED_RUNTIME_SECRET_KEYS = {
     "MINIO_SECRET_KEY",
     "SECRET_KEY",
 }
+_SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)\b(?:"
+    + "|".join(re.escape(key) for key in sorted(REQUIRED_RUNTIME_SECRET_KEYS))
+    + r"|openrouter_api_key|openai_api_key|neo4j_password|"
+    r"[a-z_][a-z0-9_]*(?:api[_-]?key|password|secret|token)[a-z0-9_]*)\b\s*[:=]\s*"
+    r"(?:['\"](?P<quoted>[^'\"]*)['\"]|(?P<bare>[^\s,;}\]]+))"
+)
+_SECRET_FIELD_PATTERN = re.compile(
+    r"(?ix)(?P<key>\"(?:"
+    + "|".join(
+        re.escape(key)
+        for key in sorted(
+            REQUIRED_RUNTIME_SECRET_KEYS
+            | {"OPENROUTER_API_KEY", "OPENAI_API_KEY", "NEO4J_PASSWORD"}
+        )
+    )
+    + r"|[a-z_][a-z0-9_]*(?:api[_-]?key|password|secret|token)[a-z0-9_]*)\"|'(?:"
+    + "|".join(
+        re.escape(key)
+        for key in sorted(
+            REQUIRED_RUNTIME_SECRET_KEYS
+            | {"OPENROUTER_API_KEY", "OPENAI_API_KEY", "NEO4J_PASSWORD"}
+        )
+    )
+    + r"|[a-z_][a-z0-9_]*(?:api[_-]?key|password|secret|token)[a-z0-9_]*)'|"
+    r"[a-z_][a-z0-9_]*(?:api[_-]?key|password|secret|token)[a-z0-9_]*)"
+    r"\s*[:=]\s*(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)"
+)
 PLACEHOLDER_SECRET = re.compile(
     r"(?i)^(?:change[_-]?me|replace[_-]?(?:with|me)|"
     r"your[_-](?:[a-z0-9]+[_-])*(?:key|secret)(?:[_-][a-z0-9]+)*[_-]here|placeholder|"
@@ -815,9 +844,68 @@ def _record_private_failure(command: str, exc: BaseException, state: dict[str, A
     return evidence_path
 
 
+def _record_private_ssh_timeout(
+    command: str, timeout: subprocess.TimeoutExpired
+) -> Path:
+    """Store partial SSH output when the exact client reaches its deadline."""
+    EXTERNAL_PROOF_ROOT.mkdir(parents=True, exist_ok=True)
+    evidence_dir = Path(tempfile.mkdtemp(prefix="ssh-timeout-", dir=EXTERNAL_PROOF_ROOT))
+
+    def sanitize(value: object, stream: str) -> str | dict[str, object]:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            digest = hashlib.sha256(value).hexdigest()
+            try:
+                decoded = value.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                safe_prefix = value[: exc.start].decode("utf-8", errors="strict")
+                return {
+                    "type": "encoding_error",
+                    "stream": stream,
+                    "byte_length": len(value),
+                    "sha256": digest,
+                    "error": {"offset": exc.start, "reason": exc.reason},
+                    "safe_prefix": _sanitize_ssh_diagnostic(safe_prefix, command),
+                }
+            return _sanitize_ssh_diagnostic(decoded, command)
+        return _sanitize_ssh_diagnostic(str(value), command)
+
+    evidence_path = evidence_dir / "ssh-timeout.json"
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "command": "<submitted script>",
+                "timeout_seconds": SSH_TIMEOUT_SECONDS,
+                "outcome": "unknown_external_outcome",
+                "stdout": sanitize(timeout.stdout, "stdout"),
+                "stderr": sanitize(timeout.stderr, "stderr"),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return evidence_path
+
+
 def _sanitize_failure_text(value: str) -> str:
+    secret_values = []
+    for match in _SECRET_FIELD_PATTERN.finditer(value):
+        candidate = match.group("value")
+        if candidate[:1] in {'"', "'"} and candidate[-1:] == candidate[:1]:
+            candidate = candidate[1:-1]
+        if candidate and not any(reference in candidate for reference in SAFE_SECRET_REFERENCES):
+            secret_values.append(candidate)
+    for match in _SECRET_ASSIGNMENT_PATTERN.finditer(value):
+        candidate = match.group("quoted") or match.group("bare")
+        if candidate and not any(reference in candidate for reference in SAFE_SECRET_REFERENCES):
+            secret_values.append(candidate)
+    for candidate in sorted(set(secret_values), key=len, reverse=True):
+        value = value.replace(candidate, "<REDACTED>")
     for pattern in SECRET_PATTERNS:
         value = pattern.sub("<REDACTED>", value)
+    value = _SECRET_FIELD_PATTERN.sub("<REDACTED>", value)
+    value = _SECRET_ASSIGNMENT_PATTERN.sub("<REDACTED>", value)
     return value
 
 
@@ -1418,7 +1506,14 @@ def _ssh(command: str) -> str:
             capture_output=True,
             text=False,
             check=False,
+            timeout=SSH_TIMEOUT_SECONDS,
         )
+    except subprocess.TimeoutExpired as exc:
+        evidence_path = _record_private_ssh_timeout(command, exc)
+        raise RuntimeError(
+            "remote deployment command timed out; unknown external outcome; "
+            f"the exact SSH client was terminated; private evidence: {evidence_path}"
+        ) from exc
     except OSError as exc:
         detail = _sanitize_ssh_diagnostic(str(exc), command)
         raise RuntimeError(
@@ -1454,7 +1549,9 @@ def _sanitize_ssh_diagnostic(detail: str, command: str) -> str:
     sanitized = detail.replace(command, "<submitted script>")
     if command.strip() != command:
         sanitized = sanitized.replace(command.strip(), "<submitted script>")
-    sanitized = sanitized.replace(SSH_KEY.as_posix(), "<configured SSH key>")
+    for key_path in {SSH_KEY.as_posix(), str(SSH_KEY), str(SSH_KEY.resolve())}:
+        sanitized = sanitized.replace(key_path, "<configured SSH key>")
+    sanitized = sanitized.replace("CITESPAN_PRIVATE_SCRIPT_MARKER", "<redacted marker>")
     return _sanitize_failure_text(sanitized)
 
 
@@ -2159,6 +2256,7 @@ def _deployment_command_authoritative(payload: dict[str, Any]) -> str:
     rollback_script = f"""rollback() {{
     status=$?
     if [ "$status" -ne 0 ]; then
+        phase_failure "$failed_step" "$status"
         echo "deployment failed at $failed_step" >&2
         if [ "$cutover_committed" -eq 1 ]; then
             echo 'rollback skipped after metadata commit; prior-container retirement failed' >&2
@@ -2253,7 +2351,7 @@ trap rollback EXIT
         f"test -f /etc/caddy/Caddyfile; if [ ! -d {DEPLOY_PATH}/.git ]; then git clone {shlex.quote(DEPLOY_REPOSITORY)} {DEPLOY_PATH}; fi; "
         f"test -d {DEPLOY_PATH}/.git; if ! origin_url=$(git -C {DEPLOY_PATH} config --get remote.origin.url 2>/dev/null); then echo 'release blocked: origin lookup failed' >&2; exit 1; fi; test -n \"$origin_url\"; verified_origin=$(CITESPAN_ORIGIN_URL=\"$origin_url\" python3 -c {origin_check}); test \"$verified_origin\" = aayushman-singh/ufdr-analyzer; "
         f"export CITESPAN_SYNTHETIC_MARKER={shlex.quote(CANONICAL_DEMO_MARKER)}; "
-        f"deployment_metadata={DEPLOYMENT_METADATA}; demo_marker={DEMO_MARKER}; receipt={DEPLOY_PATH}/.citespan-authoritative-receipt.json; backup_dir={DEPLOY_PATH}/.citespan-backups/$(date -u +%Y%m%d%H%M%S%N); mkdir -p \"$backup_dir\"; "
+        f"deployment_metadata={DEPLOYMENT_METADATA}; demo_marker={DEMO_MARKER}; receipt={DEPLOY_PATH}/.citespan-authoritative-receipt.json; backup_dir={DEPLOY_PATH}/.citespan-backups/$(date -u +%Y%m%d%H%M%S%N); mkdir -p \"$backup_dir\"; phase_trace=\"$backup_dir/release-phase-trace.log\"; umask 077; : > \"$phase_trace\"; chmod 600 \"$phase_trace\"; printf 'release phase trace=%s\\n' \"$phase_trace\" >&2; phase_start() {{ printf '%s phase=%s status=start\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \"$1\" >> \"$phase_trace\"; }}; phase_end() {{ printf '%s phase=%s status=end exit_code=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \"$1\" \"$2\" >> \"$phase_trace\"; }}; phase_failure() {{ printf '%s phase=%s status=failure exit_code=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \"$1\" \"$2\" >> \"$phase_trace\"; }}; phase_start \"bootstrap\"; "
         f"runtime={DEPLOY_PATH}/.citespan-runtime.env; if [ ! -f \"$runtime\" ]; then umask 077; neo4j_password=$(openssl rand -hex 32); postgres_password=$(openssl rand -hex 32); meili_master_key=$(openssl rand -hex 32); minio_root_user=$(openssl rand -hex 16); minio_root_password=$(openssl rand -hex 32); secret_key=$(openssl rand -hex 32); temporary_runtime=$(mktemp \"$runtime.XXXXXX\"); printf 'DEMO_MODE=1\\nCITESPAN_SYNTHETIC_ONLY=1\\nOPENAI_API_KEY=\\nOPENROUTER_API_KEY=\\nNEO4J_PASSWORD=%s\\nPOSTGRES_USER=ufdr_user\\nPOSTGRES_DB=ufdr_analyzer\\nPOSTGRES_PASSWORD=%s\\nMEILI_MASTER_KEY=%s\\nMINIO_ROOT_USER=%s\\nMINIO_ROOT_PASSWORD=%s\\nMINIO_ACCESS_KEY=%s\\nMINIO_SECRET_KEY=%s\\nSECRET_KEY=%s\\n' \"$neo4j_password\" \"$postgres_password\" \"$meili_master_key\" \"$minio_root_user\" \"$minio_root_password\" \"$minio_root_user\" \"$minio_root_password\" \"$secret_key\" > \"$temporary_runtime\"; chmod 600 \"$temporary_runtime\"; mv -f \"$temporary_runtime\" \"$runtime\"; fi; python3 -c {runtime_check} \"$runtime\"; set -a; . \"$runtime\"; set +a; "
         "previous_deployment_id=; previous_backend=; previous_static=; previous_frontend=; candidate_backend=; candidate_static=; "
         "previous_backend_running=0; previous_static_running=0; "
@@ -2273,7 +2371,7 @@ trap rollback EXIT
         "fi; "
         f"recovery_log=\"$backup_dir/recovery.log\"; caddy_backup=\"$backup_dir/Caddyfile\"; cp -p /etc/caddy/Caddyfile \"$caddy_backup\"; "
         + rollback_script
-        + "history_hash_count=$(printf '%s\\n' " + shlex.quote(history_hashes) + " | wc -w); "
+        + "phase_end \"bootstrap\" 0; phase_start \"authoritative-data-readiness\"; history_hash_count=$(printf '%s\\n' " + shlex.quote(history_hashes) + " | wc -w); "
         + history_check
         + f"git -C {DEPLOY_PATH} fetch --prune origin main; test \"$(git -C {DEPLOY_PATH} rev-parse refs/remotes/origin/main)\" = {expected}; git -C {DEPLOY_PATH} fetch --prune origin {expected_commit}; test \"$(git -C {DEPLOY_PATH} rev-parse FETCH_HEAD)\" = {expected}; git -C {DEPLOY_PATH} checkout --detach --force {expected_commit}; "
         f"test \"$(git -C {DEPLOY_PATH} rev-parse HEAD)\" = {expected_commit}; "
@@ -2306,7 +2404,7 @@ trap rollback EXIT
         "if [ \"$demo_state\" = EMPTY ]; then echo 'candidate demo target is empty'; docker exec \"$backend_id\" sh -c 'echo " + seed + " | base64 -d | python3'; elif [ \"$demo_state\" = EXISTING ]; then test -f \"$receipt\"; "
         f"python3 -c {receipt_validate} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\"; "
         "if [ -f \"$deployment_metadata\" ]; then python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); required=(\"deployment_id\",\"backend_container\",\"static_container\",\"runtime_identity\",\"backend_identity\",\"static_identity\",\"commit\",\"live_url\",\"static_content_dir\",\"authoritative_network\",\"authoritative_postgres\",\"authoritative_meili\",\"authoritative_minio\",\"authoritative_data\",\"synthetic_only\",\"marker\"); assert all(key in m for key in required); assert m[\"authoritative_data\"] is True and m[\"synthetic_only\"] is True and m[\"marker\"] == \"" + CANONICAL_DEMO_MARKER + "\"; assert len(m[\"commit\"]) == 40' \"$deployment_metadata\"; python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); assert m[\"marker\"] == \"" + CANONICAL_DEMO_MARKER + "\" and m[\"synthetic_only\"] is True' \"$demo_marker\"; test \"$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"runtime_identity\"])' \"$deployment_metadata\")\" = \"$previous_deployment_id\"; test \"$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"backend_identity\"])' \"$deployment_metadata\")\" = \"$previous_backend\"; test \"$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"static_identity\"])' \"$deployment_metadata\")\" = \"$previous_static\"; fi; test \"$CITESPAN_SYNTHETIC_ONLY\" = 1; else echo 'candidate demo target is not empty' >&2; exit 1; fi; "
-        "docker exec \"$backend_id\" sh -c 'echo " + audit + " | base64 -d | python3'; "
+        "docker exec \"$backend_id\" sh -c 'echo " + audit + " | base64 -d | python3'; phase_end \"application-candidate\" 0; "
         f"mkdir -p \"$backup_dir/static-content\"; frontend_builder=node:22-alpine; docker run --rm -v {DEPLOY_PATH}:/workspace -w /workspace/frontend -e {shlex.quote(f'NEXT_PUBLIC_API_URL=https://{domain_value}/api')} -e NEXT_PUBLIC_DEMO_MODE=1 \"$frontend_builder\" sh -c 'npm ci && npm run build'; test -d {DEPLOY_PATH}/frontend/out; cp -a {DEPLOY_PATH}/frontend/out/. \"$backup_dir/static-content/\"; static_content_dir=\"$backup_dir/static-content\"; "
         "candidate_static=$CITESPAN_DEPLOYMENT_ID-static; docker run -d --name \"$candidate_static\" -p 127.0.0.1:$candidate_frontend_port:80 -v \"$static_content_dir:/usr/share/nginx/html:ro\" nginx:1.29-alpine; "
         "test -n \"$(docker ps -q --filter name=^/$candidate_static$)\"; "
@@ -2333,7 +2431,7 @@ trap rollback EXIT
     command = command[:readiness_start] + _readiness_sanitizer() + command[readiness_end:]
     minio_start = command.index("failed_step=readiness-minio;")
     minio_end = command.index("candidate_suffix=", minio_start)
-    authoritative_services = _minio_readiness_command(receipt_writer) + "fi\n"
+    authoritative_services = _minio_readiness_command(receipt_writer) + 'fi\nphase_end "authoritative-data-readiness" 0\nphase_start "application-candidate"\n'
     command = command[:minio_start] + authoritative_services + command[minio_end:]
     return command
 
@@ -2578,8 +2676,17 @@ def _execute(payload: dict[str, Any]) -> dict[str, Any]:
         )
     _ssh(_deployment_command(payload))
     observation = _observe(payload)
-    if observation.get("observed") is not True or not observation.get("deployment_commit"):
-        raise RuntimeError("execute failed: deployment did not produce remote commit evidence")
+    expected_commit = _expected_commit(payload)
+    if (
+        not isinstance(observation, dict)
+        or observation.get("action_key") != _action(payload)
+        or observation.get("complete") is not True
+        or observation.get("observed") is not True
+        or observation.get("state") is not None
+        or observation.get("external_identity") != f"{DEPLOY_HOST}:citespan"
+        or observation.get("deployment_commit") != expected_commit
+    ):
+        raise RuntimeError("execute failed: deployment did not produce strict remote commit evidence")
     return {
         "action_key": _action(payload),
         "complete": True,

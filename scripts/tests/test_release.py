@@ -276,7 +276,10 @@ def _rollback_fixture_state(deploy_root: Path, caddy_root: Path) -> str:
     caddy_backup={_bash_path(caddy_root / "Caddyfile.backup")}
     compose='docker compose --project-name citespan-candidate'
     recovery_log={_bash_path(deploy_root / "recovery.log")}
+    phase_trace={_bash_path(deploy_root / "phase-trace.log")}
+    phase_failure() {{ printf 'phase=%s status=failure exit_code=%s\\n' "$1" "$2" >> "$phase_trace"; }}
     mkdir -p "$backup_dir"
+    : > "$phase_trace"
     cp "$deployment_metadata" "$backup_dir/.citespan-deployment.json"
     cp {_bash_path(deploy_root / ".citespan-demo-marker.json")} "$backup_dir/.citespan-demo-marker.json"
     cp {_bash_path(deploy_root / ".citespan-runtime.env")} "$backup_dir/.citespan-runtime.env"
@@ -1004,7 +1007,7 @@ def test_execute_fails_closed_without_deployment_evidence():
     with patch.object(release, "_critical_dependency_findings", return_value=[]), patch.object(
         release, "_branding_findings", return_value=[]
     ), patch.object(release, "_ssh", return_value="NOT_DEPLOYED"):
-        with pytest.raises(RuntimeError, match="deployment did not produce remote commit evidence"):
+        with pytest.raises(RuntimeError, match="deployment did not produce strict remote commit evidence"):
             release._execute(valid_payload())
 
 
@@ -1625,6 +1628,300 @@ def test_ssh_process_creation_error_fails_without_script_or_retry():
     assert len(calls) == 1
     assert script not in str(error.value)
     assert "sensitive deployment payload" not in str(error.value)
+
+
+def test_ssh_timeout_captures_partial_output_and_reports_unknown_outcome(tmp_path):
+    script = "echo deployment-boundary"
+    timeout = subprocess.TimeoutExpired(
+        ["ssh"], release.SSH_TIMEOUT_SECONDS, output=b"partial stdout", stderr=b"partial stderr"
+    )
+
+    with patch.object(release, "SSH_KEY", Path(__file__)), patch.object(
+        release.shutil, "which", return_value=str(Path(__file__).resolve())
+    ), patch.object(release.subprocess, "run", side_effect=timeout) as run, patch.object(
+        release, "EXTERNAL_PROOF_ROOT", tmp_path
+    ), pytest.raises(RuntimeError, match="unknown external outcome") as error:
+        release._ssh(script)
+
+    assert run.call_count == 1
+    assert run.call_args.kwargs["timeout"] == release.SSH_TIMEOUT_SECONDS
+    evidence = list(tmp_path.rglob("ssh-timeout.json"))
+    assert len(evidence) == 1
+    value = json.loads(evidence[0].read_text(encoding="utf-8"))
+    assert value["stdout"] == "partial stdout"
+    assert value["stderr"] == "partial stderr"
+    assert value["outcome"] == "unknown_external_outcome"
+    assert script not in error.value.args[0]
+
+
+def test_ssh_timeout_redacts_submitted_script_marker_key_and_credentials(tmp_path):
+    private_marker = "CITESPAN_" + "PRIVATE_SCRIPT_MARKER"
+    openrouter_assignment = "OPENROUTER_" + "API_KEY=" + "sk-or-v1-" + (
+        "12345678901234567890"
+    )
+    neo4j_assignment = "neo4j_" + "password=" + "super-secret-password"
+    script = (
+        f"printf '{private_marker}'; "
+        f"printf '{openrouter_assignment}'; "
+        f"printf '{neo4j_assignment}'"
+    )
+    timeout = subprocess.TimeoutExpired(
+        ["ssh"],
+        release.SSH_TIMEOUT_SECONDS,
+        output=(script + "\n").encode(),
+        stderr=(str(Path(__file__).resolve()) + "\n").encode(),
+    )
+
+    with patch.object(release, "SSH_KEY", Path(__file__)), patch.object(
+        release.shutil, "which", return_value=str(Path(__file__).resolve())
+    ), patch.object(release.subprocess, "run", side_effect=timeout), patch.object(
+        release, "EXTERNAL_PROOF_ROOT", tmp_path
+    ), pytest.raises(RuntimeError, match="unknown external outcome"):
+        release._ssh(script)
+
+    evidence = next(tmp_path.rglob("ssh-timeout.json"))
+    serialized = evidence.read_text(encoding="utf-8")
+    value = json.loads(serialized)
+    assert script not in serialized
+    assert "CITESPAN_PRIVATE_SCRIPT_MARKER" not in serialized
+    assert ("sk-or-v1-" + "12345678901234567890") not in serialized
+    assert "super-secret-password" not in serialized
+    assert str(Path(__file__).resolve()) not in serialized
+    assert value["stdout"] == "<submitted script>\n"
+    assert value["stderr"] == "<configured SSH key>\n"
+
+
+def test_ssh_timeout_records_sanitized_strict_utf8_error_metadata(tmp_path):
+    script = "echo CITESPAN_PRIVATE_SCRIPT_MARKER"
+    malformed = b"safe stdout " + b"\xff" + b" hidden-secret"
+    truncated = b"safe stderr " + b"\xe2\x82"
+    timeout = subprocess.TimeoutExpired(
+        ["ssh"], release.SSH_TIMEOUT_SECONDS, output=malformed, stderr=truncated
+    )
+
+    with patch.object(release, "SSH_KEY", Path(__file__)), patch.object(
+        release.shutil, "which", return_value=str(Path(__file__).resolve())
+    ), patch.object(release.subprocess, "run", side_effect=timeout), patch.object(
+        release, "EXTERNAL_PROOF_ROOT", tmp_path
+    ), pytest.raises(RuntimeError, match="unknown external outcome"):
+        release._ssh(script)
+
+    value = json.loads(next(tmp_path.rglob("ssh-timeout.json")).read_text(encoding="utf-8"))
+    for stream, raw in (("stdout", malformed), ("stderr", truncated)):
+        evidence = value[stream]
+        assert evidence["type"] == "encoding_error"
+        assert evidence["stream"] == stream
+        assert evidence["byte_length"] == len(raw)
+        assert evidence["sha256"] == hashlib.sha256(raw).hexdigest()
+        assert evidence["error"]["offset"] == (12 if stream == "stdout" else 12)
+        assert evidence["error"]["reason"]
+        assert "\ufffd" not in json.dumps(evidence)
+    assert value["stdout"]["safe_prefix"] == "safe stdout "
+    assert value["stderr"]["safe_prefix"] == "safe stderr "
+    assert "hidden-secret" not in json.dumps(value)
+    assert "CITESPAN_PRIVATE_SCRIPT_MARKER" not in json.dumps(value)
+
+
+@pytest.mark.parametrize("secret_key", sorted(release.REQUIRED_RUNTIME_SECRET_KEYS))
+def test_ssh_timeout_redacts_every_required_runtime_secret_in_output_and_echoes(
+    tmp_path, secret_key
+):
+    value = "runtime-" + secret_key.lower().replace("_", "-") + "-" + ("x" * 24)
+    assignment = f'"{secret_key}": "{value}"'
+    output = (
+        f"list=[{{{assignment}}}] nested={{'runtime':{{{assignment}}}}} "
+        f"echo={value}\n"
+    ).encode()
+    timeout = subprocess.TimeoutExpired(
+        ["ssh"], release.SSH_TIMEOUT_SECONDS, output=output, stderr=output
+    )
+
+    with patch.object(release, "SSH_KEY", Path(__file__)), patch.object(
+        release.shutil, "which", return_value=str(Path(__file__).resolve())
+    ), patch.object(release.subprocess, "run", side_effect=timeout), patch.object(
+        release, "EXTERNAL_PROOF_ROOT", tmp_path
+    ), pytest.raises(RuntimeError, match="unknown external outcome"):
+        release._ssh("printf 'timeout evidence'")
+
+    serialized = next(tmp_path.rglob("ssh-timeout.json")).read_text(encoding="utf-8")
+    assert value not in serialized
+    assert secret_key not in serialized
+
+
+def test_ssh_timeout_redacts_runtime_secret_values_before_unlabelled_echoes(tmp_path):
+    values = {
+        key: "secret-" + key.lower().replace("_", "-") + "-" + ("z" * 24)
+        for key in sorted(release.REQUIRED_RUNTIME_SECRET_KEYS)
+    }
+    assignments = ", ".join(f'"{key}": "{value}"' for key, value in values.items())
+    generic_key = "INTERNAL_" + "SERVICE_" + "TOKEN"
+    generic_value = "generic-service-token-" + ("q" * 24)
+    output = (
+        "{"
+        + assignments
+        + f', "{generic_key}": "{generic_value}"'
+        + "}"
+        + "\nunlabelled="
+        + " ".join(values.values())
+        + f" {generic_value}"
+    ).encode()
+    timeout = subprocess.TimeoutExpired(
+        ["ssh"], release.SSH_TIMEOUT_SECONDS, output=output, stderr=output
+    )
+
+    with patch.object(release, "SSH_KEY", Path(__file__)), patch.object(
+        release.shutil, "which", return_value=str(Path(__file__).resolve())
+    ), patch.object(release.subprocess, "run", side_effect=timeout), patch.object(
+        release, "EXTERNAL_PROOF_ROOT", tmp_path
+    ), pytest.raises(RuntimeError, match="unknown external outcome"):
+        release._ssh("printf 'timeout evidence'")
+
+    serialized = next(tmp_path.rglob("ssh-timeout.json")).read_text(encoding="utf-8")
+    for value in values.values():
+        assert value not in serialized
+    assert generic_value not in serialized
+
+
+@pytest.mark.parametrize("field_name", [
+    "openrouter_api_key",
+    "openai_api_key",
+    "neo4j_password",
+    "INTERNAL_" + "SERVICE_" + "TOKEN",
+])
+def test_ssh_timeout_redacts_supported_alias_and_generic_json_fields(tmp_path, field_name):
+    secret_value = "json-secret-" + field_name.lower().replace("_", "-") + "-" + ("y" * 24)
+    output = (
+        '{"outer": {"'
+        + field_name
+        + '": "'
+        + secret_value
+        + '"}, "echo": "'
+        + secret_value
+        + '"}'
+    ).encode()
+    timeout = subprocess.TimeoutExpired(
+        ["ssh"], release.SSH_TIMEOUT_SECONDS, output=output, stderr=output
+    )
+
+    with patch.object(release, "SSH_KEY", Path(__file__)), patch.object(
+        release.shutil, "which", return_value=str(Path(__file__).resolve())
+    ), patch.object(release.subprocess, "run", side_effect=timeout), patch.object(
+        release, "EXTERNAL_PROOF_ROOT", tmp_path
+    ), pytest.raises(RuntimeError, match="unknown external outcome"):
+        release._ssh("printf 'timeout evidence'")
+
+    serialized = next(tmp_path.rglob("ssh-timeout.json")).read_text(encoding="utf-8")
+    assert secret_value not in serialized
+    assert field_name not in serialized
+
+
+def test_execute_allows_valid_existing_host_state_then_deploys_once():
+    payload = valid_payload()
+    prepared = {
+        "release_ready": True,
+        "repository": "aayushman-singh/ufdr-analyzer",
+        "product_name": "CiteSpan",
+        "demo_policy": "synthetic-only",
+    }
+    deployed = {
+        "action_key": "citespan-release",
+        "complete": True,
+        "observed": True,
+        "deployment_commit": EXPECTED_COMMIT,
+        "external_identity": "root@169.58.64.150:citespan",
+        "live_url": "https://citespan.example",
+    }
+    with patch.object(release, "_prepare", return_value=prepared), patch.object(
+        release, "_deployment_command", return_value="deploy"
+    ), patch.object(
+        release,
+        "_observe",
+        return_value=deployed,
+    ) as observe, patch.object(release, "_ssh") as ssh:
+        result = release._execute(payload)
+
+    assert result["complete"] is True
+    assert result["deployment_commit"] == EXPECTED_COMMIT
+    assert ssh.call_count == 1
+    ssh.assert_called_once_with("deploy")
+    assert observe.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        {},
+        {"state": "not_deployed", "observed": False},
+        {
+            "action_key": "citespan-release",
+            "complete": True,
+            "observed": True,
+            "state": "not_deployed",
+            "external_identity": "root@169.58.64.150:citespan",
+            "deployment_commit": EXPECTED_COMMIT,
+        },
+        {
+            "action_key": "citespan-release",
+            "complete": True,
+            "observed": True,
+            "external_identity": "root@169.58.64.150:citespan",
+            "deployment_commit": "0" * 40,
+        },
+    ],
+)
+def test_execute_fails_after_attempt_when_post_deployment_proof_is_invalid(observation):
+    payload = valid_payload()
+    call_order = []
+
+    def observe_after_deploy(_payload):
+        call_order.append("observe")
+        return observation
+
+    def deploy_once(command):
+        call_order.append("ssh")
+        assert command == "deploy"
+
+    with patch.object(
+        release, "_prepare", return_value={
+            "release_ready": True,
+            "repository": "aayushman-singh/ufdr-analyzer",
+            "product_name": "CiteSpan",
+            "demo_policy": "synthetic-only",
+        }
+    ), patch.object(release, "_deployment_command", return_value="deploy"), patch.object(
+        release, "_observe", side_effect=observe_after_deploy
+    ), patch.object(release, "_ssh", side_effect=deploy_once) as ssh, pytest.raises(
+        RuntimeError, match="strict remote commit evidence"
+    ):
+        release._execute(payload)
+
+    assert call_order == ["ssh", "observe"]
+    ssh.assert_called_once_with("deploy")
+
+
+def test_deployment_records_boundary_phase_before_and_after_application_candidate():
+    command = release._deployment_command(valid_payload())
+
+    assert "release-phase-trace.log" in command
+    assert 'phase_start "authoritative-data-readiness"' in command
+    assert 'phase_end "authoritative-data-readiness" 0' in command
+    assert 'phase_start "application-candidate"' in command
+    assert 'phase_end "application-candidate" 0' in command
+    assert command.index('phase_end "authoritative-data-readiness" 0') < command.index(
+        'phase_start "application-candidate"'
+    )
+
+
+def test_deployment_boundary_failure_keeps_phase_trace_in_rollback_path():
+    command = release._deployment_command(valid_payload())
+
+    assert 'phase_failure "$failed_step" "$status"' in command
+    assert 'phase_trace="$backup_dir/release-phase-trace.log"' in command
+    assert 'phase_start "application-candidate"' in command
+    assert 'phase_end "application-candidate" 0' in command
+    assert command.index('phase_failure "$failed_step" "$status"') < command.index(
+        'rm -f "${compose_override:-}"'
+    )
 
 
 def test_ssh_uses_windows_standard_openSSH_when_path_lookup_fails():
