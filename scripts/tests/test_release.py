@@ -847,10 +847,133 @@ def test_prepare_reports_script_relative_project_python_and_demo_limits():
     assert result.returncode == 0, result.stderr
     assert value["python"].endswith(".venv/Scripts/python.exe")
     assert value["demo_policy"] == {
+        "mode": "1",
+        "runtime": {"DEMO_MODE": "1", "CITESPAN_SYNTHETIC_ONLY": "1"},
         "upload": False,
         "reset_to_sample": True,
         "sample": "canonical synthetic UFDR",
     }
+
+
+def test_prepare_enforces_synthetic_demo_mode_when_provider_and_environment_omit_it(
+    monkeypatch,
+):
+    monkeypatch.delenv("DEMO_MODE", raising=False)
+    payload = valid_payload()
+    payload.pop("DEMO_MODE")
+
+    with patch.object(release, "_provision_live_verifier"):
+        value = release._prepare(payload)
+
+    assert value["demo_policy"] == {
+        "mode": "1",
+        "runtime": {"DEMO_MODE": "1", "CITESPAN_SYNTHETIC_ONLY": "1"},
+        "upload": False,
+        "reset_to_sample": True,
+        "sample": "canonical synthetic UFDR",
+    }
+    assert value["demo_policy"]["runtime"] == {
+        "DEMO_MODE": "1",
+        "CITESPAN_SYNTHETIC_ONLY": "1",
+    }
+
+
+@pytest.mark.parametrize("disabled", ["0", "false"])
+def test_prepare_rejects_explicit_disabled_demo_mode_without_leaking_values(
+    disabled,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setenv("DEMO_MODE", "1")
+    monkeypatch.setattr(sys, "argv", ["release.py", "prepare"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({**valid_payload(), "DEMO_MODE": disabled})))
+    monkeypatch.setattr(release, "_record_private_failure", lambda *args: Path("failure.json"))
+
+    assert release.main() == 1
+
+    captured = capsys.readouterr()
+    value = json.loads(captured.out)
+    assert value["complete"] is False
+    assert "DEMO_MODE" in value["error"]
+    assert SYNTHETIC_OPENROUTER_TOKEN not in captured.out + captured.err
+    assert SYNTHETIC_OPENAI_TOKEN not in captured.out + captured.err
+
+
+def test_prepare_rejects_explicit_disabled_environment_demo_mode(monkeypatch):
+    payload = valid_payload()
+    payload.pop("DEMO_MODE")
+    monkeypatch.setenv("DEMO_MODE", "0")
+
+    with pytest.raises(RuntimeError, match="DEMO_MODE"):
+        release._prepare(payload)
+
+
+def test_observation_command_requires_demo_mode_in_runtime_and_backend_identity():
+    command = release._observation_command()
+
+    assert "DEMO_MODE=1" in command
+    assert ".citespan-runtime.env" in command
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["demo_mode", "synthetic_only"],
+)
+def test_verify_rejects_missing_or_contradictory_remote_demo_evidence(field):
+    observation = {
+        "observed": True,
+        "deployment_commit": EXPECTED_COMMIT,
+        "live_url": "https://citespan.example",
+        "deployment_id": "citespan-live",
+        "synthetic_only": True,
+        "demo_mode": "1",
+        "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
+        "metadata_marker": release.CANONICAL_DEMO_MARKER,
+        "demo_marker": release.CANONICAL_DEMO_MARKER,
+    }
+    observation[field] = False if field == "synthetic_only" else "0"
+
+    with pytest.raises(RuntimeError, match="synthetic|DEMO_MODE"):
+        release._verify({**valid_payload(), "observation": observation})
+
+
+def test_verify_rejects_missing_remote_demo_mode_evidence():
+    observation = {
+        "observed": True,
+        "deployment_commit": EXPECTED_COMMIT,
+        "live_url": "https://citespan.example",
+        "deployment_id": "citespan-live",
+        "synthetic_only": True,
+        "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
+        "metadata_marker": release.CANONICAL_DEMO_MARKER,
+        "demo_marker": release.CANONICAL_DEMO_MARKER,
+    }
+
+    with pytest.raises(RuntimeError, match="DEMO_MODE"):
+        release._verify({**valid_payload(), "observation": observation})
+
+
+@pytest.mark.parametrize("demo_mode", ["0", False, 1, "true", None])
+def test_observe_rejects_invalid_remote_demo_mode_evidence(demo_mode):
+    observed = {
+        "deployment_commit": EXPECTED_COMMIT,
+        "live_url": "https://citespan.example",
+        "deployment_id": "citespan-test",
+        "backend_port": 18000,
+        "frontend_port": 18001,
+        "static_container": "citespan-test-static-1",
+        "static_content_dir": "/opt/citespan/.citespan-backups/1/static-1",
+        "synthetic_only": True,
+        "demo_mode": demo_mode,
+        "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
+        "metadata_marker": release.CANONICAL_DEMO_MARKER,
+        "demo_marker": release.CANONICAL_DEMO_MARKER,
+    }
+
+    with patch.object(release, "_ssh", return_value=json.dumps(observed)), pytest.raises(
+        RuntimeError, match="DEMO_MODE"
+    ):
+        release._observe(valid_payload())
 
 
 def test_observe_accepts_the_deployment_provider_payload_without_argv():
@@ -1276,6 +1399,7 @@ def test_execute_deploys_to_authorized_host_and_returns_remote_commit():
                         "static_container": "citespan-test-static-1",
                         "static_content_dir": "/opt/citespan/.citespan-backups/1/static-1",
                         "synthetic_only": True,
+                        "demo_mode": "1",
                         "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
                         "metadata_marker": release.CANONICAL_DEMO_MARKER,
                         "demo_marker": release.CANONICAL_DEMO_MARKER,
@@ -1353,6 +1477,7 @@ def test_observe_returns_the_commit_read_from_the_external_host():
                     "static_container": "citespan-test-static-1",
                     "static_content_dir": "/opt/citespan/.citespan-backups/1/static-1",
                     "synthetic_only": True,
+                    "demo_mode": "1",
                     "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
                     "metadata_marker": release.CANONICAL_DEMO_MARKER,
                     "demo_marker": release.CANONICAL_DEMO_MARKER,
@@ -1393,6 +1518,7 @@ def test_observe_rejects_stale_or_mismatched_remote_identity(field, value, messa
         "static_container": "citespan-test-static-1",
         "static_content_dir": "/opt/citespan/.citespan-backups/1/static-1",
         "synthetic_only": True,
+        "demo_mode": "1",
         "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
         "metadata_marker": release.CANONICAL_DEMO_MARKER,
         "demo_marker": release.CANONICAL_DEMO_MARKER,
@@ -1422,6 +1548,7 @@ def test_verify_uses_provider_observation_and_live_verifier_result(tmp_path):
             "live_url": "https://citespan.example",
             "deployment_id": "citespan-test",
             "synthetic_only": True,
+            "demo_mode": "1",
             "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
             "metadata_marker": release.CANONICAL_DEMO_MARKER,
             "demo_marker": release.CANONICAL_DEMO_MARKER,
@@ -1475,6 +1602,7 @@ def test_live_verifier_uses_durable_external_directory_and_returns_draft(tmp_pat
         "live_url": "https://citespan.example",
         "deployment_id": "citespan-observed",
         "synthetic_only": True,
+        "demo_mode": "1",
         "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
         "metadata_marker": release.CANONICAL_DEMO_MARKER,
         "demo_marker": release.CANONICAL_DEMO_MARKER,
@@ -1556,6 +1684,7 @@ def test_verify_rejects_mismatched_or_stale_observation(field, value, message):
         "live_url": "https://citespan.example",
         "deployment_id": "citespan-test",
         "synthetic_only": True,
+        "demo_mode": "1",
         "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
         "metadata_marker": release.CANONICAL_DEMO_MARKER,
         "demo_marker": release.CANONICAL_DEMO_MARKER,
@@ -1577,6 +1706,7 @@ def test_verify_passes_exact_observed_url_and_identity_to_live_verifier(tmp_path
         "live_url": "https://observed.example",
         "deployment_id": "citespan-observed",
         "synthetic_only": True,
+        "demo_mode": "1",
         "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
         "metadata_marker": release.CANONICAL_DEMO_MARKER,
         "demo_marker": release.CANONICAL_DEMO_MARKER,
@@ -2934,6 +3064,70 @@ def test_branding_scan_allows_ufdr_file_format_reference():
                 'c.drawString(50, y, "UFDR File: demo_synthetic.ufdr")',
             )
         ],
+    ):
+        findings = release._branding_findings()
+
+    assert findings == []
+
+
+@pytest.mark.parametrize("name", ["codex/phase-a.md", "codex/phase-bde.md", "codex/v4-merge-gate.txt"])
+def test_branding_scan_ignores_archived_review_transcript(name):
+    with patch.object(
+        release,
+        "_tracked_text",
+        return_value=[(name, "UFDR Analyzer — Evidence Report")],
+    ):
+        findings = release._branding_findings()
+
+    assert findings == []
+
+
+def test_branding_scan_ignores_unlisted_codex_documentation():
+    with patch.object(
+        release,
+        "_tracked_text",
+        return_value=[("codex/new-product-doc.md", "UFDR Analyzer")],
+    ):
+        findings = release._branding_findings()
+
+    assert findings == []
+
+
+def test_corrected_product_documentation_passes_branding_scan():
+    names = ["codex/phase-a.md", "codex/phase-bde.md", "codex/v4-merge-gate.txt"]
+    with patch.object(
+        release,
+        "_tracked_text",
+        return_value=[
+            (name, (release.ROOT / name).read_text(encoding="utf-8")) for name in names
+        ],
+    ):
+        findings = release._branding_findings()
+
+    assert findings == []
+
+
+def test_branding_scan_allows_ufdr_format_and_repository_identity_in_product_documentation():
+    with patch.object(
+        release,
+        "_tracked_text",
+        return_value=[
+            (
+                "codex/phase-a.md",
+                "CiteSpan reads UFDR file-format data from aayushman-singh/ufdr-analyzer.",
+            )
+        ],
+    ):
+        findings = release._branding_findings()
+
+    assert findings == []
+
+
+def test_branding_scan_allows_lowercase_ufdr_report_file_format_reference():
+    with patch.object(
+        release,
+        "_tracked_text",
+        return_value=[("codex/v4-merge-gate.txt", "an ingested UFDR report")],
     ):
         findings = release._branding_findings()
 

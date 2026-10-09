@@ -893,10 +893,12 @@ def _critical_dependency_findings() -> list[str]:
 def _branding_findings() -> list[str]:
     """Find old names in public product surfaces and unscoped AI claims."""
     findings: list[str] = []
-    old_name = re.compile(r"(?i)\b(?:ForensicAI|UFDR Analyzer|UFDR Report)\b")
+    old_name = re.compile(r"\b(?:ForensicAI|(?i:UFDR Analyzer)|UFDR Report)\b")
     for name, text in _tracked_text():
+        normalized_name = name.replace("\\", "/")
         if name not in PUBLIC_BRANDING_PATHS and not (
-            name.startswith("frontend/app/") or name.startswith("frontend/components/")
+            normalized_name.startswith("frontend/app/")
+            or normalized_name.startswith("frontend/components/")
         ):
             continue
         public_text = re.sub(r"(?s)/\*.*?\*/", "", text)
@@ -999,6 +1001,22 @@ def _payload_value(payload: dict[str, Any], name: str) -> Any:
             if isinstance(container, dict) and name in container:
                 return container[name]
     return None
+
+
+def _enforce_hosted_demo_mode(payload: dict[str, Any]) -> str:
+    """Enforce the hosted release demo invariant without ambient defaults."""
+    configured = [("provider payload", _payload_value(payload, "DEMO_MODE"))]
+    configured.append(("process environment", os.environ.get("DEMO_MODE")))
+    enabled = {"1", "true", "yes", "on"}
+    for source, value in configured:
+        if value is None:
+            continue
+        normalized = str(value).strip().lower()
+        if normalized not in enabled:
+            raise RuntimeError(
+                f"release blocked: {source} DEMO_MODE must be 1 for the hosted synthetic demo"
+            )
+    return "1"
 
 
 def _observation_value(payload: dict[str, Any], name: str) -> Any:
@@ -1815,7 +1833,7 @@ trap rollback EXIT
         "failed_step=readiness-postgresql; postgres_ready=0; last_readiness_cause=; for readiness_attempt in $(seq 1 30); do set +e; readiness_output=$(docker exec \"$authoritative_postgres\" env PGPASSWORD=\"$POSTGRES_PASSWORD\" pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" 2>&1); readiness_status=$?; set -e; last_readiness_cause=$(sanitize_probe_output \"$readiness_output\"); printf '%s\n' \"service=postgres identity=$authoritative_postgres attempt=$readiness_attempt status=$readiness_status cause=$last_readiness_cause\" >> \"$readiness_evidence\"; if [ \"$readiness_status\" -eq 0 ] && printf '%s' \"$readiness_output\" | grep -q accepting; then postgres_ready=1; break; fi; if [ \"$readiness_status\" -eq 127 ] || printf '%s' \"$readiness_output\" | grep -Eqi 'not found|invalid|malformed|authentication|permission denied|wrong identity'; then echo \"readiness failed: PostgreSQL permanent probe fault; cause=$last_readiness_cause; see $readiness_evidence\" >&2; exit 1; fi; sleep 1; done; test \"$postgres_ready\" -eq 1 || { echo \"readiness failed: PostgreSQL timed out; last_cause=$last_readiness_cause; see $readiness_evidence\" >&2; exit 1; }; python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" postgres ready; "
         "failed_step=readiness-meilisearch; meili_ready=0; last_readiness_cause=; for readiness_attempt in $(seq 1 30); do set +e; readiness_output=$(docker exec \"$authoritative_meili\" sh -c 'wget --header=\"Authorization: Bearer $MEILI_MASTER_KEY\" -qO- http://127.0.0.1:7700/health' 2>&1); readiness_status=$?; set -e; last_readiness_cause=$(sanitize_probe_output \"$readiness_output\"); printf '%s\n' \"service=meili identity=$authoritative_meili attempt=$readiness_attempt status=$readiness_status cause=$last_readiness_cause\" >> \"$readiness_evidence\"; if [ \"$readiness_status\" -eq 0 ] && printf '%s' \"$readiness_output\" | grep -q available; then meili_ready=1; break; fi; if [ \"$readiness_status\" -eq 127 ] || printf '%s' \"$readiness_output\" | grep -Eqi 'not found|invalid|malformed|unauthorized|authentication|permission denied|wrong identity'; then echo \"readiness failed: Meilisearch permanent probe fault; cause=$last_readiness_cause; see $readiness_evidence\" >&2; exit 1; fi; sleep 1; done; test \"$meili_ready\" -eq 1 || { echo \"readiness failed: Meilisearch timed out; last_cause=$last_readiness_cause; see $readiness_evidence\" >&2; exit 1; }; python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" meili ready; "
         "failed_step=readiness-minio; minio_ready=0; last_readiness_cause=; for readiness_attempt in $(seq 1 30); do set +e; readiness_output=$(docker exec \"$authoritative_minio\" sh -c 'wget --user=\"$MINIO_ROOT_USER\" --password=\"$MINIO_ROOT_PASSWORD\" -qO- http://127.0.0.1:9000/minio/health/live' 2>&1); readiness_status=$?; set -e; last_readiness_cause=$(sanitize_probe_output \"$readiness_output\"); printf '%s\n' \"service=minio identity=$authoritative_minio attempt=$readiness_attempt status=$readiness_status cause=$last_readiness_cause\" >> \"$readiness_evidence\"; if [ \"$readiness_status\" -eq 0 ] && printf '%s' \"$readiness_output\" | grep -q -E 'OK|live|success'; then minio_ready=1; break; fi; if [ \"$readiness_status\" -eq 127 ] || printf '%s' \"$readiness_output\" | grep -Eqi 'not found|invalid|malformed|unauthorized|authentication|permission denied|wrong identity'; then echo \"readiness failed: MinIO permanent probe fault; cause=$last_readiness_cause; see $readiness_evidence\" >&2; exit 1; fi; sleep 1; done; test \"$minio_ready\" -eq 1 || { echo \"readiness failed: MinIO timed out; last_cause=$last_readiness_cause; see $readiness_evidence\" >&2; exit 1; }; python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" minio ready; fi\n"
-        "candidate_suffix=$(date -u +%Y%m%d%H%M%S%N); export CITESPAN_DEPLOYMENT_ID=\"citespan-candidate-$candidate_suffix\" CITESPAN_DEMO_RUN_ID=\"$run_id\" CITESPAN_SYNTHETIC_MARKER="
+        "test \"$DEMO_MODE\" = 1; export DEMO_MODE=1; candidate_suffix=$(date -u +%Y%m%d%H%M%S%N); export CITESPAN_DEPLOYMENT_ID=\"citespan-candidate-$candidate_suffix\" CITESPAN_DEMO_RUN_ID=\"$run_id\" CITESPAN_SYNTHETIC_MARKER="
         + shlex.quote(CANONICAL_DEMO_MARKER)
         + " CITESPAN_SYNTHETIC_ONLY=1 CITESPAN_AUTHORITATIVE_NETWORK=\"$authoritative_network\" CITESPAN_AUTHORITATIVE_POSTGRES=\"$authoritative_postgres\" CITESPAN_AUTHORITATIVE_MEILI=\"$authoritative_meili\" CITESPAN_AUTHORITATIVE_MINIO=\"$authoritative_minio\" OPENAI_API_KEY= OPENROUTER_API_KEY=; "
         "backend_port=$(python3 -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); print(s.getsockname()[1]); s.close()'); candidate_frontend_port=$(python3 -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\",0)); print(s.getsockname()[1]); s.close()'); frontend_port=$candidate_frontend_port; "
@@ -1884,12 +1902,12 @@ def _observation_command() -> str:
         "assert marker['run_id'] == sys.argv[4], 'demo marker run ID mismatch'; "
         "assert marker['synthetic_only'] is True, 'demo marker is not synthetic-only'; "
         "assert marker['marker'] == sys.argv[5], 'demo marker contents mismatch'; "
-        "print(json.dumps({'deployment_commit':metadata['commit'],'live_url':metadata['live_url'],'deployment_id':metadata['deployment_id'],'backend_port':metadata['backend_port'],'frontend_port':metadata['frontend_port'],'static_container':metadata['static_container'],'static_content_dir':metadata['static_content_dir'],'synthetic_only':True,'demo_run_id':marker['run_id'],'metadata_marker':metadata['marker'],'demo_marker':marker['marker']}))"
+        "print(json.dumps({'deployment_commit':metadata['commit'],'live_url':metadata['live_url'],'deployment_id':metadata['deployment_id'],'backend_port':metadata['backend_port'],'frontend_port':metadata['frontend_port'],'static_container':metadata['static_container'],'static_content_dir':metadata['static_content_dir'],'synthetic_only':True,'demo_mode':'1','demo_run_id':marker['run_id'],'metadata_marker':metadata['marker'],'demo_marker':marker['marker']}))"
     )
     return (
         "set -eu; "
         f"if [ ! -f {DEPLOYMENT_METADATA} ] || [ ! -f {DEMO_MARKER} ]; then printf 'NOT_DEPLOYED\\n'; "
-        f"else deployment_id=$(python3 -c 'import json; print(json.load(open(\"{DEPLOYMENT_METADATA}\"))[\"deployment_id\"]'); static_container=$(python3 -c 'import json; print(json.load(open(\"{DEPLOYMENT_METADATA}\"))[\"static_container\"]'); backend_id=$(docker ps -q --filter name=^/$deployment_id-backend$); test -n \"$backend_id\"; test -n \"$(docker ps -q --filter name=^/$static_container$)\"; backend_env=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \"$backend_id\"); printf %s \"$backend_env\" | grep -Fxq 'CITESPAN_SYNTHETIC_ONLY=1'; printf %s \"$backend_env\" | grep -Fxq 'CITESPAN_DEMO_RUN_ID={CANONICAL_DEMO_RUN_ID}'; printf %s \"$backend_env\" | grep -Fxq 'CITESPAN_SYNTHETIC_MARKER={CANONICAL_DEMO_MARKER}'; printf %s \"$backend_env\" | grep -Fxq \"CITESPAN_DEPLOYMENT_ID=$deployment_id\"; test \"$(git -C {DEPLOY_PATH} rev-parse HEAD)\" = \"$(python3 -c 'import json; print(json.load(open(\"{DEPLOYMENT_METADATA}\"))[\"commit\"]')\"; test -f /etc/caddy/Caddyfile; grep -Fq '# BEGIN CITESPAN ROUTE' /etc/caddy/Caddyfile; "
+        f"else deployment_id=$(python3 -c 'import json; print(json.load(open(\"{DEPLOYMENT_METADATA}\"))[\"deployment_id\"]'); static_container=$(python3 -c 'import json; print(json.load(open(\"{DEPLOYMENT_METADATA}\"))[\"static_container\"]'); runtime={DEPLOY_PATH}/.citespan-runtime.env; test -f \"$runtime\"; grep -Fxq 'DEMO_MODE=1' \"$runtime\"; grep -Fxq 'CITESPAN_SYNTHETIC_ONLY=1' \"$runtime\"; backend_id=$(docker ps -q --filter name=^/$deployment_id-backend$); test -n \"$backend_id\"; test -n \"$(docker ps -q --filter name=^/$static_container$)\"; backend_env=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \"$backend_id\"); printf %s \"$backend_env\" | grep -Fxq 'DEMO_MODE=1'; printf %s \"$backend_env\" | grep -Fxq 'CITESPAN_SYNTHETIC_ONLY=1'; printf %s \"$backend_env\" | grep -Fxq 'CITESPAN_DEMO_RUN_ID={CANONICAL_DEMO_RUN_ID}'; printf %s \"$backend_env\" | grep -Fxq 'CITESPAN_SYNTHETIC_MARKER={CANONICAL_DEMO_MARKER}'; printf %s \"$backend_env\" | grep -Fxq \"CITESPAN_DEPLOYMENT_ID=$deployment_id\"; test \"$(git -C {DEPLOY_PATH} rev-parse HEAD)\" = \"$(python3 -c 'import json; print(json.load(open(\"{DEPLOYMENT_METADATA}\"))[\"commit\"]')\"; test -f /etc/caddy/Caddyfile; grep -Fq '# BEGIN CITESPAN ROUTE' /etc/caddy/Caddyfile; "
         "python3 -c " + shlex.quote(observation_script) + " "
         + DEPLOYMENT_METADATA
         + " "
@@ -1907,6 +1925,7 @@ def _observation_command() -> str:
 def _prepare(payload: dict[str, Any]) -> dict[str, Any]:
     action = _provider_payload(payload)
     _check_payload_secrets(payload)
+    demo_mode = _enforce_hosted_demo_mode(payload)
     release_text = _release_text()
     for name in _credential_scan_findings(release_text):
         raise RuntimeError(f"release blocked: credential pattern found in tracked file {name}")
@@ -1923,11 +1942,6 @@ def _prepare(payload: dict[str, Any]) -> dict[str, Any]:
     actual = _git("rev-parse", "HEAD").lower()
     if actual != expected:
         raise RuntimeError("release blocked: prepared commit does not match expected commit")
-    demo_mode = _payload_value(payload, "DEMO_MODE")
-    if demo_mode is None:
-        demo_mode = os.environ.get("DEMO_MODE")
-    if str(demo_mode).lower() not in {"1", "true", "yes"}:
-        raise RuntimeError("release blocked: DEMO_MODE must be enabled for the hosted sample")
     dependency_findings = _critical_dependency_findings()
     branding_findings = _branding_findings()
     release_ready = not dependency_findings and not branding_findings
@@ -1941,7 +1955,13 @@ def _prepare(payload: dict[str, Any]) -> dict[str, Any]:
         "commit": expected,
         "product_name": "CiteSpan",
         "python": _project_python(),
-        "demo_policy": {"upload": False, "reset_to_sample": True, "sample": "canonical synthetic UFDR"},
+        "demo_policy": {
+            "mode": demo_mode,
+            "runtime": {"DEMO_MODE": "1", "CITESPAN_SYNTHETIC_ONLY": "1"},
+            "upload": False,
+            "reset_to_sample": True,
+            "sample": "canonical synthetic UFDR",
+        },
         "secret_policy": "known historical credentials are compromised; runtime secrets are external and rotated",
         "credential_history_findings": history_findings,
         "critical_dependency_findings": dependency_findings,
@@ -2036,6 +2056,8 @@ def _observe(payload: dict[str, Any]) -> dict[str, Any]:
     expected = _expected_commit(payload)
     if remote_commit.lower() != expected:
         raise RuntimeError("observation failed: remote commit does not match expected commit")
+    if observed.get("demo_mode") != "1":
+        raise RuntimeError("observation failed: deployed DEMO_MODE is not 1")
     result = {
         "action_key": action,
         "complete": True,
@@ -2077,6 +2099,7 @@ def _observe(payload: dict[str, Any]) -> dict[str, Any]:
     result["static_container"] = static_container
     result["static_content_dir"] = static_content_dir
     result["synthetic_only"] = True
+    result["demo_mode"] = "1"
     result["demo_run_id"] = observed["demo_run_id"]
     result["metadata_marker"] = observed["metadata_marker"]
     result["demo_marker"] = observed["demo_marker"]
@@ -2134,6 +2157,8 @@ def _verify(payload: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("verification blocked: payload deployment identity does not match observation")
     if observation.get("synthetic_only") is not True:
         raise RuntimeError("verification blocked: observed deployment is not synthetic-only")
+    if observation.get("demo_mode") != "1":
+        raise RuntimeError("verification blocked: observed deployment DEMO_MODE is not 1")
     if observation.get("demo_run_id") != CANONICAL_DEMO_RUN_ID:
         raise RuntimeError("verification blocked: observed canonical demo run ID is invalid")
     if observation.get("metadata_marker") != CANONICAL_DEMO_MARKER or observation.get("demo_marker") != CANONICAL_DEMO_MARKER:
