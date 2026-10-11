@@ -1446,8 +1446,12 @@ def test_generated_recovery_runs_real_bash_and_preserves_prior_state(bash_tmp_pa
     call_log.touch()
     (bin_root / "docker").write_text(
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\n"
-        "case \"$*\" in\n"
-        "  *'inspect -f {{.State.Running}} '*) echo true ;;\n"
+            "case \"$*\" in\n"
+            "  *'inspect -f {{.Id}} candidate-id'*) echo candidate-id ;;\n"
+            "  *'inspect -f {{.Name}} candidate-id'*) printf '/%s-backend\\n' \"$CITESPAN_DEPLOYMENT_ID\" ;;\n"
+            "  *'inspect -f {{.State.Status}} candidate-id'*) echo running ;;\n"
+            "  *'inspect -f {{if .State.Health}}'*) echo none ;;\n"
+            "  *'inspect -f {{.State.Running}} '*) echo true ;;\n"
         "  *'inspect -f {{.Name}} '*) container=; for argument do container=$argument; done; printf '/%s\\n' \"$container\" ;;\n"
         "  *'inspect '*) printf '%s\\n' '[{\"Id\":\"prior-id\",\"Name\":\"previous\",\"State\":{\"Running\":true},\"Config\":{\"Env\":[\"CITESPAN_SYNTHETIC_ONLY=1\"]}}]' ;;\n"
         "  *'pg_isready'*) exit 0 ;;\n"
@@ -1494,7 +1498,10 @@ def test_generated_recovery_runs_real_bash_and_preserves_prior_state(bash_tmp_pa
     }.items():
         (bin_root / name).write_text(body, encoding="utf-8")
     (bin_root / "curl").write_text(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\ncase \"$*\" in *https://*) if [ \"$CITESPAN_FAIL_STEP\" = post_cutover ]; then printf '%s\\n' \"injected failure: $CITESPAN_FAIL_STEP\" >> \"$CALL_LOG\"; echo \"injected failure: $CITESPAN_FAIL_STEP\" >&2; exit 22; fi;; esac\nprintf 'CiteSpan\\n'\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\n"
+        "output=; previous=; for argument do if [ \"$previous\" = output ]; then output=\"$argument\"; previous=; elif [ \"$argument\" = --output ]; then previous=output; fi; done\n"
+        "case \"$*\" in *https://*) if [ \"$CITESPAN_FAIL_STEP\" = post_cutover ]; then printf '%s\\n' \"injected failure: $CITESPAN_FAIL_STEP\" >> \"$CALL_LOG\"; echo \"injected failure: $CITESPAN_FAIL_STEP\" >&2; exit 22; fi;; esac\n"
+        "case \"$*\" in */health/*) printf '%s' '{\"status\":\"OK\"}' > \"$output\"; printf '200' ;; *) printf 'CiteSpan\\n' ;; esac\n",
         encoding="utf-8",
     )
     for name in ("caddy", "systemctl"):
@@ -1572,7 +1579,11 @@ def test_generated_recovery_runs_real_bash_and_preserves_prior_state(bash_tmp_pa
         assert "injected failure: pre_cutover" in result.stderr
         assert "injected failure: pre_cutover" in calls
     else:
-        https_index = next(index for index, call in enumerate(calls) if release.AUTHORIZED_LIVE_ORIGIN in call)
+        https_calls = [
+            index for index, call in enumerate(calls) if release.AUTHORIZED_LIVE_ORIGIN in call
+        ]
+        assert https_calls, f"{failure} did not reach authorized HTTPS request; calls:\n{calls}\nstderr:\n{result.stderr}"
+        https_index = https_calls[0]
         assert compose_calls[0] < https_index
         assert any("down --remove-orphans" in call for call in calls)
         assert "injected failure: post_cutover" in result.stderr or "deployment failed at" in result.stderr
@@ -4971,6 +4982,127 @@ def test_negative_readiness_probe_keeps_receipt_not_ready_and_records_diagnostic
     assert "[REDACTED]" in command
     assert "minio_http_status" in command
     assert "/minio/health/ready" in command
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_success", "expected_attempts"),
+    [
+        ("delayed", True, 2),
+        ("delayed-late", True, 31),
+        ("permanent", False, 1),
+        ("inspect-failure", False, 0),
+        ("exit", False, 0),
+        ("wrong-identity", False, 0),
+        ("invalid", False, 1),
+        ("hanging", False, 1),
+        ("timeout", False, 1),
+    ],
+)
+def test_candidate_readiness_executes_before_demo_work_and_records_private_evidence(
+    bash_tmp_path, mode, expected_success, expected_attempts
+):
+    bin_root = bash_tmp_path / "bin"
+    bin_root.mkdir()
+    call_log = bash_tmp_path / "calls.log"
+    attempt_file = bash_tmp_path / "attempt"
+    evidence = bash_tmp_path / "readiness.log"
+    attempt_file.write_text("0", encoding="utf-8")
+    project_python = _bash_path(Path(PYTHON))
+    (bin_root / "python3").write_text(
+        f"#!/bin/sh\nexec '{project_python}' \"$@\"\n", encoding="utf-8"
+    )
+    (bin_root / "docker").write_text(
+        "#!/bin/sh\n"
+        "printf 'docker %s\\n' \"$*\" >> \"$CALL_LOG\"\n"
+        "case \"$*\" in\n"
+        "  *'inspect -f {{.Id}} candidate-id'*) if [ \"$READINESS_MODE\" = inspect-failure ]; then echo 'inspect denied' >&2; exit 13; else echo candidate-id; fi ;;\n"
+        "  *'inspect -f {{.Name}} candidate-id'*) if [ \"$READINESS_MODE\" = wrong-identity ]; then echo /wrong-container; else echo /citespan-candidate-backend; fi ;;\n"
+        "  *'inspect -f {{.State.Status}} candidate-id'*) if [ \"$READINESS_MODE\" = exit ]; then echo exited; else echo running; fi ;;\n"
+        "  *'inspect -f {{if .State.Health}}'*) echo none ;;\n"
+        "  *'logs candidate-id'*) echo \"backend secret-for-evidence super-secret\" ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    (bin_root / "curl").write_text(
+        "#!/bin/sh\n"
+        "output=; previous=\n"
+        "for argument do if [ \"$previous\" = output ]; then output=\"$argument\"; previous=; elif [ \"$argument\" = --output ]; then previous=output; fi; done\n"
+        "case \"$*\" in *--connect-timeout*--max-time*) ;; *) echo 'missing bounded curl flags' >&2; exit 64;; esac\n"
+        "count=$(cat \"$ATTEMPT_FILE\"); count=$((count + 1)); printf '%s' \"$count\" > \"$ATTEMPT_FILE\"\n"
+        "if [ \"$READINESS_MODE\" = permanent ]; then echo 'authorization denied' >&2; exit 1; fi\n"
+        "if [ \"$READINESS_MODE\" = hanging ]; then printf '%s' '{\"status\":\"STARTING\"}' > \"$output\"; printf '000'; exit 28; fi\n"
+        "if [ \"$READINESS_MODE\" = invalid ]; then printf '%s' '{\"status\":\"BROKEN\"}' > \"$output\"; printf '200'; exit 0; fi\n"
+        "if [ \"$READINESS_MODE\" = delayed ] && [ \"$count\" -lt 2 ]; then printf '%s' '{\"status\":\"STARTING\"}' > \"$output\"; printf '503'; exit 0; fi\n"
+        "if [ \"$READINESS_MODE\" = delayed-late ] && [ \"$count\" -lt 31 ]; then printf '%s' '{\"status\":\"STARTING\"}' > \"$output\"; printf '503'; exit 0; fi\n"
+        "if [ \"$READINESS_MODE\" = timeout ]; then printf '%s' '{\"status\":\"STARTING\"}' > \"$output\"; printf '503'; exit 0; fi\n"
+        "printf '%s' '{\"status\":\"OK\"}' > \"$output\"; printf '200'\n",
+        encoding="utf-8",
+    )
+    for path in bin_root.iterdir():
+        path.chmod(0o755)
+
+    runtime_credential_names = (
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "NEO4J_PASSWORD",
+        "POSTGRES_PASSWORD",
+        "MEILI_MASTER_KEY",
+        "MINIO_ROOT_USER",
+        "MINIO_ROOT_PASSWORD",
+        "MINIO_ACCESS_KEY",
+        "MINIO_SECRET_KEY",
+        "SECRET_KEY",
+    )
+    runtime_credential_env = " ".join(
+        f"{name}={'super-secret' if name == 'NEO4J_PASSWORD' else ''}"
+        for name in runtime_credential_names
+    )
+    script = (
+        "#!/usr/bin/env bash\nset -Eeuo pipefail\n"
+        f"PATH='{_bash_path(bin_root)}:'\"$PATH\"\n"
+        f"CALL_LOG='{_bash_path(call_log)}' ATTEMPT_FILE='{_bash_path(attempt_file)}' READINESS_MODE='{mode}' export CALL_LOG ATTEMPT_FILE READINESS_MODE\n"
+        f"readiness_evidence='{_bash_path(evidence)}'\n"
+        "CITESPAN_DEPLOYMENT_ID=citespan-candidate\nbackend_port=18000\ncandidate_backend=candidate-id\n"
+        f"{runtime_credential_env}\n"
+        "export OPENAI_API_KEY OPENROUTER_API_KEY NEO4J_PASSWORD POSTGRES_PASSWORD MEILI_MASTER_KEY MINIO_ROOT_USER MINIO_ROOT_PASSWORD MINIO_ACCESS_KEY MINIO_SECRET_KEY SECRET_KEY\n"
+        "export CITESPAN_DEPLOYMENT_ID backend_port candidate_backend\n"
+        "sleep() { if [ \"$READINESS_MODE\" = hanging ] || [ \"$READINESS_MODE\" = timeout ]; then SECONDS=$readiness_deadline; else SECONDS=$((SECONDS + 1)); fi; :; }\n"
+            + release._readiness_sanitizer()
+            + "\n"
+            + release._candidate_backend_readiness_command()
+            + "for dependent_step in demo-query seed audit frontend-build route; do printf '%s\\n' \"$dependent_step\" >> \"$CALL_LOG\"; done\n"
+    )
+    script_path = bash_tmp_path / "candidate-readiness.sh"
+    script_path.write_text(script, encoding="utf-8")
+    result = subprocess.run(
+        [str(_git_bash_executable()), _bash_path(script_path)],
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+
+    assert (result.returncode == 0) is expected_success, (
+        result.stderr
+        + "\n"
+        + call_log.read_text(encoding="utf-8")
+        + "\n"
+        + (evidence.read_text(encoding="utf-8") if evidence.exists() else "")
+    )
+    assert int(attempt_file.read_text(encoding="utf-8")) == expected_attempts
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    if expected_success:
+        assert calls[-5:] == ["demo-query", "seed", "audit", "frontend-build", "route"]
+        assert f"attempt={expected_attempts}" in evidence.read_text(encoding="utf-8")
+    else:
+        assert not set(calls) & {"demo-query", "seed", "audit", "frontend-build", "route"}
+        private_evidence = evidence.read_text(encoding="utf-8")
+        assert "candidate-id" in private_evidence
+        assert "state=" in private_evidence
+        assert "health_status=" in private_evidence
+        assert "port=18000" in private_evidence
+        assert "super-secret" not in private_evidence
+        assert "[REDACTED]" in private_evidence
 
 
 def test_readiness_sanitizer_keeps_safe_cause_and_removes_runtime_secret():

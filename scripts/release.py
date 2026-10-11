@@ -2203,6 +2203,136 @@ python3 -c {receipt_writer} "$receipt" "$runtime" "$CITESPAN_SYNTHETIC_MARKER" "
 """
 
 
+def _candidate_backend_readiness_command() -> str:
+    """Return the bounded readiness probe for the single candidate backend."""
+    return _readiness_sanitizer() + r'''
+failed_step=candidate-backend-readiness
+candidate_ready=0
+candidate_expected_name="/$CITESPAN_DEPLOYMENT_ID-backend"
+candidate_state=unknown
+candidate_health_status=unknown
+candidate_http_status=000
+candidate_curl_status=1
+candidate_readiness_cause='candidate backend is not ready'
+candidate_health_body=$(mktemp)
+candidate_probe_error=$(mktemp)
+candidate_health_body_context=unknown
+candidate_health_validation_status=1
+capture_candidate_failure() {
+    printf '%s\n' "service=candidate-backend attempt=$readiness_attempt identity=$candidate_backend expected_name=$candidate_expected_name port=$backend_port state=$candidate_state health_status=$candidate_health_status http_status=$candidate_http_status curl_status=$candidate_curl_status health_validation_status=$candidate_health_validation_status health_body=$candidate_health_body_context cause=$candidate_readiness_cause" >> "$readiness_evidence"
+    set +e
+    candidate_logs=$(docker logs "$candidate_backend" 2>&1)
+    candidate_logs_status=$?
+    set -e
+    printf '%s\n' "candidate_logs_status=$candidate_logs_status logs=$(sanitize_probe_output "$candidate_logs")" >> "$readiness_evidence"
+}
+readiness_deadline=$((SECONDS + 190))
+readiness_attempt=0
+while :; do
+    readiness_attempt=$((readiness_attempt + 1))
+    if [ "$SECONDS" -ge "$readiness_deadline" ]; then
+        candidate_readiness_cause='candidate readiness deadline exceeded'
+        capture_candidate_failure
+        echo "readiness failed: candidate backend deadline exceeded; see $readiness_evidence" >&2
+        exit 1
+    fi
+    set +e
+    candidate_identity=$(docker inspect -f '{{.Id}}' "$candidate_backend" 2>&1)
+    candidate_identity_status=$?
+    candidate_name=$(docker inspect -f '{{.Name}}' "$candidate_backend" 2>&1)
+    candidate_name_status=$?
+    candidate_state=$(docker inspect -f '{{.State.Status}}' "$candidate_backend" 2>&1)
+    candidate_state_status=$?
+    candidate_health_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$candidate_backend" 2>&1)
+    candidate_health_inspect_status=$?
+    set -e
+    candidate_identity=$(sanitize_probe_output "$candidate_identity")
+    candidate_name=$(sanitize_probe_output "$candidate_name")
+    candidate_state=$(sanitize_probe_output "$candidate_state")
+    candidate_health_status=$(sanitize_probe_output "$candidate_health_status")
+    if [ "$candidate_identity_status" -ne 0 ] || [ "$candidate_identity" != "$candidate_backend" ]; then
+        candidate_readiness_cause='candidate identity check failed'
+        capture_candidate_failure
+        echo "readiness failed: candidate backend permanent identity failure; see $readiness_evidence" >&2
+        exit 1
+    fi
+    if [ "$candidate_name_status" -ne 0 ] || [ "$candidate_name" != "$candidate_expected_name" ]; then
+        candidate_readiness_cause='candidate name check failed'
+        capture_candidate_failure
+        echo "readiness failed: candidate backend permanent name failure; see $readiness_evidence" >&2
+        exit 1
+    fi
+    if [ "$candidate_state_status" -ne 0 ] || [ "$candidate_health_inspect_status" -ne 0 ] || [ "$candidate_state" = exited ] || [ "$candidate_state" = dead ]; then
+        candidate_readiness_cause='candidate container exited or inspect failed'
+        capture_candidate_failure
+        echo "readiness failed: candidate backend permanent startup failure; see $readiness_evidence" >&2
+        exit 1
+    fi
+    : > "$candidate_health_body"
+    : > "$candidate_probe_error"
+    candidate_probe_remaining=$((readiness_deadline - SECONDS))
+    if [ "$candidate_probe_remaining" -le 0 ]; then
+        candidate_readiness_cause='candidate readiness deadline exceeded before health probe'
+        capture_candidate_failure
+        echo "readiness failed: candidate backend deadline exceeded before health probe; see $readiness_evidence" >&2
+        exit 1
+    fi
+    candidate_connect_timeout=2
+    if [ "$candidate_probe_remaining" -lt "$candidate_connect_timeout" ]; then
+        candidate_connect_timeout=$candidate_probe_remaining
+    fi
+    candidate_max_time=5
+    if [ "$candidate_probe_remaining" -lt "$candidate_max_time" ]; then
+        candidate_max_time=$candidate_probe_remaining
+    fi
+    set +e
+    candidate_http_status=$(curl --silent --show-error --connect-timeout "$candidate_connect_timeout" --max-time "$candidate_max_time" --output "$candidate_health_body" --write-out '%{http_code}' "http://127.0.0.1:$backend_port/health/" 2>"$candidate_probe_error")
+    candidate_curl_status=$?
+    set -e
+    candidate_curl_context=$(cat "$candidate_probe_error")
+    candidate_curl_context=$(sanitize_probe_output "$candidate_curl_context")
+    if [ "$candidate_curl_status" -eq 0 ] && [ "$candidate_http_status" = 200 ]; then
+        set +e
+        candidate_health_body_context=$(cat "$candidate_health_body")
+        candidate_health_body_context=$(sanitize_probe_output "$candidate_health_body_context")
+        python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value == {"status": "OK"}' "$candidate_health_body" >/dev/null 2>&1
+        candidate_health_validation_status=$?
+        set -e
+        if [ "$candidate_health_validation_status" -eq 0 ]; then
+            candidate_ready=1
+            candidate_readiness_cause='health response is valid'
+            printf '%s\n' "service=candidate-backend identity=$candidate_backend expected_name=$candidate_expected_name port=$backend_port attempt=$readiness_attempt state=$candidate_state health_status=$candidate_health_status http_status=$candidate_http_status curl_status=$candidate_curl_status cause=$candidate_readiness_cause" >> "$readiness_evidence"
+            break
+        fi
+        candidate_readiness_cause="invalid health response: parser_status=$candidate_health_validation_status body=$candidate_health_body_context"
+        capture_candidate_failure
+        echo "readiness failed: candidate backend permanent health response failure; see $readiness_evidence" >&2
+        exit 1
+    fi
+    candidate_readiness_cause="health probe failed: $candidate_curl_context"
+    printf '%s\n' "service=candidate-backend identity=$candidate_backend expected_name=$candidate_expected_name port=$backend_port attempt=$readiness_attempt state=$candidate_state health_status=$candidate_health_status http_status=$candidate_http_status curl_status=$candidate_curl_status cause=$candidate_readiness_cause" >> "$readiness_evidence"
+    if [ "$candidate_curl_status" -eq 127 ] || printf '%s' "$candidate_curl_context" | grep -Eqi 'not found|invalid|malformed|unauthorized|authorization|authentication|permission denied|wrong identity'; then
+        capture_candidate_failure
+        echo "readiness failed: candidate backend permanent health probe failure; see $readiness_evidence" >&2
+        exit 1
+    fi
+    if [ "$((readiness_deadline - SECONDS))" -lt 1 ]; then
+        candidate_readiness_cause='candidate readiness deadline exceeded before sleep'
+        capture_candidate_failure
+        echo "readiness failed: candidate backend deadline exceeded before sleep; see $readiness_evidence" >&2
+        exit 1
+    fi
+    sleep 1
+done
+rm -f "$candidate_health_body" "$candidate_probe_error"
+if [ "$candidate_ready" -ne 1 ]; then
+    capture_candidate_failure
+    echo "readiness failed: candidate backend timed out; see $readiness_evidence" >&2
+    exit 1
+fi
+'''
+
+
 def _minio_source_build_definition() -> str:
     """Return the controlled Dockerfile that compiles the official MinIO source."""
     _validate_immutable_source_commits()
@@ -2316,6 +2446,7 @@ def _deployment_command_authoritative(payload: dict[str, Any]) -> str:
     domain = shlex.quote(domain_value)
     run_id = shlex.quote(_demo_run_id(payload))
     port_check = shlex.quote(_compose_backend_port_validation_script())
+    candidate_readiness = _candidate_backend_readiness_command()
     runtime_check = shlex.quote(_runtime_validation_script(history_values))
     origin_check = shlex.quote(_remote_origin_check_script())
     receipt_writer_source = _receipt_writer()
@@ -2439,8 +2570,10 @@ trap rollback EXIT
         "if [ \"$(docker inspect -f '{{.State.Running}}' \"$previous_backend\")\" = true ]; then previous_backend_running=1; fi; "
         "if [ \"$(docker inspect -f '{{.State.Running}}' \"$previous_static\")\" = true ]; then previous_static_running=1; fi; "
         "fi; "
-        f"recovery_log=\"$backup_dir/recovery.log\"; caddy_backup=\"$backup_dir/Caddyfile\"; cp -p /etc/caddy/Caddyfile \"$caddy_backup\"; "
-        + rollback_script
+        f"recovery_log=\"$backup_dir/recovery.log\"; caddy_backup=\"$backup_dir/Caddyfile\"; readiness_evidence=\"$backup_dir/readiness-evidence.log\"; umask 077; : > \"$readiness_evidence\"; chmod 600 \"$readiness_evidence\"; cp -p /etc/caddy/Caddyfile \"$caddy_backup\"; "
+            + _readiness_sanitizer()
+            + "\n"
+            + rollback_script
         + "phase_end \"bootstrap\" 0; phase_start \"authoritative-data-readiness\"; history_hash_count=$(printf '%s\\n' " + shlex.quote(history_hashes) + " | wc -w); "
         + history_check
         + f"git -C {DEPLOY_PATH} fetch --prune origin main; test \"$(git -C {DEPLOY_PATH} rev-parse refs/remotes/origin/main)\" = {expected}; git -C {DEPLOY_PATH} fetch --prune origin {expected_commit}; test \"$(git -C {DEPLOY_PATH} rev-parse FETCH_HEAD)\" = {expected}; git -C {DEPLOY_PATH} checkout --detach --force {expected_commit}; "
@@ -2453,7 +2586,7 @@ trap rollback EXIT
         f"if [ -f \"$receipt\" ]; then python3 -c {receipt_validate} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\"; else python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\"; fi; "
         + reconciliation
         + " reconcile_authoritative_resources; "
-        f"readiness_evidence=\"$backup_dir/readiness-evidence.log\"; umask 077; : > \"$readiness_evidence\"; chmod 600 \"$readiness_evidence\"; sanitize_probe_output() {{ local value=\"$1\"; value=${{value//$NEO4J_PASSWORD/[REDACTED]}}; value=${{value//$POSTGRES_PASSWORD/[REDACTED]}}; value=${{value//$MEILI_MASTER_KEY/[REDACTED]}}; value=${{value//$MINIO_ROOT_USER/[REDACTED]}}; value=${{value//$MINIO_ROOT_PASSWORD/[REDACTED]}}; printf '%s' \"$value\"; }}; if [ \"$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))[\"resources\"][\"network\"][\"created\"]))' \"$receipt\")\" -eq 0 ]; then if docker network inspect \"$authoritative_network\" >/dev/null 2>&1; then echo 'authoritative receipt does not own existing network' >&2; exit 1; fi; docker network create \"$authoritative_network\"; python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" network created; fi; docker network inspect \"$authoritative_network\" >/dev/null; "
+        f"if [ \"$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))[\"resources\"][\"network\"][\"created\"]))' \"$receipt\")\" -eq 0 ]; then if docker network inspect \"$authoritative_network\" >/dev/null 2>&1; then echo 'authoritative receipt does not own existing network' >&2; exit 1; fi; docker network create \"$authoritative_network\"; python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" network created; fi; docker network inspect \"$authoritative_network\" >/dev/null; "
         f"if [ \"$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))[\"resources\"][\"postgres\"][\"created\"]))' \"$receipt\")\" -eq 0 ]; then if docker inspect \"$authoritative_postgres\" >/dev/null 2>&1; then echo 'authoritative receipt does not own existing PostgreSQL container' >&2; exit 1; fi; docker run -d --name \"$authoritative_postgres\" --network \"$authoritative_network\" -e POSTGRES_USER=\"$POSTGRES_USER\" -e POSTGRES_DB=\"$POSTGRES_DB\" -e POSTGRES_PASSWORD=\"$POSTGRES_PASSWORD\" -v citespan-postgres-data:/var/lib/postgresql/data postgres:17-alpine; python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" postgres created; fi; test -n \"$(docker inspect -f '{{.Name}}' \"$authoritative_postgres\")\"; "
         f"if [ \"$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))[\"resources\"][\"meili\"][\"created\"]))' \"$receipt\")\" -eq 0 ]; then if docker inspect \"$authoritative_meili\" >/dev/null 2>&1; then echo 'authoritative receipt does not own Meilisearch container' >&2; exit 1; fi; docker run -d --name \"$authoritative_meili\" --network \"$authoritative_network\" -e MEILI_MASTER_KEY=\"$MEILI_MASTER_KEY\" -v citespan-meili-data:/meili_data getmeili/meilisearch:v1.15; python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" meili created; fi; test -n \"$(docker inspect -f '{{.Name}}' \"$authoritative_meili\")\"; "
         f"if [ \"$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1]))[\"resources\"][\"minio\"][\"created\"]))' \"$receipt\")\" -eq 0 ]; then if docker inspect \"$authoritative_minio\" >/dev/null 2>&1; then echo 'authoritative receipt does not own MinIO container' >&2; exit 1; fi; docker run -d --name \"$authoritative_minio\" --network \"$authoritative_network\" -e MINIO_ROOT_USER=\"$MINIO_ROOT_USER\" -e MINIO_ROOT_PASSWORD=\"$MINIO_ROOT_PASSWORD\" -e MINIO_ACCESS_KEY=\"$MINIO_ROOT_USER\" -e MINIO_SECRET_KEY=\"$MINIO_ROOT_PASSWORD\" -v citespan-minio-data:/data \"$minio_image\" server /data; python3 -c {receipt_writer} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\" minio created; fi; test -n \"$(docker inspect -f '{{.Name}}' \"$authoritative_minio\")\"; "
@@ -2469,8 +2602,9 @@ trap rollback EXIT
         f"printf %s {override} | base64 -d > \"$compose_override\"; "
         f'compose="docker compose --project-name $CITESPAN_DEPLOYMENT_ID --env-file {DEPLOY_PATH}/.citespan-runtime.env -f {DEPLOY_PATH}/{DEMO_COMPOSE} -f $compose_override"; '
         f"$compose config --format json | python3 -c {port_check} \"$backend_port\"; "
-        "$compose up -d --no-deps --build backend; backend_id=$($compose ps -q backend); test -n \"$backend_id\"; "
-        "demo_state=$(docker exec \"$backend_id\" sh -c 'echo " + empty_check + " | base64 -d | python3'); "
+        "$compose up -d --no-deps --build backend; backend_id=$($compose ps -q backend); test -n \"$backend_id\"; candidate_backend=\"$backend_id\"; "
+        + candidate_readiness
+        + "demo_state=$(docker exec \"$backend_id\" sh -c 'echo " + empty_check + " | base64 -d | python3'); "
         "if [ \"$demo_state\" = EMPTY ]; then echo 'candidate demo target is empty'; docker exec \"$backend_id\" sh -c 'echo " + seed + " | base64 -d | python3'; elif [ \"$demo_state\" = EXISTING ]; then test -f \"$receipt\"; "
         f"python3 -c {receipt_validate} \"$receipt\" \"$runtime\" \"$CITESPAN_SYNTHETIC_MARKER\" \"$authoritative_network\" \"$authoritative_postgres\" \"$authoritative_meili\" \"$authoritative_minio\"; "
         "if [ -f \"$deployment_metadata\" ]; then python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); required=(\"deployment_id\",\"backend_container\",\"static_container\",\"runtime_identity\",\"backend_identity\",\"static_identity\",\"commit\",\"live_url\",\"static_content_dir\",\"authoritative_network\",\"authoritative_postgres\",\"authoritative_meili\",\"authoritative_minio\",\"authoritative_data\",\"synthetic_only\",\"marker\"); assert all(key in m for key in required); assert m[\"authoritative_data\"] is True and m[\"synthetic_only\"] is True and m[\"marker\"] == \"" + CANONICAL_DEMO_MARKER + "\"; assert len(m[\"commit\"]) == 40' \"$deployment_metadata\"; python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); assert m[\"marker\"] == \"" + CANONICAL_DEMO_MARKER + "\" and m[\"synthetic_only\"] is True' \"$demo_marker\"; test \"$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"runtime_identity\"])' \"$deployment_metadata\")\" = \"$previous_deployment_id\"; test \"$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"backend_identity\"])' \"$deployment_metadata\")\" = \"$previous_backend\"; test \"$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"static_identity\"])' \"$deployment_metadata\")\" = \"$previous_static\"; fi; test \"$CITESPAN_SYNTHETIC_ONLY\" = 1; else echo 'candidate demo target is not empty' >&2; exit 1; fi; "
@@ -2496,9 +2630,6 @@ trap rollback EXIT
         "printf '{\"live_url\":\"https://%s\",\"deployment_id\":\"%s\",\"backend_port\":%s,\"frontend_port\":%s,\"authoritative_data\":true}\\n' \"$domain\" \"$CITESPAN_DEPLOYMENT_ID\" \"$backend_port\" \"$frontend_port\""
     )
     command = command.replace("{receipt_writer}", receipt_writer)
-    readiness_start = command.index("sanitize_probe_output() {")
-    readiness_end = command.index("; if [ \"$(python3 -c", readiness_start)
-    command = command[:readiness_start] + _readiness_sanitizer() + command[readiness_end:]
     minio_start = command.index("failed_step=readiness-minio;")
     minio_end = command.index("candidate_suffix=", minio_start)
     authoritative_services = _minio_readiness_command(receipt_writer) + 'fi\nphase_end "authoritative-data-readiness" 0\nphase_start "application-candidate"\n'
