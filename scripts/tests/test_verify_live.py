@@ -459,9 +459,48 @@ def test_upload_reset_control_has_authenticated_canonical_request_and_error_gate
     assert "router.push" not in handler[handler.index("} catch"):]
 
 
-def test_live_verification_rejects_non_https_urls():
+def test_live_url_validator_accepts_only_the_canonical_origin():
+    assert (
+        verify_live._validate_live_url("https://citespan.169.58.64.150.nip.io")
+        == "https://citespan.169.58.64.150.nip.io"
+    )
+    assert (
+        verify_live._validate_live_url("https://citespan.169.58.64.150.nip.io/")
+        == "https://citespan.169.58.64.150.nip.io"
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://citespan.169.58.64.150.nip.io",
+        "https://citespan.169.58.64.150.nip.io.evil.example",
+        "https://citespan.169.58.64.150.nip.io:443",
+        "https://user:password@citespan.169.58.64.150.nip.io",
+        "https://citespan.169.58.64.150.nip.io/?q=1",
+        "https://citespan.169.58.64.150.nip.io/#fragment",
+        "https://citespan.169.58.64.150.nip.io/disallowed",
+        "https://[malformed",
+        "https://citespan.example",
+    ],
+)
+def test_live_url_validator_rejects_unauthorized_targets(url):
+    with pytest.raises(verify_live.LiveUrlValidationError):
+        verify_live._validate_live_url(url)
+
+
+def test_live_verification_rejects_non_https_urls_without_proof_side_effects(tmp_path):
     result = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "verify_live.py"), "--url", "http://localhost:3000", "--run-id", "demo"],
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "verify_live.py"),
+            "--url",
+            "http://citespan.169.58.64.150.nip.io",
+            "--run-id",
+            "demo",
+            "--output-dir",
+            str(tmp_path / "proof"),
+        ],
         capture_output=True,
         text=True,
         cwd=ROOT,
@@ -471,6 +510,33 @@ def test_live_verification_rejects_non_https_urls():
     assert result.returncode != 0
     assert value["complete"] is False
     assert "HTTPS" in value["error"]
+    assert not (tmp_path / "proof").exists()
+
+
+def test_live_verification_rejects_another_https_host_before_proof_activity(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "verify_live.py"),
+            "--url",
+            "https://example.com",
+            "--run-id",
+            verify_live.CANONICAL_DEMO_RUN_ID,
+            "--deployment-id",
+            "citespan-test",
+            "--output-dir",
+            str(tmp_path / "proof"),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+
+    value = json.loads(result.stdout)
+    assert result.returncode != 0
+    assert value["complete"] is False
+    assert "authorized CiteSpan HTTPS origin" in value["error"]
+    assert not (tmp_path / "proof").exists()
 
 
 def test_live_verification_rejects_noncanonical_run_id_from_cli(tmp_path):
@@ -479,7 +545,7 @@ def test_live_verification_rejects_noncanonical_run_id_from_cli(tmp_path):
             sys.executable,
             str(ROOT / "scripts" / "verify_live.py"),
             "--url",
-            "https://citespan.example",
+            "https://citespan.169.58.64.150.nip.io",
             "--run-id",
             "not-canonical",
             "--deployment-id",

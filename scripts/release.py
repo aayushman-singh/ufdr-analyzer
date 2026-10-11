@@ -56,6 +56,7 @@ DEPLOY_PATH = "/opt/citespan"
 DEPLOY_REPOSITORY = "https://github.com/aayushman-singh/ufdr-analyzer.git"
 DEMO_COMPOSE = "docker-compose.demo.yml"
 DEPLOY_DOMAIN = "citespan.169.58.64.150.nip.io"
+AUTHORIZED_LIVE_ORIGIN = f"https://{DEPLOY_DOMAIN}"
 DEPLOYMENT_METADATA = f"{DEPLOY_PATH}/.citespan-deployment.json"
 DEMO_MARKER = f"{DEPLOY_PATH}/.citespan-demo-marker.json"
 EXTERNAL_PROOF_ROOT = Path.home() / ".citespan" / "release-proof"
@@ -739,6 +740,8 @@ for key in (\"NEO4J_PASSWORD\", \"POSTGRES_PASSWORD\", \"MEILI_MASTER_KEY\", \"M
         raise ValueError(f\"runtime env has an empty {{key}}\")
     if is_placeholder(values[key]):
         raise ValueError(f\"runtime env has a placeholder value for {{key}}\")
+    if len(values[key].strip()) < 8 or any(character.isspace() for character in values[key]):
+        raise ValueError(f\"runtime env has a non-meaningful value for {{key}}\")
 if values[\"OPENAI_API_KEY\"] or values[\"OPENROUTER_API_KEY\"]:
     raise ValueError(\"runtime env enables external AI credentials\")
 if values[\"MINIO_ACCESS_KEY\"] != values[\"MINIO_ROOT_USER\"] or values[\"MINIO_SECRET_KEY\"] != values[\"MINIO_ROOT_PASSWORD\"]:
@@ -1274,23 +1277,49 @@ def _expected_commit(payload: dict[str, Any]) -> str:
 
 
 def _public_url(payload: dict[str, Any]) -> str:
+    supplied = []
     for name in ("live_url", "public_url", "deployment_url"):
         value = _payload_value(payload, name)
-        if isinstance(value, str) and value.startswith("https://"):
-            return value.rstrip("/")
-    observation = payload.get("observation")
-    if isinstance(observation, dict):
-        value = observation.get("live_url")
-        if isinstance(value, str) and value.startswith("https://"):
-            return value.rstrip("/")
-    return f"https://{DEPLOY_DOMAIN}"
+        if value is not None:
+            supplied.append((name, _validate_live_url(value, f"provider {name}")))
+    if not supplied:
+        return AUTHORIZED_LIVE_ORIGIN
+    origins = {value for _, value in supplied}
+    if len(origins) != 1:
+        names = ", ".join(name for name, _ in supplied)
+        raise RuntimeError(f"release blocked: provider URL aliases conflict: {names}")
+    return supplied[0][1]
+
+
+def _validate_live_url(value: Any, context: str = "live URL") -> str:
+    if not isinstance(value, str):
+        raise RuntimeError(f"release blocked: {context} is missing or is not a string")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError(f"release blocked: {context} is malformed") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != DEPLOY_DOMAIN
+        or parsed.hostname != DEPLOY_DOMAIN
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError(f"release blocked: {context} is not the authorized CiteSpan HTTPS origin")
+    return AUTHORIZED_LIVE_ORIGIN
 
 
 def _api_origin(payload: dict[str, Any]) -> str:
     value = _payload_value(payload, "api_origin")
-    if isinstance(value, str) and value.startswith("https://"):
-        return value.rstrip("/")
-    return f"{_public_url(payload)}/api"
+    expected = f"{_public_url(payload)}/api"
+    if value is not None and value.rstrip("/") != expected:
+        raise RuntimeError("release blocked: provider API origin does not match the authorized live origin")
+    return expected
 
 
 def _payload_value(payload: dict[str, Any], name: str) -> Any:
@@ -1638,12 +1667,29 @@ def _compose_override(payload: dict[str, Any]) -> str:
     )
 
 
+def _normalize_rendered_backend_port(value: Any) -> int | None:
+    """Normalize one Compose published port without accepting ambiguous forms."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        normalized = value
+    elif (
+        isinstance(value, str)
+        and 1 <= len(value) <= 5
+        and value[0] != "0"
+        and all(character in "0123456789" for character in value)
+    ):
+        normalized = int(value)
+    else:
+        return None
+    return normalized if 1 <= normalized <= 65535 else None
+
+
 def _validate_rendered_backend_ports(config: dict[str, Any], allocated_port: int | str) -> None:
     """Require the rendered Compose backend ports to contain one loopback binding."""
-    try:
-        expected_port = int(allocated_port)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("release blocked: allocated backend port is not an integer") from exc
+    expected_port = _normalize_rendered_backend_port(allocated_port)
+    if expected_port is None:
+        raise RuntimeError("release blocked: allocated backend port is not an integer")
     services = config.get("services")
     backend = services.get("backend") if isinstance(services, dict) else None
     ports = backend.get("ports") if isinstance(backend, dict) else None
@@ -1652,7 +1698,7 @@ def _validate_rendered_backend_ports(config: dict[str, Any], allocated_port: int
     binding = ports[0]
     if (
         binding.get("host_ip") != "127.0.0.1"
-        or binding.get("published") != expected_port
+        or _normalize_rendered_backend_port(binding.get("published")) != expected_port
         or binding.get("target") != 8000
         or binding.get("protocol") != "tcp"
     ):
@@ -1661,19 +1707,43 @@ def _validate_rendered_backend_ports(config: dict[str, Any], allocated_port: int
 
 def _compose_backend_port_validation_script() -> str:
     """Return the validator executed against Compose's rendered JSON output."""
-    return (
-        "import json,sys; "
-        "config=json.load(sys.stdin); "
-        "services=config.get('services'); "
-        "backend=services.get('backend') if isinstance(services,dict) else None; "
-        "ports=backend.get('ports') if isinstance(backend,dict) else None; "
-        "expected=int(sys.argv[1]); "
-        "assert isinstance(ports,list) and len(ports)==1 and isinstance(ports[0],dict), "
-        "'rendered Compose backend ports do not contain the exact allocated loopback backend binding'; "
-        "binding=ports[0]; "
-        "assert binding.get('host_ip')=='127.0.0.1' and binding.get('published')==expected and binding.get('target')==8000 and binding.get('protocol')=='tcp', "
-        "'rendered Compose backend ports do not contain the exact allocated loopback backend binding'"
-    )
+    return """import json
+import sys
+
+
+def normalize_port(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        normalized = value
+    elif (
+        isinstance(value, str)
+        and 1 <= len(value) <= 5
+        and value[0] != "0"
+        and all(character in "0123456789" for character in value)
+    ):
+        normalized = int(value)
+    else:
+        return None
+    return normalized if 1 <= normalized <= 65535 else None
+
+
+config = json.load(sys.stdin)
+services = config.get("services")
+backend = services.get("backend") if isinstance(services, dict) else None
+ports = backend.get("ports") if isinstance(backend, dict) else None
+expected = normalize_port(sys.argv[1])
+message = "rendered Compose backend ports do not contain the exact allocated loopback backend binding"
+assert expected is not None, message
+assert isinstance(ports, list) and len(ports) == 1 and isinstance(ports[0], dict), message
+binding = ports[0]
+assert (
+    binding.get("host_ip") == "127.0.0.1"
+    and normalize_port(binding.get("published")) == expected
+    and binding.get("target") == 8000
+    and binding.get("protocol") == "tcp"
+), message
+"""
 
 
 def _metadata_writer_script() -> str:
@@ -2441,6 +2511,7 @@ def _deployment_command(payload: dict[str, Any]) -> str:
 
 
 def _observation_command() -> str:
+    runtime_check = shlex.quote(_runtime_validation_script(_history_secret_hashes()))
     observation_script = (
         "import json,sys,re; "
         "metadata=json.load(open(sys.argv[1])); marker=json.load(open(sys.argv[2])); "
@@ -2449,7 +2520,7 @@ def _observation_command() -> str:
         "assert metadata['synthetic_only'] is True, 'deployment is not synthetic-only'; "
         "assert metadata['marker'] == sys.argv[3], 'deployment metadata marker mismatch'; "
         "assert isinstance(metadata['commit'],str) and len(metadata['commit']) == 40, 'deployment identity is invalid'; "
-        "assert isinstance(metadata['live_url'],str) and metadata['live_url'].startswith('https://'), 'live URL is not HTTPS'; "
+        "assert metadata['live_url'] == sys.argv[6], 'live URL is not the authorized origin'; "
         "assert isinstance(metadata['deployment_id'],str) and metadata['deployment_id'], 'deployment ID is missing'; "
         "assert re.fullmatch(r'[0-9a-z-]+', metadata['static_container']), 'static container identity is invalid'; "
         "assert isinstance(metadata['static_content_dir'],str) and metadata['static_content_dir'].startswith('/opt/citespan/.citespan-backups/'), 'static content identity is invalid'; "
@@ -2459,12 +2530,12 @@ def _observation_command() -> str:
         "assert marker['run_id'] == sys.argv[4], 'demo marker run ID mismatch'; "
         "assert marker['synthetic_only'] is True, 'demo marker is not synthetic-only'; "
         "assert marker['marker'] == sys.argv[5], 'demo marker contents mismatch'; "
-        "print(json.dumps({'deployment_commit':metadata['commit'],'live_url':metadata['live_url'],'deployment_id':metadata['deployment_id'],'backend_port':metadata['backend_port'],'frontend_port':metadata['frontend_port'],'static_container':metadata['static_container'],'static_content_dir':metadata['static_content_dir'],'synthetic_only':True,'demo_mode':'1','demo_run_id':marker['run_id'],'metadata_marker':metadata['marker'],'demo_marker':marker['marker']}))"
+        "print(json.dumps({'deployment_commit':metadata['commit'],'live_url':metadata['live_url'],'deployment_id':metadata['deployment_id'],'backend_port':metadata['backend_port'],'frontend_port':metadata['frontend_port'],'static_container':metadata['static_container'],'static_content_dir':metadata['static_content_dir'],'synthetic_only':True,'demo_mode':'1','runtime_validated':True,'demo_run_id':marker['run_id'],'metadata_marker':metadata['marker'],'demo_marker':marker['marker']}))"
     )
     return (
         "set -eu; "
         f"if [ ! -f {DEPLOYMENT_METADATA} ] || [ ! -f {DEMO_MARKER} ]; then printf 'NOT_DEPLOYED\\n'; "
-        f"else deployment_id=$(python3 -c 'import json; print(json.load(open(\"{DEPLOYMENT_METADATA}\"))[\"deployment_id\"]'); static_container=$(python3 -c 'import json; print(json.load(open(\"{DEPLOYMENT_METADATA}\"))[\"static_container\"]'); runtime={DEPLOY_PATH}/.citespan-runtime.env; test -f \"$runtime\"; grep -Fxq 'DEMO_MODE=1' \"$runtime\"; grep -Fxq 'CITESPAN_SYNTHETIC_ONLY=1' \"$runtime\"; backend_id=$(docker ps -q --filter name=^/$deployment_id-backend$); test -n \"$backend_id\"; test -n \"$(docker ps -q --filter name=^/$static_container$)\"; backend_env=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \"$backend_id\"); printf %s \"$backend_env\" | grep -Fxq 'DEMO_MODE=1'; printf %s \"$backend_env\" | grep -Fxq 'CITESPAN_SYNTHETIC_ONLY=1'; printf %s \"$backend_env\" | grep -Fxq 'CITESPAN_DEMO_RUN_ID={CANONICAL_DEMO_RUN_ID}'; printf %s \"$backend_env\" | grep -Fxq 'CITESPAN_SYNTHETIC_MARKER={CANONICAL_DEMO_MARKER}'; printf %s \"$backend_env\" | grep -Fxq \"CITESPAN_DEPLOYMENT_ID=$deployment_id\"; test \"$(git -C {DEPLOY_PATH} rev-parse HEAD)\" = \"$(python3 -c 'import json; print(json.load(open(\"{DEPLOYMENT_METADATA}\"))[\"commit\"]')\"; test -f /etc/caddy/Caddyfile; grep -Fq '# BEGIN CITESPAN ROUTE' /etc/caddy/Caddyfile; "
+        f"else deployment_id=$(python3 -c 'import json; print(json.load(open(\"{DEPLOYMENT_METADATA}\"))[\"deployment_id\"]'); static_container=$(python3 -c 'import json; print(json.load(open(\"{DEPLOYMENT_METADATA}\"))[\"static_container\"]'); runtime={DEPLOY_PATH}/.citespan-runtime.env; python3 -c {runtime_check} \"$runtime\"; grep -Fxq 'DEMO_MODE=1' \"$runtime\"; grep -Fxq 'CITESPAN_SYNTHETIC_ONLY=1' \"$runtime\"; backend_id=$(docker ps -q --filter name=^/$deployment_id-backend$); test -n \"$backend_id\"; test -n \"$(docker ps -q --filter name=^/$static_container$)\"; backend_env=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \"$backend_id\"); printf %s \"$backend_env\" | grep -Fxq 'DEMO_MODE=1'; printf %s \"$backend_env\" | grep -Fxq 'CITESPAN_SYNTHETIC_ONLY=1'; printf %s \"$backend_env\" | grep -Fxq 'CITESPAN_DEMO_RUN_ID={CANONICAL_DEMO_RUN_ID}'; printf %s \"$backend_env\" | grep -Fxq 'CITESPAN_SYNTHETIC_MARKER={CANONICAL_DEMO_MARKER}'; printf %s \"$backend_env\" | grep -Fxq \"CITESPAN_DEPLOYMENT_ID=$deployment_id\"; test \"$(git -C {DEPLOY_PATH} rev-parse HEAD)\" = \"$(python3 -c 'import json; print(json.load(open(\"{DEPLOYMENT_METADATA}\"))[\"commit\"]')\"; test -f /etc/caddy/Caddyfile; grep -Fq '# BEGIN CITESPAN ROUTE' /etc/caddy/Caddyfile; "
         "python3 -c " + shlex.quote(observation_script) + " "
         + DEPLOYMENT_METADATA
         + " "
@@ -2475,6 +2546,8 @@ def _observation_command() -> str:
         + shlex.quote(CANONICAL_DEMO_RUN_ID)
         + " "
         + shlex.quote(CANONICAL_DEMO_MARKER)
+        + " "
+        + shlex.quote(AUTHORIZED_LIVE_ORIGIN)
         + "; fi"
     )
 
@@ -2616,16 +2689,18 @@ def _observe(payload: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("observation failed: remote commit does not match expected commit")
     if observed.get("demo_mode") != "1":
         raise RuntimeError("observation failed: deployed DEMO_MODE is not 1")
+    if observed.get("runtime_validated") is not True:
+        raise RuntimeError("observation failed: remote runtime validation is not confirmed")
     result = {
         "action_key": action,
         "complete": True,
         "observed": True,
         "deployment_commit": remote_commit,
         "external_identity": f"{DEPLOY_HOST}:citespan",
+        "runtime_validated": True,
     }
     live_url = observed.get("live_url")
-    if not isinstance(live_url, str) or not live_url.startswith("https://"):
-        raise RuntimeError("observation failed: metadata has no valid live HTTPS URL")
+    live_url = _validate_live_url(live_url, "observed live URL")
     if observed.get("synthetic_only") is not True:
         raise RuntimeError("observation failed: deployment is not marked synthetic-only")
     deployment_id = observed.get("deployment_id")
@@ -2742,16 +2817,17 @@ def _verify(payload: dict[str, Any]) -> dict[str, Any]:
     if observation.get("observed") is not True:
         raise RuntimeError("verification blocked: deployment observation is not confirmed")
     live_url = observation.get("live_url")
-    if not isinstance(live_url, str) or not re.fullmatch(r"https://[^\s]+", live_url):
-        raise RuntimeError("verification blocked: observed live URL is not HTTPS")
-    payload_url = _payload_value(payload, "live_url")
-    if payload_url is not None and payload_url.rstrip("/") != live_url.rstrip("/"):
+    live_url = _validate_live_url(live_url, "observed live URL")
+    payload_url = _public_url(payload)
+    if payload_url != live_url:
         raise RuntimeError("verification blocked: payload live URL does not match observation")
     payload_deployment_id = _payload_value(payload, "deployment_id")
     if payload_deployment_id is not None and payload_deployment_id != observation.get("deployment_id"):
         raise RuntimeError("verification blocked: payload deployment identity does not match observation")
     if observation.get("synthetic_only") is not True:
         raise RuntimeError("verification blocked: observed deployment is not synthetic-only")
+    if observation.get("runtime_validated") is not True:
+        raise RuntimeError("verification blocked: remote runtime validation is not confirmed")
     if observation.get("demo_mode") != "1":
         raise RuntimeError("verification blocked: observed deployment DEMO_MODE is not 1")
     if observation.get("demo_run_id") != CANONICAL_DEMO_RUN_ID:

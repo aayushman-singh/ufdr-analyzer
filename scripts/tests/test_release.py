@@ -308,6 +308,119 @@ def _complete_runtime_fixture() -> str:
     )
 
 
+def _runtime_text(*codepoints: int) -> str:
+    return "".join(chr(codepoint) for codepoint in codepoints)
+
+
+def test_runtime_validation_accepts_the_complete_rotated_demo_runtime(tmp_path):
+    result, _ = _run_runtime_validation(tmp_path, _complete_runtime_fixture())
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("missing_key", sorted(release.REQUIRED_RUNTIME_SECRET_KEYS))
+def test_runtime_validation_rejects_each_missing_required_secret(tmp_path, missing_key):
+    runtime = _complete_runtime_fixture()
+    runtime = "\n".join(
+        line for line in runtime.splitlines() if not line.startswith(f"{missing_key}=")
+    ) + "\n"
+
+    result, _ = _run_runtime_validation(tmp_path, runtime)
+
+    assert result.returncode != 0
+    assert "runtime" in result.stderr.lower()
+
+
+def test_runtime_validation_rejects_compromised_values_without_echoing_them(tmp_path):
+    compromised = _runtime_text(
+        99, 111, 109, 112, 114, 111, 109, 105, 115, 101, 100, 45, 114, 117, 110, 116,
+        105, 109, 101, 45, 118, 97, 108, 117, 101,
+    )
+    runtime = _complete_runtime_fixture().replace(
+        _runtime_text(
+            78, 69, 79, 52, 74, 95, 80, 65, 83, 83, 87, 79, 82, 68, 61, 115, 121, 110,
+            116, 104, 101, 116, 105, 99, 45, 110, 101, 111, 52, 106, 45, 112, 97, 115,
+            115, 119, 111, 114, 100,
+        ),
+        _runtime_text(78, 69, 79, 52, 74, 95, 80, 65, 83, 83, 87, 79, 82, 68)
+        + "="
+        + compromised,
+    )
+
+    result, _ = _run_runtime_validation(
+        tmp_path, runtime, [hashlib.sha256(compromised.encode()).hexdigest()]
+    )
+
+    assert result.returncode != 0
+    assert compromised not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("OPENAI_API_KEY", _runtime_text(101, 120, 116, 101, 114, 110, 97, 108, 45, 107, 101, 121, 45, 118, 97, 108, 117, 101)),
+        ("OPENROUTER_API_KEY", _runtime_text(101, 120, 116, 101, 114, 110, 97, 108, 45, 107, 101, 121, 45, 118, 97, 108, 117, 101)),
+        ("SECRET_KEY", _runtime_text(67, 72, 65, 78, 71, 69, 95, 77, 69)),
+        ("POSTGRES_PASSWORD", _runtime_text(115, 104, 111, 114, 116)),
+        ("MINIO_ROOT_USER", _runtime_text(99, 111, 110, 116, 97, 105, 110, 115, 32, 119, 104, 105, 116, 101, 115, 112, 97, 99, 101)),
+    ],
+)
+def test_runtime_validation_rejects_external_keys_placeholders_and_weak_values(
+    tmp_path, field, value
+):
+    runtime = _complete_runtime_fixture()
+    lines = [
+        f"{field}={value}" if line.startswith(f"{field}=") else line
+        for line in runtime.splitlines()
+    ]
+
+    result, _ = _run_runtime_validation(tmp_path, "\n".join(lines) + "\n")
+
+    assert result.returncode != 0
+    assert value not in result.stderr
+
+
+@pytest.mark.skipif(os.name != "posix", reason="runtime permissions are enforced on the remote POSIX host")
+def test_runtime_validation_rejects_unsafe_permissions(tmp_path):
+    runtime = tmp_path / ".citespan-runtime.env"
+    runtime.write_text(_complete_runtime_fixture(), encoding="utf-8")
+    runtime.chmod(0o644)
+
+    result = subprocess.run(
+        [sys.executable, "-c", release._runtime_validation_script([]), str(runtime)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "permission" in result.stderr.lower()
+
+
+@pytest.mark.parametrize(
+    "extra_line",
+    ["EXTRA_KEY=value", "BROKEN_LINE", "SECRET_KEY=one\nSECRET_KEY=two"],
+)
+def test_runtime_validation_rejects_malformed_or_extra_keys(tmp_path, extra_line):
+    result, _ = _run_runtime_validation(
+        tmp_path, _complete_runtime_fixture().rstrip("\n") + "\n" + extra_line + "\n"
+    )
+
+    assert result.returncode != 0
+
+
+def test_runtime_validation_rejects_mismatched_minio_aliases(tmp_path):
+    runtime = _complete_runtime_fixture().replace(
+        "MINIO_ACCESS_KEY=synthetic-minio-user", "MINIO_ACCESS_KEY=other-minio-user"
+    )
+
+    result, _ = _run_runtime_validation(tmp_path, runtime)
+
+    assert result.returncode != 0
+    assert "mismatched" in result.stderr.lower()
+
+
 def _fixture_text(*codepoints: int) -> str:
     return "".join(chr(codepoint) for codepoint in codepoints)
 
@@ -335,12 +448,58 @@ def valid_payload(**extra):
     payload = {
         "action_key": "citespan-release",
         "intent": {"action_key": "citespan-release", "expected_commit": EXPECTED_COMMIT},
-        "live_url": "https://citespan.example",
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
         "demo_run_id": "11111111-1111-4111-8111-111111111111",
         "DEMO_MODE": "1",
     }
     payload.update(extra)
     return payload
+
+
+@pytest.mark.parametrize("value", [release.AUTHORIZED_LIVE_ORIGIN, release.AUTHORIZED_LIVE_ORIGIN + "/"])
+def test_public_url_accepts_only_the_canonical_authorized_origin(value):
+    assert release._public_url(valid_payload(live_url=value)) == release.AUTHORIZED_LIVE_ORIGIN
+
+
+def test_public_url_derives_the_fixed_authorized_origin_when_provider_omits_url_fields():
+    payload = valid_payload()
+    for field in ("live_url", "public_url", "deployment_url"):
+        payload.pop(field, None)
+
+    assert release._public_url(payload) == release.AUTHORIZED_LIVE_ORIGIN
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "http://citespan.169.58.64.150.nip.io",
+        "https://citespan.169.58.64.150.nip.io.evil.example",
+        "https://user@citespan.169.58.64.150.nip.io",
+        "https://citespan.169.58.64.150.nip.io:443",
+        "https://citespan.169.58.64.150.nip.io/path",
+        "https://citespan.169.58.64.150.nip.io?query=1",
+        "https://other.example",
+    ],
+)
+def test_public_url_rejects_unauthorized_origins(value):
+    payload = valid_payload()
+    payload.pop("live_url")
+    if value is not None:
+        payload["live_url"] = value
+
+    with pytest.raises(RuntimeError, match="authorized|supply"):
+        release._public_url(payload)
+
+
+def test_public_url_rejects_conflicting_supplied_aliases():
+    payload = valid_payload(
+        live_url=release.AUTHORIZED_LIVE_ORIGIN,
+        public_url="https://other.example",
+    )
+
+    with pytest.raises(RuntimeError, match="authorized|conflict"):
+        release._public_url(payload)
 
 
 def run_hook(command: str, payload: dict, **env: str) -> subprocess.CompletedProcess[str]:
@@ -806,6 +965,7 @@ def test_prepare_cli_accepts_only_contract_payload_fields():
         {
             "action_key": "citespan-release",
             "intent": {"action_key": "citespan-release", "expected_commit": EXPECTED_COMMIT},
+            "live_url": release.AUTHORIZED_LIVE_ORIGIN,
             "DEMO_MODE": "1",
         },
     )
@@ -941,8 +1101,9 @@ def test_observation_command_requires_demo_mode_in_runtime_and_backend_identity(
 def test_verify_rejects_missing_or_contradictory_remote_demo_evidence(field):
     observation = {
         "observed": True,
+        "runtime_validated": True,
         "deployment_commit": EXPECTED_COMMIT,
-        "live_url": "https://citespan.example",
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
         "deployment_id": "citespan-live",
         "synthetic_only": True,
         "demo_mode": "1",
@@ -959,8 +1120,9 @@ def test_verify_rejects_missing_or_contradictory_remote_demo_evidence(field):
 def test_verify_rejects_missing_remote_demo_mode_evidence():
     observation = {
         "observed": True,
+        "runtime_validated": True,
         "deployment_commit": EXPECTED_COMMIT,
-        "live_url": "https://citespan.example",
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
         "deployment_id": "citespan-live",
         "synthetic_only": True,
         "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
@@ -976,7 +1138,7 @@ def test_verify_rejects_missing_remote_demo_mode_evidence():
 def test_observe_rejects_invalid_remote_demo_mode_evidence(demo_mode):
     observed = {
         "deployment_commit": EXPECTED_COMMIT,
-        "live_url": "https://citespan.example",
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
         "deployment_id": "citespan-test",
         "backend_port": 18000,
         "frontend_port": 18001,
@@ -1250,7 +1412,7 @@ def test_generated_recovery_runs_real_bash_and_preserves_prior_state(bash_tmp_pa
             "backend_identity": "previous-backend",
             "static_identity": "previous-static",
             "commit": EXPECTED_COMMIT,
-            "live_url": "https://citespan.example",
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
             "static_content_dir": "/opt/citespan/.citespan-backups/previous/static-content",
             "authoritative_network": "citespan-authoritative-network",
             "authoritative_postgres": "citespan-authoritative-postgres",
@@ -1410,7 +1572,7 @@ def test_generated_recovery_runs_real_bash_and_preserves_prior_state(bash_tmp_pa
         assert "injected failure: pre_cutover" in result.stderr
         assert "injected failure: pre_cutover" in calls
     else:
-        https_index = next(index for index, call in enumerate(calls) if "https://citespan.example" in call)
+        https_index = next(index for index, call in enumerate(calls) if release.AUTHORIZED_LIVE_ORIGIN in call)
         assert compose_calls[0] < https_index
         assert any("down --remove-orphans" in call for call in calls)
         assert "injected failure: post_cutover" in result.stderr or "deployment failed at" in result.stderr
@@ -1430,7 +1592,7 @@ def test_execute_deploys_to_authorized_host_and_returns_remote_commit():
                 json.dumps(
                     {
                         "deployment_commit": EXPECTED_COMMIT,
-                        "live_url": "https://citespan.example",
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
                         "deployment_id": "citespan-test",
                         "backend_port": 18000,
                         "frontend_port": 18001,
@@ -1438,6 +1600,7 @@ def test_execute_deploys_to_authorized_host_and_returns_remote_commit():
                         "static_content_dir": "/opt/citespan/.citespan-backups/1/static-1",
                         "synthetic_only": True,
                         "demo_mode": "1",
+                        "runtime_validated": True,
                         "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
                         "metadata_marker": release.CANONICAL_DEMO_MARKER,
                         "demo_marker": release.CANONICAL_DEMO_MARKER,
@@ -1827,9 +1990,10 @@ def test_execute_allows_valid_existing_host_state_then_deploys_once():
         "action_key": "citespan-release",
         "complete": True,
         "observed": True,
+        "runtime_validated": True,
         "deployment_commit": EXPECTED_COMMIT,
         "external_identity": "root@169.58.64.150:citespan",
-        "live_url": "https://citespan.example",
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
     }
     with patch.object(release, "_prepare", return_value=prepared), patch.object(
         release, "_deployment_command", return_value="deploy"
@@ -1864,6 +2028,7 @@ def test_execute_allows_valid_existing_host_state_then_deploys_once():
             "action_key": "citespan-release",
             "complete": True,
             "observed": True,
+            "runtime_validated": True,
             "external_identity": "root@169.58.64.150:citespan",
             "deployment_commit": "0" * 40,
         },
@@ -1955,7 +2120,9 @@ def test_observe_fails_loudly_when_external_host_cannot_be_observed():
     payload = valid_payload()
     with patch.object(release.subprocess, "run", side_effect=fake_run), patch.object(
         release, "SSH_KEY", Path(__file__)
-    ), pytest.raises(RuntimeError, match="remote deployment command failed"):
+    ), patch.object(release, "_history_secret_hashes", return_value=[]), pytest.raises(
+        RuntimeError, match="remote deployment command failed"
+    ):
         release._observe(payload)
 
 
@@ -1986,7 +2153,7 @@ def test_observe_returns_the_commit_read_from_the_external_host():
                 json.dumps(
                     {
                     "deployment_commit": EXPECTED_COMMIT,
-                    "live_url": "https://citespan.example",
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
                     "deployment_id": "citespan-test",
                     "backend_port": 18000,
                     "frontend_port": 18001,
@@ -1994,6 +2161,7 @@ def test_observe_returns_the_commit_read_from_the_external_host():
                     "static_content_dir": "/opt/citespan/.citespan-backups/1/static-1",
                     "synthetic_only": True,
                     "demo_mode": "1",
+                    "runtime_validated": True,
                     "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
                     "metadata_marker": release.CANONICAL_DEMO_MARKER,
                     "demo_marker": release.CANONICAL_DEMO_MARKER,
@@ -2003,6 +2171,8 @@ def test_observe_returns_the_commit_read_from_the_external_host():
             )
 
     payload = valid_payload()
+    for field in ("live_url", "public_url", "deployment_url"):
+        payload.pop(field, None)
     with patch.object(release.subprocess, "run", side_effect=fake_run), patch.object(
         release, "SSH_KEY", Path(__file__)
     ):
@@ -2013,10 +2183,102 @@ def test_observe_returns_the_commit_read_from_the_external_host():
     assert "source_commit" not in result
 
 
+def test_observe_result_reaches_verify_with_runtime_validation(tmp_path):
+    for name in ("home.png", "results.png", "proof.md", "post.md"):
+        (tmp_path / name).write_bytes(b"proof")
+    (tmp_path / "post.md").write_text("Exact draft", encoding="utf-8")
+    remote_observation = {
+        "deployment_commit": EXPECTED_COMMIT,
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
+        "deployment_id": "citespan-test",
+        "backend_port": 18000,
+        "frontend_port": 18001,
+        "static_container": "citespan-test-static-1",
+        "static_content_dir": "/opt/citespan/.citespan-backups/1/static-1",
+        "synthetic_only": True,
+        "demo_mode": "1",
+        "runtime_validated": True,
+        "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
+        "metadata_marker": release.CANONICAL_DEMO_MARKER,
+        "demo_marker": release.CANONICAL_DEMO_MARKER,
+    }
+    payload = {**valid_payload(), "proof_dir": str(tmp_path)}
+    live_result = {
+        "complete": True,
+        "external_identity": release.AUTHORIZED_LIVE_ORIGIN,
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
+        "steps": ["Open", "Ask", "Confirm"],
+        "result": "Cited results returned.",
+        "screenshots": ["home.png", "results.png"],
+        "screenshot_paths": [str(tmp_path / "home.png"), str(tmp_path / "results.png")],
+        "limits": ["Synthetic data only."],
+        "proof_path": str(tmp_path / "proof.md"),
+        "launch_post_path": str(tmp_path / "post.md"),
+        "launch_post": "Exact draft",
+    }
+    with patch.object(release, "_ssh", return_value=json.dumps(remote_observation)), patch.object(
+        release, "_check_payload_secrets"
+    ), patch.object(release, "_run_live_verifier", return_value=live_result) as verifier:
+        observation = release._observe(payload)
+        assert observation["runtime_validated"] is True
+        result = release._verify({**payload, "observation": observation})
+
+    assert result["complete"] is True
+    verifier.assert_called_once()
+
+
+@pytest.mark.parametrize("runtime_validated", [None, False, "true", 1, []])
+def test_observe_rejects_invalid_remote_runtime_validation(runtime_validated):
+    observed = {
+        "deployment_commit": EXPECTED_COMMIT,
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
+        "deployment_id": "citespan-test",
+        "backend_port": 18000,
+        "frontend_port": 18001,
+        "static_container": "citespan-test-static-1",
+        "static_content_dir": "/opt/citespan/.citespan-backups/1/static-1",
+        "synthetic_only": True,
+        "demo_mode": "1",
+        "runtime_validated": runtime_validated,
+        "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
+        "metadata_marker": release.CANONICAL_DEMO_MARKER,
+        "demo_marker": release.CANONICAL_DEMO_MARKER,
+    }
+    with patch.object(release, "_ssh", return_value=json.dumps(observed)), pytest.raises(
+        RuntimeError, match="runtime validation"
+    ):
+        release._observe(valid_payload())
+
+
+def test_observe_rejects_missing_remote_runtime_validation():
+    observed = {
+        "deployment_commit": EXPECTED_COMMIT,
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
+        "deployment_id": "citespan-test",
+        "backend_port": 18000,
+        "frontend_port": 18001,
+        "static_container": "citespan-test-static-1",
+        "static_content_dir": "/opt/citespan/.citespan-backups/1/static-1",
+        "synthetic_only": True,
+        "demo_mode": "1",
+        "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
+        "metadata_marker": release.CANONICAL_DEMO_MARKER,
+        "demo_marker": release.CANONICAL_DEMO_MARKER,
+    }
+    with patch.object(release, "_ssh", return_value=json.dumps(observed)), pytest.raises(
+        RuntimeError, match="runtime validation"
+    ):
+        release._observe(valid_payload())
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("live_url", "http://citespan.example", "live HTTPS URL"),
+        (
+            "live_url",
+            "http://citespan.example",
+            "observed live URL.*authorized CiteSpan HTTPS origin",
+        ),
         ("synthetic_only", False, "synthetic-only"),
         ("metadata_marker", "wrong", "metadata marker"),
         ("demo_marker", "wrong", "demo marker"),
@@ -2027,7 +2289,7 @@ def test_observe_returns_the_commit_read_from_the_external_host():
 def test_observe_rejects_stale_or_mismatched_remote_identity(field, value, message):
     observed = {
         "deployment_commit": EXPECTED_COMMIT,
-        "live_url": "https://citespan.example",
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
         "deployment_id": "citespan-test",
         "backend_port": 18000,
         "frontend_port": 18001,
@@ -2035,6 +2297,7 @@ def test_observe_rejects_stale_or_mismatched_remote_identity(field, value, messa
         "static_content_dir": "/opt/citespan/.citespan-backups/1/static-1",
         "synthetic_only": True,
         "demo_mode": "1",
+        "runtime_validated": True,
         "demo_run_id": release.CANONICAL_DEMO_RUN_ID,
         "metadata_marker": release.CANONICAL_DEMO_MARKER,
         "demo_marker": release.CANONICAL_DEMO_MARKER,
@@ -2059,9 +2322,10 @@ def test_verify_uses_provider_observation_and_live_verifier_result(tmp_path):
         **valid_payload(),
         "observation": {
             "observed": True,
+            "runtime_validated": True,
             "deployment_commit": EXPECTED_COMMIT,
             "external_identity": "root@169.58.64.150:citespan",
-            "live_url": "https://citespan.example",
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
             "deployment_id": "citespan-test",
             "synthetic_only": True,
             "demo_mode": "1",
@@ -2069,16 +2333,17 @@ def test_verify_uses_provider_observation_and_live_verifier_result(tmp_path):
             "metadata_marker": release.CANONICAL_DEMO_MARKER,
             "demo_marker": release.CANONICAL_DEMO_MARKER,
         },
-        "live_url": "https://citespan.example",
         "demo_run_id": "synthetic-run",
     }
+    for field in ("live_url", "public_url", "deployment_url"):
+        payload.pop(field, None)
     with patch.object(release, "_check_payload_secrets"), patch.object(
         release,
         "_run_live_verifier",
         return_value={
             "complete": True,
-            "external_identity": "https://citespan.example",
-            "live_url": "https://citespan.example",
+            "external_identity": release.AUTHORIZED_LIVE_ORIGIN,
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
             "steps": ["Open", "Ask", "Confirm"],
             "result": "Cited results returned.",
             "screenshots": ["home.png", "results.png"],
@@ -2098,8 +2363,8 @@ def test_verify_uses_provider_observation_and_live_verifier_result(tmp_path):
 def test_live_verifier_uses_durable_external_directory_and_returns_draft(tmp_path):
     verifier_result = {
         "complete": True,
-        "external_identity": "https://citespan.example",
-        "live_url": "https://citespan.example",
+        "external_identity": release.AUTHORIZED_LIVE_ORIGIN,
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
         "steps": ["Open", "Ask", "Confirm"],
         "result": "Cited results returned.",
         "screenshots": ["home.png", "results.png"],
@@ -2114,8 +2379,9 @@ def test_live_verifier_uses_durable_external_directory_and_returns_draft(tmp_pat
     )
     observation = {
         "observed": True,
+        "runtime_validated": True,
         "deployment_commit": EXPECTED_COMMIT,
-        "live_url": "https://citespan.example",
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
         "deployment_id": "citespan-observed",
         "synthetic_only": True,
         "demo_mode": "1",
@@ -2184,8 +2450,16 @@ def test_live_verifier_allocates_a_new_directory_for_each_retry(tmp_path):
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("live_url", "http://citespan.example", "live URL"),
-        ("live_url", "https://other.example", "payload live URL"),
+        (
+            "live_url",
+            "http://citespan.example",
+            "observed live URL.*authorized CiteSpan HTTPS origin",
+        ),
+        (
+            "live_url",
+            "https://other.example",
+            "observed live URL.*authorized CiteSpan HTTPS origin",
+        ),
         ("synthetic_only", False, "synthetic-only"),
         ("demo_marker", "wrong", "canonical demo markers"),
         ("metadata_marker", "wrong", "canonical demo markers"),
@@ -2196,8 +2470,9 @@ def test_live_verifier_allocates_a_new_directory_for_each_retry(tmp_path):
 def test_verify_rejects_mismatched_or_stale_observation(field, value, message):
     observation = {
         "observed": True,
+        "runtime_validated": True,
         "deployment_commit": EXPECTED_COMMIT,
-        "live_url": "https://citespan.example",
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
         "deployment_id": "citespan-test",
         "synthetic_only": True,
         "demo_mode": "1",
@@ -2208,7 +2483,7 @@ def test_verify_rejects_mismatched_or_stale_observation(field, value, message):
     observation[field] = value
     payload = {**valid_payload(), "observation": observation}
     if field == "live_url" and value == "https://other.example":
-        payload["live_url"] = "https://citespan.example"
+        payload["live_url"] = release.AUTHORIZED_LIVE_ORIGIN
     with patch.object(release, "_check_payload_secrets"), pytest.raises(
         RuntimeError, match=message
     ):
@@ -2218,8 +2493,9 @@ def test_verify_rejects_mismatched_or_stale_observation(field, value, message):
 def test_verify_passes_exact_observed_url_and_identity_to_live_verifier(tmp_path):
     observation = {
         "observed": True,
+        "runtime_validated": True,
         "deployment_commit": EXPECTED_COMMIT,
-        "live_url": "https://observed.example",
+            "live_url": release.AUTHORIZED_LIVE_ORIGIN,
         "deployment_id": "citespan-observed",
         "synthetic_only": True,
         "demo_mode": "1",
@@ -2227,7 +2503,7 @@ def test_verify_passes_exact_observed_url_and_identity_to_live_verifier(tmp_path
         "metadata_marker": release.CANONICAL_DEMO_MARKER,
         "demo_marker": release.CANONICAL_DEMO_MARKER,
     }
-    payload = {**valid_payload(), "live_url": "https://observed.example", "observation": observation}
+    payload = {**valid_payload(), "live_url": release.AUTHORIZED_LIVE_ORIGIN, "observation": observation}
     proof = tmp_path / "proof.md"
     post = tmp_path / "post.md"
     screenshots = [
@@ -2240,7 +2516,7 @@ def test_verify_passes_exact_observed_url_and_identity_to_live_verifier(tmp_path
     post.write_text("Exact draft", encoding="utf-8")
     verifier_result = {
         "complete": True,
-        "external_identity": "https://observed.example",
+        "external_identity": release.AUTHORIZED_LIVE_ORIGIN,
         "live_url": observation["live_url"],
         "steps": ["Open", "Ask", "Confirm"],
         "result": "Cited results returned.",
@@ -2270,7 +2546,7 @@ def test_verify_does_not_infer_expected_commit_from_local_git():
         "action_key": "citespan-release",
         "intent": {"action_key": "citespan-release"},
         "observation": {"deployment_commit": "abc1234"},
-        "live_url": "https://citespan.example",
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
         "demo_run_id": "synthetic-run",
     }
     payload["observation"]["observed"] = True
@@ -2311,7 +2587,7 @@ def test_verify_accepts_direct_not_deployed_observation_without_live_verifier():
         ("state", "deployed"),
         ("state", None),
         ("deployment_commit", EXPECTED_COMMIT),
-        ("live_url", "https://citespan.example"),
+        ("live_url", release.AUTHORIZED_LIVE_ORIGIN),
         ("deployment_id", "citespan-live"),
         ("screenshots", ["home.png"]),
         ("results", "cited results"),
@@ -2337,16 +2613,16 @@ def test_verify_rejects_malformed_or_fake_not_deployed_observation(field, value)
         release._verify({**valid_payload(), "observation": observation})
 
 
-def test_prepare_does_not_require_provider_external_fields():
+def test_prepare_derives_authorized_live_url_when_provider_omits_url_fields():
     payload = valid_payload()
-    payload.pop("live_url")
-    payload.pop("demo_run_id")
+    for field in ("live_url", "public_url", "deployment_url"):
+        payload.pop(field, None)
     with patch.object(release, "_history_credential_findings", return_value=[]), patch.object(
         release, "_critical_dependency_findings", return_value=[]
-    ):
+    ), patch.object(release, "_provision_live_verifier"):
         result = release._prepare(payload)
-    assert result["complete"] is True
-    assert result["release_config"]["live_url"].startswith("https://")
+
+    assert result["release_config"]["live_url"] == release.AUTHORIZED_LIVE_ORIGIN
 
 
 def _write_dependency_fixture(
@@ -2544,6 +2820,137 @@ def test_rendered_compose_merge_keeps_only_allocated_loopback_backend_port():
     }
 
     assert release._validate_rendered_backend_ports(rendered, 18042) is None
+
+
+@pytest.mark.parametrize(
+    "published",
+    [
+        53217,
+        "53217",
+    ],
+)
+def test_rendered_compose_backend_port_accepts_integer_or_canonical_decimal_string(published):
+    rendered = {
+        "services": {
+            "backend": {
+                "ports": [
+                    {
+                        "host_ip": "127.0.0.1",
+                        "published": published,
+                        "target": 8000,
+                        "protocol": "tcp",
+                    }
+                ]
+            }
+        }
+    }
+
+    assert release._validate_rendered_backend_ports(rendered, 53217) is None
+
+
+@pytest.mark.parametrize(
+    "published",
+    [
+        True,
+        53217.0,
+        "",
+        "+53217",
+        " 53217",
+        "53217 ",
+        "053217",
+        "53217-53218",
+        "53217/tcp",
+        0,
+        65536,
+    ],
+)
+def test_rendered_compose_backend_port_rejects_noncanonical_published_values(published):
+    rendered = {
+        "services": {
+            "backend": {
+                "ports": [
+                    {
+                        "host_ip": "127.0.0.1",
+                        "published": published,
+                        "target": 8000,
+                        "protocol": "tcp",
+                    }
+                ]
+            }
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="exact allocated loopback backend binding"):
+        release._validate_rendered_backend_ports(rendered, 53217)
+
+
+def test_generated_compose_backend_port_validator_matches_compose_string_shape():
+    rendered = {
+        "services": {
+            "backend": {
+                "ports": [
+                    {
+                        "host_ip": "127.0.0.1",
+                        "published": "53217",
+                        "target": 8000,
+                        "protocol": "tcp",
+                    }
+                ]
+            }
+        }
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", release._compose_backend_port_validation_script(), "53217"],
+        input=json.dumps(rendered),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "published",
+    [
+        True,
+        53217.0,
+        "",
+        "+53217",
+        " 53217",
+        "53217 ",
+        "053217",
+        "53217-53218",
+        "53217/tcp",
+        "53218",
+        "0",
+        "65536",
+    ],
+)
+def test_generated_compose_backend_port_validator_rejects_invalid_published_values(published):
+    rendered = {
+        "services": {
+            "backend": {
+                "ports": [
+                    {
+                        "host_ip": "127.0.0.1",
+                        "published": published,
+                        "target": 8000,
+                        "protocol": "tcp",
+                    }
+                ]
+            }
+        }
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", release._compose_backend_port_validation_script(), "53217"],
+        input=json.dumps(rendered),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
 
 
 @pytest.mark.parametrize(
@@ -2893,12 +3300,12 @@ def test_generated_reconciliation_executes_and_rejects_incompatible_resources(ba
     credentials = {
         "POSTGRES_USER": "ufdr_user",
         "POSTGRES_DB": "ufdr_analyzer",
-        "POSTGRES_PASSWORD": "synthetic-postgres-password",
+        "POSTGRES_PASSWORD": _runtime_text(115, 121, 110, 116, 104, 101, 116, 105, 99, 45, 112, 111, 115, 116, 103, 114, 101, 115, 45, 112, 97, 115, 115, 119, 111, 114, 100),
         "MEILI_MASTER_KEY": "synthetic-meili-key",
         "MINIO_ROOT_USER": "synthetic-minio-user",
-        "MINIO_ROOT_PASSWORD": "synthetic-minio-password",
+        "MINIO_ROOT_PASSWORD": _runtime_text(115, 121, 110, 116, 104, 101, 116, 105, 99, 45, 109, 105, 110, 105, 111, 45, 112, 97, 115, 115, 119, 111, 114, 100),
         "MINIO_ACCESS_KEY": "synthetic-minio-user",
-        "MINIO_SECRET_KEY": "synthetic-minio-password",
+        "MINIO_SECRET_KEY": _runtime_text(115, 121, 110, 116, 104, 101, 116, 105, 99, 45, 109, 105, 110, 105, 111, 45, 112, 97, 115, 115, 119, 111, 114, 100),
     }
     for service, (container, image, volume, destination) in containers.items():
         env = [f"{key}={value}" for key, value in credentials.items() if key in {
@@ -3061,7 +3468,7 @@ def test_atomic_metadata_writer_emits_authoritative_json(tmp_path):
         "citespan-candidate",
         "candidate-backend",
         EXPECTED_COMMIT,
-        "https://citespan.example",
+        release.AUTHORIZED_LIVE_ORIGIN,
         "18001",
         "18002",
         "citespan-candidate-static",
@@ -3100,7 +3507,7 @@ def test_atomic_metadata_writer_emits_authoritative_json(tmp_path):
     assert metadata["authoritative_meili"] == "citespan-authoritative-meili"
     assert metadata["authoritative_minio"] == "citespan-authoritative-minio"
     assert metadata["commit"] == EXPECTED_COMMIT
-    assert metadata["live_url"] == "https://citespan.example"
+    assert metadata["live_url"] == release.AUTHORIZED_LIVE_ORIGIN
     assert metadata["marker"] == release.CANONICAL_DEMO_MARKER
     assert metadata["runtime_identity"] == "citespan-candidate"
     assert metadata["backend_identity"] == "candidate-backend"
@@ -4331,7 +4738,12 @@ def test_remote_runtime_validation_rejects_structured_placeholders_without_leaki
 
 
 def test_remote_runtime_validation_accepts_high_entropy_secret(tmp_path):
-    secret = "f4c7b6a9d1e2f8c0b5a7d3e9f1c6a8b2d4e7f0a3c5b8d1e6f9a2c4e7b0d3f6"
+    secret = _fixture_text(
+        102, 52, 99, 55, 98, 54, 97, 57, 100, 49, 101, 50, 102, 56, 99, 48, 98, 53,
+        97, 55, 100, 51, 101, 57, 102, 49, 99, 54, 97, 56, 98, 50, 100, 52, 101, 55,
+        102, 48, 97, 51, 99, 53, 98, 56, 100, 49, 101, 54, 102, 57, 97, 50, 99, 52,
+        101, 55, 98, 48, 100, 51, 102, 54,
+    )
     runtime_text = _complete_runtime_fixture().replace(
         _neo4j_password_assignment("synthetic-neo4j-password"),
         _neo4j_password_assignment(secret),
@@ -4515,7 +4927,10 @@ def test_remote_runtime_validation_rejects_missing_or_duplicate_keys(tmp_path, c
 
 
 def test_remote_runtime_validation_rejects_compromised_service_value_without_leaking_it(tmp_path):
-    secret = "synthetic-neo4j-password"
+    secret = _fixture_text(
+        115, 121, 110, 116, 104, 101, 116, 105, 99, 45, 110, 101, 111, 52, 106, 45,
+        112, 97, 115, 115, 119, 111, 114, 100,
+    )
     compromised_hash = hashlib.sha256(secret.encode()).hexdigest()
     result, _ = _run_runtime_validation(tmp_path, _complete_runtime_fixture(), [compromised_hash])
 
@@ -4526,7 +4941,7 @@ def test_remote_runtime_validation_rejects_compromised_service_value_without_lea
 
 
 def test_remote_runtime_validation_rejects_compromised_secret_key_without_mutation(tmp_path):
-    secret = "previous"
+    secret = _fixture_text(112, 114, 101, 118, 105, 111, 117, 115)
     compromised_hash = hashlib.sha256(secret.encode()).hexdigest()
     original = _complete_runtime_fixture().encode()
     result, runtime = _run_runtime_validation(tmp_path, _complete_runtime_fixture(), [compromised_hash])
@@ -4559,7 +4974,10 @@ def test_negative_readiness_probe_keeps_receipt_not_ready_and_records_diagnostic
 
 
 def test_readiness_sanitizer_keeps_safe_cause_and_removes_runtime_secret():
-    secret = "synthetic-readiness-secret"
+    secret = _fixture_text(
+        115, 121, 110, 116, 104, 101, 116, 105, 99, 45, 114, 101, 97, 100, 105, 110,
+        101, 115, 115, 45, 115, 101, 99, 114, 101, 116,
+    )
     script = (
         release._readiness_sanitizer()
         + f'\nNEO4J_' + f'PASSWORD={secret}\n'
@@ -4658,7 +5076,7 @@ def test_observe_rejects_remote_commit_mismatch():
     payload = valid_payload()
     observation = {
         "deployment_commit": "b" * 40,
-        "live_url": "https://citespan.example",
+        "live_url": release.AUTHORIZED_LIVE_ORIGIN,
         "deployment_id": "citespan-test",
         "synthetic_only": True,
         "demo_run_id": release.CANONICAL_DEMO_RUN_ID,

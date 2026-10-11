@@ -165,7 +165,7 @@ The CiteSpan desktop application is also available using Electron. It provides n
 
 #### **1. Clone and Setup**
 ```bash
-git clone https://github.com/your-org/ufdr-analyzer.git
+git clone https://github.com/aayushman-singh/ufdr-analyzer.git
 cd ufdr-analyzer
 ```
 

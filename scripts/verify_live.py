@@ -17,6 +17,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
+AUTHORIZED_LIVE_ORIGIN = "https://citespan.169.58.64.150.nip.io"
 EXTERNAL_PROOF_ROOT = Path.home() / ".citespan" / "release-proof"
 PLAYWRIGHT_BROWSERS_PATH = ROOT / ".venv" / "playwright-browsers"
 CANONICAL_DEMO_RUN_ID = "11111111-1111-4111-8111-111111111111"
@@ -54,6 +55,34 @@ CANONICAL_EVIDENCE_MANIFEST = {
         },
     },
 }
+
+
+class LiveUrlValidationError(ValueError):
+    """The verifier target is outside the authorized live origin."""
+
+
+def _validate_live_url(value: object) -> str:
+    """Require the exact authorized HTTPS origin and canonical root path."""
+    if not isinstance(value, str):
+        raise LiveUrlValidationError("--url must be the authorized CiteSpan HTTPS origin")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise LiveUrlValidationError("--url must be the authorized CiteSpan HTTPS origin") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "citespan.169.58.64.150.nip.io"
+        or parsed.hostname != "citespan.169.58.64.150.nip.io"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise LiveUrlValidationError("--url must be the authorized CiteSpan HTTPS origin")
+    return AUTHORIZED_LIVE_ORIGIN
 
 
 def _canonical_content_digest(value: str) -> str:
@@ -393,7 +422,7 @@ def _run_browser_flow(playwright, live_url: str, run_id: str, question: str, out
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--url", default=os.environ.get("CITESPAN_URL"))
+    parser.add_argument("--url", default=os.environ.get("CITESPAN_URL", AUTHORIZED_LIVE_ORIGIN))
     parser.add_argument("--run-id", default=os.environ.get("CITESPAN_DEMO_RUN_ID"))
     parser.add_argument("--deployment-id", default=os.environ.get("CITESPAN_DEPLOYMENT_ID"))
     parser.add_argument("--question", default="Show me all WhatsApp messages mentioning a bank transfer")
@@ -402,8 +431,7 @@ def main() -> int:
         default=None,
     )
     args = parser.parse_args()
-    if not args.url or not args.url.startswith("https://"):
-        raise ValueError("--url must be the live HTTPS CiteSpan URL")
+    args.url = _validate_live_url(args.url)
     if not args.run_id:
         raise ValueError("--run-id must identify the canonical synthetic demo run")
     if args.run_id != CANONICAL_DEMO_RUN_ID:
@@ -464,14 +492,18 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as exc:
-        evidence = _record_private_failure(
-            " ".join(sys.argv[1:]) or "verify_live",
-            exc,
-            {
-                "url": os.environ.get("CITESPAN_URL", "<not-provided>"),
-                "run_id": os.environ.get("CITESPAN_DEMO_RUN_ID", "<not-provided>"),
-            },
-        )
-        print(json.dumps({"complete": False, "error": _sanitize_failure_text(str(exc)), "failure_evidence": str(evidence)}))
-        print(f"live verification failed; evidence={evidence}\n{traceback.format_exc()}", file=sys.stderr)
+        if isinstance(exc, LiveUrlValidationError):
+            print(json.dumps({"complete": False, "error": _sanitize_failure_text(str(exc))}))
+            print(f"live verification failed before external interaction: {exc}", file=sys.stderr)
+        else:
+            evidence = _record_private_failure(
+                " ".join(sys.argv[1:]) or "verify_live",
+                exc,
+                {
+                    "url": os.environ.get("CITESPAN_URL", "<not-provided>"),
+                    "run_id": os.environ.get("CITESPAN_DEMO_RUN_ID", "<not-provided>"),
+                },
+            )
+            print(json.dumps({"complete": False, "error": _sanitize_failure_text(str(exc)), "failure_evidence": str(evidence)}))
+            print(f"live verification failed; evidence={evidence}\n{traceback.format_exc()}", file=sys.stderr)
         raise SystemExit(1)
