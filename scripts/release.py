@@ -11,14 +11,17 @@ import argparse
 import ast
 import base64
 import codecs
+import errno
 import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import traceback
 from urllib.parse import urlsplit
@@ -28,8 +31,20 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Host evidence stays bound to the script-relative checkout. Dependency tests
+# may patch ROOT without changing this contract.
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
-PLAYWRIGHT_VERSION = "1.55.0"
+PYTHON_PLAYWRIGHT_VERSION = "1.55.0"
+PYTHON_PLAYWRIGHT_WHEEL = "playwright-1.55.0-py3-none-win_amd64.whl"
+PYTHON_PLAYWRIGHT_WHEEL_SHA256 = (
+    "7eb5956473ca1951abb51537e6a0da55257bb2e25fc37c2b75af094a5c93736c"
+)
+PYTHON_PLAYWRIGHT_WHEEL_URL = (
+    "https://files.pythonhosted.org/packages/46/4f/"
+    "9ba607fa94bb9cee3d4beb1c7b32c16efbfc9d69d5037fa85d10cafc618b/"
+    "playwright-1.55.0-py3-none-win_amd64.whl"
+)
 PLAYWRIGHT_BROWSERS_PATH = ROOT / ".venv" / "playwright-browsers"
 AUTHENTIC_REGISTRY_METADATA = {
     ("next", "15.5.27"): (
@@ -60,6 +75,35 @@ AUTHORIZED_LIVE_ORIGIN = f"https://{DEPLOY_DOMAIN}"
 DEPLOYMENT_METADATA = f"{DEPLOY_PATH}/.citespan-deployment.json"
 DEMO_MARKER = f"{DEPLOY_PATH}/.citespan-demo-marker.json"
 EXTERNAL_PROOF_ROOT = Path.home() / ".citespan" / "release-proof"
+HOST_PROCESS_EVIDENCE_ROOT = Path.home() / ".citespan" / "host-process-evidence"
+HOST_PROCESS_EVIDENCE_FILES = (
+    "recorded-node-identities-942.json",
+    "product-frontend-native-lock-932.json",
+    "legacy-node-current-981.json",
+    "legacy-family-current-996.json",
+    "citespan-node-family-current.v1.json",
+    "legacy-family-presence-1004.json",
+    "current-frontend-processes-1004.json",
+)
+HOST_PROCESS_APPROVAL = "citespan-node-current-approval.json"
+HISTORICAL_FAMILY_RELATION = "measured historical Node family identity"
+WRAPPER_FAMILY_RELATION = (
+    "current cmd.exe wrapper descendant of the exact observed historical Node family"
+)
+HOST_NATIVE_MODULE = Path(
+    "frontend/node_modules/lightningcss-win32-x64-msvc/lightningcss.win32-x64-msvc.node"
+)
+HOST_PARENT_STATES = {
+    "readable_current_parent",
+    "verified_absent_historical_parent",
+    "unreadable_parent",
+    "reused_parent",
+    "historical_parent_exited_pid_reused",
+}
+_LEGACY_NODE_INVENTORY = HOST_PROCESS_EVIDENCE_FILES[0]
+_LEGACY_LOCK_INVENTORY = HOST_PROCESS_EVIDENCE_FILES[1]
+_OWNER_ACTOR = 7
+_OWNER_GOAL = "740d01c7-2dbf-4d74-8480-3f14cf85aa48"
 MINIO_SOURCE_REPOSITORY = "https://github.com/minio/minio.git"
 MINIO_SOURCE_REVISION = "RELEASE.2025-10-15T17-29-55Z"
 MINIO_SOURCE_COMMIT = "9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a"
@@ -84,6 +128,962 @@ IMMUTABLE_MINIO_IMAGES = {
     "MINIO_BUILDER_IMAGE": MINIO_BUILDER_IMAGE,
     "MINIO_RUNTIME_IMAGE": MINIO_RUNTIME_IMAGE,
 }
+
+
+def _host_path_identity(value: object) -> str:
+    if not isinstance(value, (str, Path)):
+        raise RuntimeError("release blocked: host process evidence contains an invalid path")
+    return os.path.normcase(os.path.normpath(str(value))).replace("\\", "/")
+
+
+def _read_host_evidence(root: Path, filename: str) -> Any:
+    path = root / filename
+    if not path.is_file() or path.is_symlink():
+        raise RuntimeError(f"release blocked: host process evidence is missing or unsafe: {filename}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"release blocked: host process evidence cannot be read: {filename}") from exc
+    return value
+
+
+def _historical_evidence_error(filename: str, detail: str) -> RuntimeError:
+    safe_filename = Path(str(filename)).name
+    return RuntimeError(
+        f"historical host process evidence invalid {safe_filename}: {detail}"
+    )
+
+
+
+
+
+
+
+
+def _native_fingerprint(path: Path, metadata: os.stat_result) -> tuple[object, ...]:
+    """Return native-file identity fields that do not include access time."""
+    return (
+        _host_path_identity(path),
+        stat.S_IFMT(metadata.st_mode),
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_size,
+        getattr(metadata, "st_dev", None),
+        getattr(metadata, "st_ino", None),
+        getattr(metadata, "st_mtime_ns", None),
+        getattr(metadata, "st_ctime_ns", None),
+    )
+
+
+def _native_snapshot(path: Path) -> tuple[tuple[object, ...], str]:
+    try:
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeError("release blocked: native resource state cannot be read") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError("release blocked: native resource is not a regular file")
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise RuntimeError("release blocked: native resource content cannot be read") from exc
+    return _native_fingerprint(path, metadata), digest
+
+
+def _prove_host_native_release() -> dict[str, str]:
+    path = (SCRIPT_ROOT / HOST_NATIVE_MODULE).absolute()
+    try:
+        initial = os.lstat(path)
+    except FileNotFoundError as exc:
+        if exc.errno == errno.ENOENT:
+            return {"state": "absent"}
+        raise RuntimeError("release blocked: native resource state is ambiguous") from exc
+    except OSError as exc:
+        raise RuntimeError("release blocked: native resource state cannot be read") from exc
+    if stat.S_ISLNK(initial.st_mode) or not stat.S_ISREG(initial.st_mode):
+        raise RuntimeError("release blocked: native resource is not a regular file")
+    replacement = path.with_name(path.name + ".citespan-release-proof")
+    if replacement.exists() or replacement.is_symlink():
+        raise RuntimeError("release blocked: native resource proof path already exists")
+    try:
+        initial_fingerprint = _native_fingerprint(path, initial)
+        original = path.read_bytes()
+        if _native_fingerprint(path, os.lstat(path)) != initial_fingerprint:
+            raise RuntimeError("native resource changed before proof")
+        os.replace(path, replacement)
+        os.replace(replacement, path)
+        restored_fingerprint, restored_digest = _native_snapshot(path)
+        if (
+            restored_fingerprint != initial_fingerprint
+            or restored_digest != hashlib.sha256(original).hexdigest()
+        ):
+            raise RuntimeError("native resource bytes or identity changed during proof")
+    except (OSError, RuntimeError) as exc:
+        if replacement.exists() and not path.exists():
+            os.replace(replacement, path)
+        raise RuntimeError("release blocked: native resource reversible proof failed") from exc
+    return {"state": "restored"}
+
+
+def _legacy_evidence_records(value, label):
+    safe_label = Path(str(label)).name
+    if not isinstance(value, list) or not value:
+        raise _historical_evidence_error(safe_label, "expected a non-empty list")
+    normalized = []
+    seen = set()
+    for record in value:
+        if not isinstance(record, dict):
+            raise _historical_evidence_error(safe_label, "each item must be an object")
+        identity = record.get("identity")
+        if not isinstance(identity, dict):
+            raise _historical_evidence_error(safe_label, "identity object is required")
+        pid = identity.get("pid")
+        creation = identity.get("creation_token")
+        if not isinstance(pid, int) or pid <= 0:
+            raise _historical_evidence_error(safe_label, "identity.pid is required")
+        if not isinstance(creation, str) or not creation:
+            raise _historical_evidence_error(
+                safe_label, f"identity.creation_token is required: pid={pid}"
+            )
+        key = (pid, creation)
+        if key in seen:
+            raise _historical_evidence_error(
+                safe_label, f"duplicate identity: pid={pid}"
+            )
+        seen.add(key)
+        parent = record.get("parent")
+        if isinstance(parent, dict):
+            parent_pid = parent.get("pid")
+        else:
+            parent_pid = parent
+        if label == _LEGACY_LOCK_INVENTORY and (not isinstance(parent_pid, int) or parent_pid <= 0):
+            raise _historical_evidence_error(
+                safe_label, f"parent is required: pid={pid} field=parent"
+            )
+        normalized.append(
+            {
+                **record,
+                "pid": pid,
+                "creation": creation,
+                "historical_parent": parent,
+            }
+        )
+        if isinstance(parent_pid, int) and parent_pid > 0:
+            normalized[-1]["parent_pid"] = parent_pid
+    return normalized
+
+def _current_observation_records(value, label):
+    if not isinstance(value, dict) or value.get("schema") != "citespan.node-current-approval.v1":
+        raise RuntimeError(
+            f"current evidence contract invalid {label}: expected schema=citespan.node-current-approval.v1"
+        )
+    if value.get("ownership_approved") is not True or value.get("cleanup_approved") is not True:
+        raise RuntimeError(
+            f"current evidence contract not approved {label}: ownership_approved=true and cleanup_approved=true are required"
+        )
+    if value.get("actor_id") != _OWNER_ACTOR or value.get("goal_id") != _OWNER_GOAL:
+        raise RuntimeError(
+            f"current evidence contract approval is not bound to actor {_OWNER_ACTOR} and goal {_OWNER_GOAL}: {label}"
+        )
+    if _host_path_identity(value.get("product_worktree", "")) != _host_path_identity(str(SCRIPT_ROOT)):
+        raise RuntimeError(f"current evidence contract approval has the wrong product worktree: {label}")
+    observed_ids = value.get("observed_identity_pids")
+    if not isinstance(observed_ids, list) or any(not isinstance(pid, int) or pid <= 0 for pid in observed_ids):
+        raise RuntimeError(f"current evidence contract approval needs observed_identity_pids: {label}")
+    approved_actions = value.get("approved_actions")
+    if not isinstance(approved_actions, list) or not approved_actions or not all(
+        isinstance(action, str) and action.strip() for action in approved_actions
+    ):
+        raise RuntimeError(f"current evidence contract approval needs narrow approved_actions: {label}")
+    records = value.get("observations")
+    if not isinstance(records, list) or not records:
+        raise RuntimeError(f"current evidence contract invalid {label}: observations must be a non-empty list")
+    for field in ("protected_processes", "unrelated_exclusions"):
+        if not isinstance(value.get(field), list):
+            raise RuntimeError(f"current evidence contract missing {field}: {label}")
+        for exclusion in value[field]:
+            if (
+                not isinstance(exclusion, dict)
+                or not isinstance(exclusion.get("pid"), int)
+                or not isinstance(exclusion.get("reason"), str)
+                or not exclusion["reason"].strip()
+            ):
+                raise RuntimeError(
+                    f"current evidence contract invalid {field}: pid and measured reason are required"
+                )
+            required_identity = (
+                "creation", "parent_pid", "cwd", "executable", "argv",
+                "argv_sha256", "native_command_sha256",
+            )
+            missing_identity = [name for name in required_identity if name not in exclusion]
+            if missing_identity:
+                raise RuntimeError(
+                    f"current evidence contract invalid {field}: full observed identity is required "
+                    f"pid={exclusion['pid']} fields={missing_identity}"
+                )
+            if not isinstance(exclusion["argv"], list) or not exclusion["argv"] or not all(
+                isinstance(item, str) for item in exclusion["argv"]
+            ):
+                raise RuntimeError(
+                    f"current evidence contract invalid {field}: argv is required: pid={exclusion['pid']}"
+                )
+            if any(
+                not isinstance(exclusion[name], str) or len(exclusion[name]) != 64
+                for name in ("argv_sha256", "native_command_sha256")
+            ):
+                raise RuntimeError(
+                    f"current evidence contract invalid {field}: hashes are required: pid={exclusion['pid']}"
+                )
+    normalized = []
+    seen_pids = set()
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("pid"), int) or record["pid"] <= 0:
+            raise RuntimeError(f"current evidence contract invalid {label}: each observation needs a positive pid")
+        if record["pid"] in seen_pids:
+            raise RuntimeError(f"current evidence contract duplicates observation: pid={record['pid']}")
+        seen_pids.add(record["pid"])
+        if record.get("role") not in {"lightningcss_loader", "related_test_family"}:
+            raise RuntimeError(f"current evidence contract invalid {label}: each observation needs a valid role")
+        if record.get("script_role") not in {"npm-cli.js", "start-server.js", "postcss.js", "none"}:
+            raise RuntimeError(f"current evidence contract invalid script role: pid={record['pid']}")
+        for field in (
+            "creation",
+            "parent_pid",
+            "cwd",
+            "executable",
+            "argv",
+            "argv_sha256",
+            "native_command_sha256",
+            "script_paths",
+            "module_paths",
+            "parent_observations",
+            "files",
+            "ports",
+            "approval",
+            "protected_or_unrelated_state",
+        ):
+            if field not in record:
+                raise RuntimeError(f"current evidence contract missing {field}: pid={record.get('pid')}")
+        if not isinstance(record["argv"], list) or not record["argv"] or not all(
+            isinstance(item, str) for item in record["argv"]
+        ):
+            raise RuntimeError(f"current evidence contract invalid argv: pid={record['pid']}")
+        if not isinstance(record["argv_sha256"], str) or len(record["argv_sha256"]) != 64:
+            raise RuntimeError(f"current evidence contract invalid argv_sha256: pid={record['pid']}")
+        if not isinstance(record["native_command_sha256"], str) or len(record["native_command_sha256"]) != 64:
+            raise RuntimeError(
+                f"current evidence contract invalid native_command_sha256: pid={record['pid']}"
+            )
+        if not isinstance(record["script_paths"], list) or not isinstance(record["module_paths"], list):
+            raise RuntimeError(f"current evidence contract invalid list fields: pid={record['pid']}")
+        if not isinstance(record["files"], list) or not isinstance(record["ports"], list):
+            raise RuntimeError(
+                f"current evidence contract missing required files or ports: pid={record['pid']}"
+            )
+        if record["role"] == "lightningcss_loader":
+            native_path = (SCRIPT_ROOT / HOST_NATIVE_MODULE).resolve()
+            native_files = []
+            for value in record["files"]:
+                candidate_path = Path(value)
+                if not candidate_path.is_absolute() and candidate_path.as_posix() == HOST_NATIVE_MODULE.as_posix():
+                    native_files.append(candidate_path)
+                elif candidate_path.is_absolute() and _host_path_identity(candidate_path) == _host_path_identity(native_path):
+                    native_files.append(candidate_path)
+            if len(native_files) != 1:
+                raise RuntimeError(
+                    f"current evidence contract loader lacks exactly the native module path: pid={record['pid']}"
+                )
+        if record["approval"] is not True:
+            raise RuntimeError(f"current evidence contract target is not approved: pid={record['pid']}")
+        if record.get("snapshot_status") == "incomplete" or record.get("proof_complete") is False:
+            raise RuntimeError(
+                f"current evidence contract rejects incomplete snapshot: pid={record['pid']}"
+            )
+        if record["protected_or_unrelated_state"] != "owned_descendant":
+            raise RuntimeError(
+                f"current evidence contract target is not an approved owned descendant: pid={record['pid']}"
+            )
+        observations = record["parent_observations"]
+        if not isinstance(observations, list) or not observations:
+            raise RuntimeError(f"current evidence contract invalid parent observations: pid={record['pid']}")
+        for observation in observations:
+            if not isinstance(observation, dict) or observation.get("state") not in HOST_PARENT_STATES:
+                raise RuntimeError(
+                    f"current evidence contract invalid parent state: pid={record['pid']} observation={observation}"
+                )
+            if observation.get("state") == "historical_parent_exited_pid_reused":
+                required = ("current_creation", "child_creation", "current_parent_pid")
+                missing = [field for field in required if field not in observation]
+                if missing:
+                    raise RuntimeError(
+                        f"current evidence contract incomplete reused-parent proof: "
+                        f"pid={record['pid']} fields={missing}"
+                    )
+        normalized.append({**record, "current_modules": record["module_paths"]})
+    return normalized
+
+def _current_family_records(value, label):
+    if not isinstance(value, dict) or value.get("schema") != "citespan.node-family-current.v1":
+        raise RuntimeError(
+            f"current family evidence contract invalid {label}: expected schema=citespan.node-family-current.v1"
+        )
+    if value.get("ownership_approved") is not False or value.get("cleanup_approved") is not False:
+        raise RuntimeError(
+            f"current family evidence must remain observation-only: {label} ownership_approved=false and cleanup_approved=false are required"
+        )
+    provenance = value.get("source_provenance")
+    if not isinstance(provenance, dict) or not provenance:
+        raise RuntimeError(
+            f"current family evidence must retain source provenance: {label}"
+        )
+    records = value.get("observations")
+    if not isinstance(records, list) or len(records) != 145:
+        raise RuntimeError(
+            f"current family evidence must contain all 145 measured identities: {label}"
+        )
+    normalized = []
+    seen = set()
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("pid"), int) or record["pid"] <= 0:
+            raise RuntimeError(f"current family evidence has an invalid identity: {label}")
+        if record["pid"] in seen:
+            raise RuntimeError(f"current family evidence duplicates identity: pid={record['pid']}")
+        seen.add(record["pid"])
+        required = (
+            "creation", "parent_pid", "cwd", "executable", "argv", "argv_sha256",
+            "native_command_sha256", "module_paths", "role", "family_relation", "files", "ports",
+            "parent_observations", "ownership_approved", "cleanup_approved",
+        )
+        missing = [field for field in required if field not in record]
+        if missing:
+            raise RuntimeError(
+                f"current family evidence is incomplete: pid={record['pid']} fields={missing}"
+            )
+        if record["ownership_approved"] is not False or record["cleanup_approved"] is not False:
+            raise RuntimeError(
+                f"current family evidence must preserve false observation approval flags: pid={record['pid']}"
+            )
+        if not isinstance(record["argv"], list) or not record["argv"] or not all(
+            isinstance(item, str) for item in record["argv"]
+        ):
+            raise RuntimeError(f"current family evidence has invalid argv: pid={record['pid']}")
+        for field in ("files", "ports"):
+            if not isinstance(record[field], list):
+                raise RuntimeError(f"current family evidence has invalid {field}: pid={record['pid']}")
+        if not isinstance(record["parent_observations"], list) or not record["parent_observations"]:
+            raise RuntimeError(
+                f"current family evidence has incomplete parent observations: pid={record['pid']}"
+            )
+        normalized.append(record)
+    if sum(record.get("role") == "lightningcss_loader" for record in normalized) != 29:
+        raise RuntimeError("current family evidence must contain 29 lightningcss loaders")
+    if sum(record.get("role") == "related_test_family" for record in normalized) != 116:
+        raise RuntimeError("current family evidence must contain 116 related family identities")
+    if sum(record["family_relation"] == HISTORICAL_FAMILY_RELATION for record in normalized) != 116:
+        raise RuntimeError(
+            "current family evidence must contain 116 measured historical Node family identities"
+        )
+    if sum(record["family_relation"] == WRAPPER_FAMILY_RELATION for record in normalized) != 29:
+        raise RuntimeError(
+            "current family evidence must contain 29 current cmd.exe wrapper descendants"
+        )
+    if any(
+        record["family_relation"] not in {HISTORICAL_FAMILY_RELATION, WRAPPER_FAMILY_RELATION}
+        for record in normalized
+    ):
+        raise RuntimeError("current family evidence contains an unknown family relation")
+    return normalized
+
+
+def _bind_normalized_family_records(historical_records, family_records):
+    """Bind normalized current identities to historical candidates by exact identity."""
+    family_by_identity = {
+        (record["pid"], record["creation"]): record for record in family_records
+    }
+    bound = []
+    for historical in historical_records:
+        identity = (historical["pid"], historical["creation"])
+        current = family_by_identity.get(identity)
+        if current is None:
+            raise RuntimeError(
+                "release blocked: normalized family evidence is missing historical identity: "
+                f"pid={historical['pid']} creation={historical['creation']}"
+            )
+        if not current["parent_observations"]:
+            raise RuntimeError(
+                "release blocked: normalized family evidence has no parent observations: "
+                f"pid={historical['pid']}"
+            )
+        bound.append(
+            {
+                **historical,
+                "creation": current["creation"],
+                "parent_pid": current["parent_pid"],
+                "cwd": current["cwd"],
+                "executable": current["executable"],
+                "argv": list(current["argv"]),
+                "argv_sha256": current["argv_sha256"],
+                "native_command_sha256": current["native_command_sha256"],
+                "module_paths": list(current["module_paths"]),
+                "files": list(current["files"]),
+                "ports": list(current["ports"]),
+                "parent_observations": list(current["parent_observations"]),
+                "role": current["role"],
+                "family_relation": current["family_relation"],
+                "current_modules": list(current["module_paths"]),
+            }
+        )
+    return bound
+
+def _legacy_family_observation_records(value, label):
+    if not isinstance(value, dict) or value.get("schema") != "citespan.read-only-family-observation.v1":
+        raise RuntimeError(
+            f"legacy family evidence contract invalid {label}: "
+            "expected schema=citespan.read-only-family-observation.v1"
+        )
+    if value.get("ownership_approved") is not False or value.get("cleanup_approved") is not False:
+        raise RuntimeError(
+            f"legacy family evidence must remain observation-only: {label}"
+        )
+    records = value.get("observations")
+    if not isinstance(records, list) or len(records) != 145:
+        raise RuntimeError(
+            f"legacy family evidence must contain all 145 measured identities: {label}"
+        )
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("pid"), int) or record["pid"] <= 0:
+            raise RuntimeError(f"legacy family evidence has an invalid identity: {label}")
+    return records
+
+def _legacy_alias(record, field, aliases, *, required=True):
+    """Read one measured value from its historical spelling.
+
+    Historical observations are immutable. This function maps their measured
+    names to the current internal names and rejects conflicting aliases.
+    """
+    values = []
+    for alias in aliases:
+        if alias in record:
+            values.append((alias, record[alias]))
+    if not values:
+        if required:
+            raise RuntimeError(
+                f"legacy family evidence is missing required measured field: field={field}"
+            )
+        return None
+    first = values[0][1]
+    if any(value != first for _, value in values[1:]):
+        raise RuntimeError(
+            f"legacy family evidence has conflicting aliases: field={field} "
+            f"aliases={[alias for alias, _ in values]}"
+        )
+    return first
+
+def _legacy_identity_value(record, field, aliases, *, required=True):
+    identity = record.get("identity")
+    nested = identity if isinstance(identity, dict) else {}
+    values = []
+    for alias in aliases:
+        if alias in record:
+            values.append((alias, record[alias]))
+        if alias in nested:
+            values.append((f"identity.{alias}", nested[alias]))
+    if not values:
+        if required:
+            raise RuntimeError(
+                f"legacy family evidence is missing required identity field: field={field}"
+            )
+        return None
+    first = values[0][1]
+    if any(value != first for _, value in values[1:]):
+        raise RuntimeError(
+            f"legacy family evidence has conflicting identity aliases: field={field}"
+        )
+    return first
+
+def _canonical_path_values(values, field, pid):
+    if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+        raise RuntimeError(f"legacy family evidence has invalid {field}: pid={pid}")
+    return sorted(values, key=lambda value: _host_path_identity(value))
+
+def _canonical_parent_observation(observation, pid):
+    if not isinstance(observation, dict):
+        raise RuntimeError(f"legacy family evidence has invalid parent observation: pid={pid}")
+    identity = observation.get("identity")
+    identity = identity if isinstance(identity, dict) else {}
+    state = observation.get("state")
+    result = {"state": state}
+    if state not in HOST_PARENT_STATES:
+        raise RuntimeError(f"legacy family evidence has invalid parent state: pid={pid}")
+    observed_pid = observation.get("pid", identity.get("pid"))
+    if "pid" in observation and "pid" in identity and observation["pid"] != identity["pid"]:
+        raise RuntimeError(f"legacy family evidence has conflicting parent values: pid={pid} field=pid")
+    if not isinstance(observed_pid, int) or observed_pid <= 0:
+        raise RuntimeError(f"legacy family evidence has invalid parent identity: pid={pid}")
+    result["pid"] = observed_pid
+    if "creation" in observation and "creation_token" in identity and observation["creation"] != identity["creation_token"]:
+        raise RuntimeError(f"legacy family evidence has conflicting parent values: pid={pid} field=creation")
+    creation = observation.get("creation", identity.get("creation_token"))
+    if creation is not None:
+        result["creation"] = creation
+    measured_fields = {
+        "parent_pid": ("parent_pid",),
+        "cwd": ("cwd",),
+        "executable": ("executable",),
+        "argv": ("argv",),
+        "argv_sha256": ("parsed_argv_sha256", "argv_sha256"),
+        "native_command_sha256": ("command_sha256", "native_command_sha256"),
+        "relation": ("relation",),
+    }
+    for normalized_field, raw_fields in measured_fields.items():
+        values = []
+        for raw_field in raw_fields:
+            if raw_field in observation:
+                values.append(observation[raw_field])
+            if raw_field in identity:
+                values.append(identity[raw_field])
+        if values:
+            if any(value != values[0] for value in values[1:]):
+                raise RuntimeError(
+                    f"legacy family evidence has conflicting parent values: pid={pid} field={normalized_field}"
+                )
+            result[normalized_field] = values[0]
+    if "module_paths" in observation:
+        result["module_paths"] = _canonical_path_values(observation["module_paths"], "module_paths", pid)
+        result["files"] = list(result["module_paths"])
+    if "files" in observation:
+        result["files"] = _canonical_path_values(observation["files"], "files", pid)
+    if "module_paths" in result and result["files"] != result["module_paths"]:
+        raise RuntimeError(f"legacy family evidence has conflicting parent values: pid={pid} field=files")
+    if "measured_listening_ports" in observation:
+        result["ports"] = sorted(observation["measured_listening_ports"])
+    elif "ports" in observation:
+        result["ports"] = sorted(observation["ports"])
+    return result
+
+def _canonical_parent_observations(observations, pid):
+    if not isinstance(observations, list) or not observations:
+        raise RuntimeError(f"legacy family evidence has no parent observations: pid={pid}")
+    canonical = {}
+    for observation in observations:
+        value = _canonical_parent_observation(observation, pid)
+        key = (value["pid"], value.get("creation"), value["state"])
+        previous = canonical.get(key)
+        if previous is not None and previous != value:
+            raise RuntimeError(
+                f"legacy family evidence has contradictory parent enrichment: pid={pid} parent={value['pid']}"
+            )
+        canonical[key] = value
+    return canonical
+
+def _legacy_family_record_canonical(record, normalized_record):
+    pid = _legacy_identity_value(record, "pid", ("pid",), required=True)
+    creation = _legacy_identity_value(record, "creation", ("creation", "creation_token"), required=True)
+    if pid != normalized_record["pid"] or creation != normalized_record["creation"]:
+        raise RuntimeError(
+            f"normalized current family evidence changed immutable observation: pid={pid} field=identity"
+        )
+    parent_pid = _legacy_alias(record, "parent_pid", ("parent_pid",), required=True)
+    if not isinstance(parent_pid, int) or parent_pid <= 0:
+        raise RuntimeError(f"legacy family evidence has invalid parent_pid: pid={pid}")
+    aliases = {
+        "cwd": ("cwd",),
+        "executable": ("executable",),
+        "argv": ("argv",),
+        "argv_sha256": ("parsed_argv_sha256",),
+        "native_command_sha256": ("command_sha256",),
+        "module_paths": ("module_paths",),
+        "ports": ("measured_listening_ports",),
+        "parent_observations": ("parent_observations",),
+    }
+    result = {"pid": pid, "creation": creation, "parent_pid": parent_pid}
+    for field, names in aliases.items():
+        value = _legacy_alias(record, field, names, required=True)
+        if field in {"module_paths", "ports"}:
+            if field == "ports":
+                if not isinstance(value, list):
+                    raise RuntimeError(f"legacy family evidence has invalid ports: pid={pid}")
+                value = sorted(value)
+            else:
+                value = _canonical_path_values(value, field, pid)
+        result[field] = value
+    result["files"] = list(result["module_paths"])
+    result["parent_observations"] = _canonical_parent_observations(result["parent_observations"], pid)
+    if not isinstance(result["argv"], list) or not all(isinstance(value, str) for value in result["argv"]):
+        raise RuntimeError(f"legacy family evidence has invalid argv: pid={pid}")
+
+    locked = any("lightningcss.win32-x64-msvc.node" in value for value in result["module_paths"])
+    result["role"] = "lightningcss_loader" if locked else "related_test_family"
+    historical = _legacy_alias(
+        record,
+        "historically_recorded_node",
+        ("historically_recorded_node",),
+        required=True,
+    )
+    if historical is not None and not isinstance(historical, bool):
+        raise RuntimeError(f"legacy family evidence has invalid historical node flag: pid={pid}")
+    result["family_relation"] = (
+        HISTORICAL_FAMILY_RELATION if historical else WRAPPER_FAMILY_RELATION
+    )
+    return result
+
+def _assert_legacy_family_matches_normalized(legacy_record, normalized_record):
+    actual = _legacy_family_record_canonical(legacy_record, normalized_record)
+    expected = {
+        "pid": normalized_record["pid"],
+        "creation": normalized_record["creation"],
+        "parent_pid": normalized_record["parent_pid"],
+        "cwd": normalized_record["cwd"],
+        "executable": normalized_record["executable"],
+        "argv": normalized_record["argv"],
+        "argv_sha256": normalized_record["argv_sha256"],
+        "native_command_sha256": normalized_record["native_command_sha256"],
+        "module_paths": _canonical_path_values(normalized_record["module_paths"], "module_paths", normalized_record["pid"]),
+        "files": _canonical_path_values(normalized_record["files"], "files", normalized_record["pid"]),
+        "ports": sorted(normalized_record["ports"]),
+        "parent_observations": _canonical_parent_observations(
+            normalized_record["parent_observations"], normalized_record["pid"]
+        ),
+    }
+    for field, expected_value in expected.items():
+        if field == "parent_observations":
+            actual_parent = actual[field]
+            expected_parent = expected_value
+            for key, raw_observation in actual_parent.items():
+                normalized_observation = expected_parent.get(key)
+                if normalized_observation is None:
+                    raise RuntimeError(
+                        f"normalized current family evidence changed immutable observation: "
+                        f"pid={normalized_record['pid']} field=parent_observations"
+                    )
+                for measured_field, measured_value in raw_observation.items():
+                    if (
+                        measured_field in normalized_observation
+                        and normalized_observation[measured_field] != measured_value
+                    ):
+                        raise RuntimeError(
+                            f"normalized current family evidence changed immutable observation: "
+                            f"pid={normalized_record['pid']} field=parent_observations"
+                        )
+            for key, normalized_observation in expected_parent.items():
+                if key not in actual_parent and normalized_observation.get("pid") != normalized_record["pid"]:
+                    raise RuntimeError(
+                        f"normalized current family evidence changed immutable observation: "
+                        f"pid={normalized_record['pid']} field=parent_observations"
+                    )
+            continue
+        if actual[field] != expected_value:
+            raise RuntimeError(
+                f"normalized current family evidence changed immutable observation: "
+                f"pid={normalized_record['pid']} field={field}"
+            )
+    if actual["role"] != normalized_record["role"]:
+        raise RuntimeError(
+            f"normalized current family evidence changed immutable observation: "
+            f"pid={normalized_record['pid']} field=role"
+        )
+    expected_relation = actual["family_relation"]
+    if normalized_record["family_relation"] != expected_relation:
+        raise RuntimeError(
+            f"normalized current family evidence changed immutable observation: "
+            f"pid={normalized_record['pid']} field=family_relation"
+        )
+
+def _assert_family_source_provenance(legacy_document, normalized_document):
+    normalized_provenance = normalized_document.get("source_provenance")
+    if not isinstance(normalized_provenance, dict) or not normalized_provenance:
+        raise RuntimeError("normalized current family evidence has no source provenance")
+    legacy_provenance = legacy_document.get("source_provenance")
+    if isinstance(legacy_provenance, dict):
+        for field, value in legacy_provenance.items():
+            if field in normalized_provenance and normalized_provenance[field] != value:
+                raise RuntimeError(
+                    f"normalized current family evidence changed source provenance: field={field}"
+                )
+    for field in ("source_hash", "sha256", "original_source_sha256"):
+        if field in legacy_document and normalized_provenance.get(field) != legacy_document[field]:
+            raise RuntimeError(
+                f"normalized current family evidence changed source provenance: field={field}"
+            )
+
+def _validate_additional_descendants(value, label):
+    records = value.get("additional_descendants")
+    if not isinstance(records, list):
+        raise RuntimeError(f"current evidence contract missing additional_descendants: {label}")
+    normalized = []
+    seen_pids = set()
+    for record in records:
+        if not isinstance(record, dict):
+            raise RuntimeError(f"current evidence contract invalid additional descendant: {label}")
+        required = (
+            "pid", "creation", "parent_pid", "cwd", "executable", "argv",
+            "argv_sha256", "native_command_sha256", "role", "family_relation",
+            "protected_or_unrelated_state",
+            "files", "ports", "approval",
+        )
+        missing = [field for field in required if field not in record]
+        if missing:
+            raise RuntimeError(
+                f"current evidence contract missing additional descendant fields: "
+                f"pid={record.get('pid')} fields={missing}"
+            )
+        if not isinstance(record["pid"], int) or record["pid"] <= 0:
+            raise RuntimeError("current evidence contract invalid additional descendant pid")
+        if record["pid"] in seen_pids:
+            raise RuntimeError(f"current evidence contract duplicates additional descendant: pid={record['pid']}")
+        seen_pids.add(record["pid"])
+        if record["role"] != "related_test_family" or not isinstance(record["family_relation"], str) or not record["family_relation"].strip():
+            raise RuntimeError(
+                f"current evidence contract invalid additional descendant family relation: pid={record.get('pid')}"
+            )
+        if record["protected_or_unrelated_state"] != "owned_descendant":
+            raise RuntimeError(
+                f"current evidence contract invalid additional descendant exclusion state: pid={record.get('pid')}"
+            )
+        if (
+            not isinstance(record["argv_sha256"], str)
+            or len(record["argv_sha256"]) != 64
+            or not isinstance(record["native_command_sha256"], str)
+            or len(record["native_command_sha256"]) != 64
+        ):
+            raise RuntimeError(f"current evidence contract invalid additional descendant hashes: pid={record['pid']}")
+        if record["approval"] is not True:
+            raise RuntimeError(f"current evidence contract additional descendant is not approved: pid={record['pid']}")
+        if not isinstance(record["argv"], list) or not record["argv"] or not all(
+            isinstance(item, str) for item in record["argv"]
+        ):
+            raise RuntimeError(f"current evidence contract invalid additional descendant argv: pid={record['pid']}")
+        if not isinstance(record["files"], list) or not isinstance(record["ports"], list):
+            raise RuntimeError(f"current evidence contract missing additional files or ports: pid={record['pid']}")
+        if not isinstance(record["parent_observations"], list) or not record["parent_observations"]:
+            raise RuntimeError(
+                f"current evidence contract missing additional parent observations: pid={record['pid']}"
+            )
+        normalized.append(record)
+    return normalized
+
+def _current_cleanup_observation(value, label):
+    if not isinstance(value, dict):
+        raise RuntimeError(f"current cleanup evidence invalid {label}: expected an object")
+    records = value.get("observations")
+    if not isinstance(records, list) or not records:
+        raise RuntimeError(f"current cleanup evidence invalid {label}: observations are required")
+    normalized = {}
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("pid"), int) or record["pid"] <= 0:
+            raise RuntimeError(f"current cleanup evidence invalid {label}: each observation needs a positive pid")
+        pid = record["pid"]
+        if pid in normalized:
+            raise RuntimeError(f"current cleanup evidence duplicates pid={pid}: {label}")
+        expected = record.get("expected_creation", record.get("expected_token"))
+        current = record.get("current_creation", record.get("current_token"))
+        state = record.get("state", record.get("status"))
+        if not isinstance(expected, str) or not expected:
+            raise RuntimeError(f"current cleanup evidence missing expected token: {label} pid={pid}")
+        if state not in {"absent", "reused", "live", "present"}:
+            raise RuntimeError(f"current cleanup evidence has an unsafe state: {label} pid={pid} state={state!r}")
+        if state == "absent" and current not in (None, ""):
+            raise RuntimeError(f"current cleanup evidence records a current token for an absent pid: {label} pid={pid}")
+        if state == "reused" and (not isinstance(current, str) or not current or current == expected):
+            raise RuntimeError(f"current cleanup evidence does not prove PID reuse: {label} pid={pid}")
+        if state in {"live", "present"} and current != expected:
+            raise RuntimeError(f"current cleanup evidence does not prove the exact live identity: {label} pid={pid}")
+        normalized[pid] = {**record, "expected_creation": expected, "current_creation": current, "state": state}
+    return normalized
+
+def _current_frontend_observation(value, label):
+    if not isinstance(value, dict):
+        raise RuntimeError(f"current frontend evidence invalid {label}: expected an object")
+    processes = value.get("product_frontend_processes", value.get("frontend_processes"))
+    holders = value.get("native_module_holders")
+    missing = [field for field in ("read_errors", "listening_ports") if field not in value]
+    if missing:
+        raise RuntimeError(
+            f"current frontend evidence invalid {label}: missing required measured fields={missing}"
+        )
+    read_errors = value["read_errors"]
+    ports = value["listening_ports"]
+    if not isinstance(processes, list) or not isinstance(holders, list):
+        raise RuntimeError(
+            f"current frontend evidence invalid {label}: product_frontend_processes and native_module_holders are required"
+        )
+    if not isinstance(read_errors, list) or any(
+        not isinstance(error, str) or not error.strip() for error in read_errors
+    ):
+        raise RuntimeError(
+            f"current frontend evidence invalid {label}: read_errors must be a list of non-empty strings"
+        )
+    if read_errors:
+        raise RuntimeError(f"current frontend evidence has read errors: {label} errors={read_errors}")
+    if not isinstance(ports, list) or any(
+        isinstance(port, bool) or not isinstance(port, int) or port <= 0 for port in ports
+    ):
+        raise RuntimeError(
+            f"current frontend evidence invalid {label}: listening_ports must be a list of positive integers"
+        )
+    for item in [*processes, *holders]:
+        if not isinstance(item, dict) or not isinstance(item.get("pid"), int) or item["pid"] <= 0:
+            raise RuntimeError(f"current frontend evidence has an invalid identity: {label}")
+    return {"processes": processes, "holders": holders, "ports": ports}
+
+
+def _derive_historical_roles(node_records, lock_records, family_records):
+    """Reconcile immutable loader measurements with the normalized family."""
+    if len(node_records) != 116 or len(lock_records) != 116:
+        raise RuntimeError("release blocked: both historical inventories must contain 116 identities")
+    node_by_identity = {(record["pid"], record["creation"]): record for record in node_records}
+    lock_by_identity = {(record["pid"], record["creation"]): record for record in lock_records}
+    if set(node_by_identity) != set(lock_by_identity):
+        raise RuntimeError("release blocked: historical inventory identity sets differ")
+    historical_family = [
+        record
+        for record in family_records
+        if record.get("family_relation") == HISTORICAL_FAMILY_RELATION
+    ]
+    if len(historical_family) != 116:
+        raise RuntimeError("release blocked: normalized family historical-node count is invalid")
+    wrapper_family = [
+        record
+        for record in family_records
+        if record.get("family_relation") == WRAPPER_FAMILY_RELATION
+    ]
+    if len(wrapper_family) != 29:
+        raise RuntimeError("release blocked: normalized family wrapper count is invalid")
+    if len(family_records) != 145 or len(historical_family) + len(wrapper_family) != len(family_records):
+        raise RuntimeError("release blocked: normalized family relation set is invalid")
+    family_by_identity = {
+        (record["pid"], record["creation"]): record for record in historical_family
+    }
+    if set(node_by_identity) != set(family_by_identity):
+        raise RuntimeError("release blocked: historical inventory does not match normalized family identities")
+    native_path = (SCRIPT_ROOT / HOST_NATIVE_MODULE).resolve()
+    for identity, node_record in node_by_identity.items():
+        pid, _creation = identity
+        lock_record = lock_by_identity[identity]
+        family_record = family_by_identity[identity]
+        previously_loaded = node_record.get("previously_loaded_native_module")
+        lock_loaded = lock_record.get("locked_module_loaded")
+        loaded_paths = lock_record.get("loaded_module_paths")
+        if not isinstance(previously_loaded, bool):
+            raise RuntimeError(
+                f"release blocked: historical host process evidence missing measured loader flag: pid={pid}"
+            )
+        if not isinstance(lock_loaded, bool) or not isinstance(loaded_paths, list) or not all(
+            isinstance(path, str) for path in loaded_paths
+        ):
+            raise RuntimeError(
+                f"release blocked: historical host process evidence has invalid lock measurement: pid={pid}"
+            )
+        native_paths = [
+            path for path in loaded_paths
+            if (
+                (not Path(path).is_absolute() and Path(path).as_posix() == HOST_NATIVE_MODULE.as_posix())
+                or _host_path_identity(path) == _host_path_identity(native_path)
+            )
+        ]
+        measured_loader = previously_loaded and lock_loaded and len(native_paths) == 1
+        if (
+            previously_loaded != lock_loaded
+            or lock_loaded != bool(native_paths)
+            or (lock_loaded and len(native_paths) != 1)
+        ):
+            raise RuntimeError(f"release blocked: historical loader flag/path disagreement: pid={pid}")
+        family_role = family_record.get("role")
+        if family_role not in {"lightningcss_loader", "related_test_family"}:
+            raise RuntimeError(f"release blocked: normalized family role is invalid: pid={pid}")
+        expected_role = "lightningcss_loader" if measured_loader else "related_test_family"
+        if family_role != expected_role:
+            raise RuntimeError(
+                f"release blocked: historical loader role disagrees with measured family: pid={pid}"
+            )
+        node_record["evidence_sources"] = ["node", "lock"]
+        node_record["role"] = family_role
+        node_record["loaded_module_paths"] = list(loaded_paths)
+    loader_identities = {
+        identity
+        for identity, record in node_by_identity.items()
+        if record["role"] == "lightningcss_loader"
+    }
+    if len(loader_identities) != 29:
+        raise RuntimeError("release blocked: historical inventory loader count is invalid")
+    if {
+        identity
+        for identity, record in family_by_identity.items()
+        if record["role"] == "lightningcss_loader"
+    } != loader_identities:
+        raise RuntimeError("release blocked: historical loader identities disagree across sources")
+    if any(record.get("role") != "related_test_family" for record in wrapper_family):
+        raise RuntimeError("release blocked: wrapper family role is invalid")
+    return node_by_identity, lock_by_identity
+
+
+def _load_host_process_contract() -> dict[str, Any]:
+    """Load and reconcile the measured host evidence before release work."""
+    root = HOST_PROCESS_EVIDENCE_ROOT.expanduser().resolve()
+    if root == ROOT or ROOT in root.parents:
+        raise RuntimeError("release blocked: host process evidence must be outside the product checkout")
+    documents = {filename: _read_host_evidence(root, filename) for filename in HOST_PROCESS_EVIDENCE_FILES}
+    node_records = _legacy_evidence_records(documents[_LEGACY_NODE_INVENTORY], _LEGACY_NODE_INVENTORY)
+    lock_records = _legacy_evidence_records(documents[_LEGACY_LOCK_INVENTORY], _LEGACY_LOCK_INVENTORY)
+    legacy_current = documents[HOST_PROCESS_EVIDENCE_FILES[2]]
+    if not isinstance(legacy_current, dict) or legacy_current.get("ownership_approved") is not False:
+        raise RuntimeError("release blocked: legacy current evidence must remain observation-only")
+    legacy_document = documents[HOST_PROCESS_EVIDENCE_FILES[3]]
+    normalized_document = documents[HOST_PROCESS_EVIDENCE_FILES[4]]
+    legacy_family = _legacy_family_observation_records(legacy_document, HOST_PROCESS_EVIDENCE_FILES[3])
+    family_records = _current_family_records(normalized_document, HOST_PROCESS_EVIDENCE_FILES[4])
+    _assert_family_source_provenance(legacy_document, normalized_document)
+    presence = _current_cleanup_observation(documents[HOST_PROCESS_EVIDENCE_FILES[5]], HOST_PROCESS_EVIDENCE_FILES[5])
+    frontend = _current_frontend_observation(
+        documents[HOST_PROCESS_EVIDENCE_FILES[6]],
+        str(root / HOST_PROCESS_EVIDENCE_FILES[6]),
+    )
+    family_by_pid = {record["pid"]: record for record in family_records}
+    legacy_by_pid = {record["pid"]: record for record in legacy_family}
+    if set(legacy_by_pid) != set(family_by_pid):
+        raise RuntimeError("release blocked: normalized family identity set does not match immutable observation")
+    for pid, legacy_record in legacy_by_pid.items():
+        _assert_legacy_family_matches_normalized(legacy_record, family_by_pid[pid])
+    if set(presence) != set(family_by_pid):
+        raise RuntimeError("release blocked: current presence identity set does not match measured family")
+    if len(node_records) != 116 or len(lock_records) != 116:
+        raise RuntimeError("release blocked: both historical inventories must contain 116 identities")
+    node_by_identity, lock_by_identity = _derive_historical_roles(
+        node_records, lock_records, family_records
+    )
+    live_exact = {pid for pid, record in presence.items() if record["state"] in {"live", "present"}}
+    approval_document = None
+    approval_records = []
+    additional_records = []
+    if live_exact:
+        approval_document = _read_host_evidence(root, HOST_PROCESS_APPROVAL)
+        approval_records = _current_observation_records(approval_document, HOST_PROCESS_APPROVAL)
+        additional_records = _validate_additional_descendants(approval_document, HOST_PROCESS_APPROVAL)
+        approval_by_pid = {record["pid"]: record for record in [*approval_records, *additional_records]}
+        if set(approval_by_pid) != set(family_by_pid):
+            raise RuntimeError("release blocked: approval identity set does not match measured family")
+        for pid, family_record in family_by_pid.items():
+            approval_record = approval_by_pid.get(pid)
+            if approval_record is None:
+                raise RuntimeError(f"release blocked: approval is missing measured identity: pid={pid}")
+            for field in ("creation", "parent_pid", "cwd", "executable", "argv", "argv_sha256", "native_command_sha256", "role", "family_relation", "module_paths", "files", "ports", "parent_observations"):
+                if approval_record.get(field) != family_record.get(field):
+                    raise RuntimeError(f"release blocked: approval disagrees with measured identity: pid={pid} field={field}")
+    elif any(record["state"] not in {"absent", "reused"} for record in presence.values()):
+        raise RuntimeError("release blocked: current presence state is incomplete")
+    node_by_pid = {record["pid"]: record for record in node_by_identity.values()}
+    lock_by_pid = {record["pid"]: record for record in lock_by_identity.values()}
+    bound_node_records = _bind_normalized_family_records(
+        list(node_by_pid.values()), family_records
+    )
+    return {"root": root, "documents": documents, "node_records": bound_node_records, "lock_records": list(lock_by_pid.values()), "historical_pids": set(node_by_pid), "family_records": family_records, "presence": presence, "frontend": frontend, "live_exact": live_exact, "approval": approval_document, "approval_records": approval_records, "additional_records": additional_records}
+
+def _validate_host_process_evidence() -> dict[str, Any]:
+    """Validate measured host evidence without changing host state."""
+    contract = _load_host_process_contract()
+    frontend = contract["frontend"]
+    if frontend["processes"] or frontend["holders"] or frontend["ports"]:
+        raise RuntimeError("release blocked: current relevant frontend processes, native holders, or ports remain")
+    native = _prove_host_native_release()
+    return {"root": str(contract["root"]), "historical_identities": len(contract["family_records"]), "native_resource": native["state"]}
 
 
 def _validate_immutable_source_commits(
@@ -117,6 +1117,11 @@ CANONICAL_DEMO_MESSAGE_ROW_IDS = (
 CANONICAL_DEMO_FILE_NAME = "demo_synthetic.ufdr"
 CANONICAL_DEMO_OWNER_EMAIL = "citespan-demo-owner@example.invalid"
 CANONICAL_DEMO_MARKER = "citespan-synthetic-demo-v1"
+ORPHAN_CONTAINER_ID = "973174b191c63a34bf306e5e76960f1d07c3e42fe6be4f7a2e4b0f9210972b65"
+ORPHAN_CONTAINER_NAME = "citespan-candidate-20261011161102141814605-backend"
+ORPHAN_DEPLOYMENT_ID = "citespan-candidate-20261011161102141814605"
+ORPHAN_ACTION_KEY = "c83803e08b3db27631bfe6eab6cc7cc57be69c12b7a957a9173afb6a2bfeb9eb"
+ORPHAN_BACKUP_DIR = "/opt/citespan/.citespan-backups/20261011161057426069091"
 SECRET_PATTERNS = (
     re.compile(r"sk-or-v1-[A-Za-z0-9_-]{20,}"),
     re.compile(r"(?i)(openrouter|openai)_api_key\s*[:=]\s*['\"]?(?!REPLACE_WITH|CHANGE_ME|CHANGEME)[A-Za-z0-9_-]{20,}"),
@@ -776,8 +1781,20 @@ def _playwright_environment() -> dict[str, str]:
     return environment
 
 
+def _validate_python_playwright_contract() -> None:
+    expected_wheel = f"playwright-{PYTHON_PLAYWRIGHT_VERSION}-py3-none-win_amd64.whl"
+    if PYTHON_PLAYWRIGHT_WHEEL != expected_wheel:
+        raise RuntimeError("release blocked: Python Playwright wheel name does not match its version")
+    if not PYTHON_PLAYWRIGHT_WHEEL_URL.endswith(f"/{expected_wheel}"):
+        raise RuntimeError("release blocked: Python Playwright wheel URL does not match its version")
+    if not re.fullmatch(r"[0-9a-f]{64}", PYTHON_PLAYWRIGHT_WHEEL_SHA256):
+        raise RuntimeError("release blocked: Python Playwright wheel SHA-256 is missing or invalid")
+
+
 def _live_verifier_is_usable() -> bool:
     probe = (
+        "import importlib.metadata as metadata; "
+        f"assert metadata.version('playwright') == {PYTHON_PLAYWRIGHT_VERSION!r}; "
         "from pathlib import Path; "
         "from playwright.sync_api import sync_playwright; "
         "p=sync_playwright().start(); "
@@ -913,13 +1930,24 @@ def _sanitize_failure_text(value: str) -> str:
 
 
 def _provision_live_verifier() -> None:
-    """Install one pinned Playwright package and its required Chromium binary."""
+    """Install the verified Python Playwright wheel and its Chromium binary."""
+    _validate_python_playwright_contract()
     if _live_verifier_is_usable():
         return
     python = _project_python()
     PLAYWRIGHT_BROWSERS_PATH.mkdir(parents=True, exist_ok=True)
     commands = [
-        [python, "-m", "pip", "install", "--disable-pip-version-check", f"playwright=={PLAYWRIGHT_VERSION}"],
+        [
+            python,
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--no-deps",
+            "--require-hashes",
+            "--only-binary=:all:",
+            f"{PYTHON_PLAYWRIGHT_WHEEL_URL}#sha256={PYTHON_PLAYWRIGHT_WHEEL_SHA256}",
+        ],
         [python, "-m", "playwright", "install", "chromium"],
     ]
     for command in commands:
@@ -1378,6 +2406,24 @@ def _provider_payload(payload: dict[str, Any]) -> str:
     if "observation" in payload and not isinstance(payload["observation"], (dict, type(None))):
         raise ValueError("deployment observation must be an object or null")
     return action
+
+
+def _validate_raw_input(payload: dict[str, Any]) -> None:
+    """Validate deterministic input invariants before host evidence access."""
+    if not isinstance(payload, dict):
+        raise ValueError("deployment hook input must be a JSON object")
+    _action(payload)
+    intent = payload.get("intent")
+    if intent is not None and not isinstance(intent, (dict, str)):
+        raise ValueError("deployment intent must be an object or string")
+    if "observation" in payload and not isinstance(payload["observation"], (dict, type(None))):
+        raise ValueError("deployment observation must be an object or null")
+    _check_payload_secrets(payload)
+    _check_payload_runtime_placeholders(payload)
+    _enforce_hosted_demo_mode(payload)
+    _expected_commit(payload)
+    _public_url(payload)
+    _api_origin(payload)
 
 
 def _check_payload_secrets(payload: dict[str, Any]) -> None:
@@ -2425,6 +3471,251 @@ if any(env.get(key) != os.environ.get(key) for key in required):
 """
 
 
+def _guarded_orphan_recovery_script() -> str:
+    """Return the one-time, exact-identity orphan recovery operation."""
+    return f'''guarded_orphan_recovery() {{
+    orphan_evidence=$(mktemp /tmp/citespan-orphan-recovery.XXXXXX) || {{ echo 'orphan recovery blocked: evidence creation failed' >&2; exit 70; }}
+    chmod 600 "$orphan_evidence" || {{ echo 'orphan recovery blocked: evidence protection failed' >&2; exit 70; }}
+    umask 077
+    cleanup_orphan_temps() {{ rm -f "${{preservation_before:-}}" "${{preservation_after:-}}" "${{receipt_before:-}}" "${{receipt_after:-}}" "${{old_backup_before:-}}" "${{old_backup_after:-}}" "${{inspect_buffer:-}}" "${{process_rows_file:-}}"; }}
+    trap cleanup_orphan_temps EXIT
+    record_orphan() {{ printf '%s\\n' "$1" >> "$orphan_evidence"; }}
+    recovery_receipt={DEPLOY_PATH}/.citespan-authoritative-receipt.json
+    orphan_backup_dir={ORPHAN_BACKUP_DIR}
+    runtime_file={DEPLOY_PATH}/.citespan-runtime.env
+    test -f "$recovery_receipt" && test -f "$runtime_file" && test -d "$orphan_backup_dir" && test -n "$(find "$orphan_backup_dir" -type f -print -quit)" || {{ record_orphan 'operation=preservation-proof result=refused cause=authoritative-receipt-runtime-or-old-backup-missing'; echo "orphan recovery blocked: authoritative preservation proof is unavailable; evidence=$orphan_evidence" >&2; exit 70; }}
+    sanitize_orphan() {{
+        local text="$1" secret_name secret_value
+        for secret_name in OPENAI_API_KEY OPENROUTER_API_KEY NEO4J_PASSWORD POSTGRES_PASSWORD MEILI_MASTER_KEY MINIO_ROOT_PASSWORD MINIO_SECRET_KEY SECRET_KEY; do
+            secret_value="${{!secret_name-}}"
+            if [ -n "$secret_value" ]; then
+                text=${{text//"$secret_value"/<REDACTED>}}
+            fi
+        done
+        sed -E 's/(PASSWORD|SECRET|KEY|TOKEN|AUTHORIZATION|API_KEY)([=:][^ ]*)/<REDACTED>/Ig' <<<"$text"
+    }}
+    inspect_orphan() {{
+        local output status identity="$1" operation="$2" inspect_buffer
+        inspect_buffer=$(mktemp /tmp/citespan-orphan-inspect.XXXXXX) || {{ record_orphan "operation=$operation result=incomplete-cleanup cause=inspection-buffer-creation-failed"; orphan_inspect_state=unknown; return 0; }}
+        chmod 600 "$inspect_buffer" || {{ rm -f "$inspect_buffer"; record_orphan "operation=$operation result=incomplete-cleanup cause=inspection-buffer-protection-failed"; orphan_inspect_state=unknown; return 0; }}
+        if docker inspect --format '{{{{.Id}}}}\t{{{{.Name}}}}\t{{{{.State.Status}}}}\t{{{{index .Config.Labels "com.docker.compose.project"}}}}\t{{{{index .Config.Labels "com.docker.compose.service"}}}}' "$identity" >"$inspect_buffer" 2>&1; then
+            status=0
+        else
+            status=$?
+        fi
+        output=$(sanitize_orphan "$(cat "$inspect_buffer" 2>/dev/null)")
+        rm -f "$inspect_buffer"
+        record_orphan "operation=$operation identity=$identity docker_exit_status=$status cause=$output"
+        if [ "$status" -eq 0 ]; then
+            orphan_inspect_state=present
+        elif [ "$status" -ne 0 ] && grep -Fqx "Error: No such object: $identity" <<<"$output"; then
+            orphan_inspect_state=absent
+        elif [ "$status" -ne 0 ] && grep -Fqx "No such object: $identity" <<<"$output"; then
+            orphan_inspect_state=absent
+        else
+            orphan_inspect_state=unknown
+        fi
+    }}
+    inspect_orphan {ORPHAN_CONTAINER_ID} initial
+    case "$orphan_inspect_state" in
+        absent)
+            record_orphan 'operation=orphan-recovery result=already-confirmed-absent'
+            return 0
+            ;;
+        unknown)
+            record_orphan 'operation=orphan-recovery result=incomplete-cleanup cause=initial-inspection-unprovable'
+            echo "orphan recovery blocked: initial inspection is not a recognized missing-container result; evidence=$orphan_evidence" >&2
+            exit 70
+            ;;
+    esac
+    orphan_record=$(docker inspect --format '{{{{.Id}}}}	{{{{.Name}}}}	{{{{.State.Status}}}}	{{{{index .Config.Labels "com.docker.compose.project"}}}}	{{{{index .Config.Labels "com.docker.compose.service"}}}}' {ORPHAN_CONTAINER_ID} 2>&1) || {{ record_orphan "operation=orphan-identity docker_exit_status=$? cause=$(sanitize_orphan \"$orphan_record\")"; echo "orphan recovery blocked: identity inspection failed; evidence=$orphan_evidence" >&2; exit 70; }}
+    record_orphan "operation=orphan-identity identity=$(sanitize_orphan \"$orphan_record\")"
+    IFS=$'\\t' read -r -a orphan_fields <<<"$orphan_record"
+    [ "${{#orphan_fields[@]}}" -eq 5 ] || {{ record_orphan 'operation=orphan-identity result=refused cause=field-count-mismatch'; echo "orphan recovery blocked: identity field count is not five; evidence=$orphan_evidence" >&2; exit 70; }}
+    orphan_id="${{orphan_fields[0]}}"
+    orphan_name="${{orphan_fields[1]}}"
+    orphan_state="${{orphan_fields[2]}}"
+    orphan_project="${{orphan_fields[3]}}"
+    orphan_service="${{orphan_fields[4]}}"
+    [ "$orphan_id" = "{ORPHAN_CONTAINER_ID}" ] && [ "$orphan_name" = "/{ORPHAN_CONTAINER_NAME}" ] && [ "$orphan_project" = "{ORPHAN_DEPLOYMENT_ID}" ] && [ "$orphan_service" = "backend" ] || {{ record_orphan 'operation=orphan-identity result=refused cause=identity-or-ownership-mismatch'; echo "orphan recovery blocked: identity or ownership mismatch; evidence=$orphan_evidence" >&2; exit 70; }}
+    case "$orphan_state" in created|running|paused|restarting|removing|exited|dead) ;; *) record_orphan 'operation=orphan-identity result=refused cause=invalid-container-state'; echo "orphan recovery blocked: container state is invalid; evidence=$orphan_evidence" >&2; exit 70 ;; esac
+    current_pid=$$
+    current_ancestry=" $current_pid "
+    while [ "$current_pid" -gt 1 ]; do
+        if ! ancestry_row=$(ps -o pid=,ppid= -p "$current_pid" 2>&1); then
+            record_orphan 'operation=process-proof result=incomplete-cleanup cause=process-ancestry-query-failed'
+            echo "orphan recovery blocked: process ancestry query failed; evidence=$orphan_evidence" >&2
+            exit 70
+        fi
+        [[ "$ancestry_row" != *$'\n'* ]] || {{ record_orphan 'operation=process-proof result=incomplete-cleanup cause=process-ancestry-ambiguous'; echo "orphan recovery blocked: process ancestry is ambiguous; evidence=$orphan_evidence" >&2; exit 70; }}
+        read -r ancestry_pid ancestry_parent <<<"$ancestry_row"
+        [[ "$ancestry_pid" =~ ^[0-9]+$ && "$ancestry_parent" =~ ^[0-9]+$ ]] || {{ record_orphan 'operation=process-proof result=incomplete-cleanup cause=process-ancestry-ambiguous'; echo "orphan recovery blocked: process ancestry is ambiguous; evidence=$orphan_evidence" >&2; exit 70; }}
+        current_ancestry+="$ancestry_parent "
+        current_pid="$ancestry_parent"
+    done
+    process_rows_file=$(mktemp /tmp/citespan-process-rows.XXXXXX) || {{ echo "orphan recovery blocked: process evidence creation failed; evidence=$orphan_evidence" >&2; exit 70; }}
+    chmod 600 "$process_rows_file" || {{ echo "orphan recovery blocked: process evidence protection failed; evidence=$orphan_evidence" >&2; exit 70; }}
+    if ps -eo pid=,ppid=,args= >"$process_rows_file" 2>&1; then
+        process_query_status=0
+    else
+        process_query_status=$?
+    fi
+    process_query_output=$(sanitize_orphan "$(cat "$process_rows_file" 2>/dev/null)")
+    record_orphan "operation=process-proof query_exit_status=$process_query_status cause=$process_query_output"
+    [ "$process_query_status" -eq 0 ] || {{ record_orphan 'operation=process-proof result=incomplete-cleanup cause=process-query-failed'; echo "orphan recovery blocked: process query failed; evidence=$orphan_evidence" >&2; exit 70; }}
+    process_match_status=0
+    process_matches=$(CITESPAN_ORPHAN_ACTION_KEY="{ORPHAN_ACTION_KEY}" python3 - "$current_ancestry" "$process_rows_file" 2>&1 <<'PY'
+import os
+import shlex
+import sys
+
+ancestry = {{int(value) for value in sys.argv[1].split() if value}}
+action_key = os.environ["CITESPAN_ORPHAN_ACTION_KEY"]
+try:
+    rows_path = sys.argv[2] if len(sys.argv) > 2 else "-"
+    rows_text = sys.stdin.read() if rows_path == "-" else open(rows_path, encoding="utf-8").read()
+except (OSError, UnicodeError) as exc:
+    print(f"parse-error: {{type(exc).__name__}}")
+    raise SystemExit(70)
+
+matches = []
+for line in rows_text.splitlines():
+    fields = line.strip().split(None, 2)
+    if len(fields) != 3:
+        print("parse-error: malformed-process-row")
+        raise SystemExit(70)
+    try:
+        pid, parent = (int(fields[0]), int(fields[1]))
+    except ValueError:
+        print("parse-error: non-numeric-process-identity")
+        raise SystemExit(70)
+    try:
+        argv = shlex.split(fields[2], posix=True)
+    except ValueError:
+        print("parse-error: ambiguous-process-argv")
+        raise SystemExit(70)
+    if not argv:
+        print("parse-error: empty-process-argv")
+        raise SystemExit(70)
+    if pid in ancestry:
+        continue
+    executable = os.path.basename(argv[0]).lower()
+    is_old_release_transport = executable == "bash" and argv[1:] == ["-seuo", "pipefail"]
+    is_old_release = action_key in argv
+    is_npm_build = executable in {{"npm", "npm.cmd", "npm-cli", "npm-cli.js"}} and (argv[1:2] == ["build"] or argv[1:3] == ["run", "build"])
+    is_next_build = executable in {{"next", "next.cmd"}} and argv[1:2] == ["build"]
+    is_shell_command = executable in {{"sh", "bash"}} and argv[1:2] == ["-c"]
+    shell_command = []
+    if is_shell_command:
+        if len(argv) < 3:
+            print("parse-error: missing-shell-command")
+            raise SystemExit(70)
+        try:
+            shell_command = shlex.split(argv[2], posix=True)
+        except ValueError:
+            print("parse-error: ambiguous-shell-command")
+            raise SystemExit(70)
+    is_shell_builder = shell_command[:2] == ["next", "build"]
+    is_shell_action = action_key in shell_command
+    if is_old_release_transport or is_old_release or is_npm_build or is_next_build or is_shell_builder or is_shell_action:
+        matches.append(f"pid={{pid}} ppid={{parent}} argv={{shlex.join(argv)}}")
+print("\\n".join(matches))
+PY
+    ) || process_match_status=$?
+    if [ "$process_match_status" -ne 0 ]; then
+        sanitized_process_matches=$(sanitize_orphan "$process_matches")
+        record_orphan "operation=process-proof result=incomplete-cleanup cause=process-match-query-failed detail=$sanitized_process_matches"
+        echo "orphan recovery blocked: process enumeration or parsing is ambiguous; evidence=$orphan_evidence" >&2
+        exit 70
+    elif [ -n "$process_matches" ]; then
+        record_orphan "operation=process-proof result=refused cause=$(sanitize_orphan \"$process_matches\")"
+        echo "orphan recovery blocked: old release or frontend builder is alive; evidence=$orphan_evidence" >&2
+        exit 70
+    fi
+    preservation_before=$(mktemp /tmp/citespan-preservation-before.XXXXXX) || {{ echo "orphan recovery blocked: preservation evidence creation failed; evidence=$orphan_evidence" >&2; exit 70; }}
+    chmod 600 "$preservation_before"
+    inspect_authoritative_container() {{ docker inspect --format '{{{{.Id}}}}\t{{{{.Name}}}}\t{{{{.State.Status}}}}\t{{{{.Config.Image}}}}\t{{{{range $network, $_ := .NetworkSettings.Networks}}}}{{{{$network}}}},{{{{end}}}}\t{{{{range .Mounts}}}}{{{{.Type}}}}:{{{{.Name}}}}:{{{{.Destination}}}}:{{{{.RW}}}},{{{{end}}}}' "$1"; }}
+    inspect_authoritative_network() {{ docker network inspect --format '{{{{.ID}}}}\t{{{{.Name}}}}\t{{{{.Driver}}}}\t{{{{.Scope}}}}\t{{{{range .IPAM.Config}}}}{{{{.Subnet}}}}:{{{{.Gateway}}}},{{{{end}}}}' "$1"; }}
+    inspect_authoritative_volume() {{ docker volume inspect --format '{{{{.Name}}}}\t{{{{.Driver}}}}\t{{{{.Mountpoint}}}}\t{{{{.Scope}}}}' "$1"; }}
+    preservation_identity() {{
+        inspect_authoritative_network citespan-authoritative-network || return 1
+        for resource in citespan-authoritative-postgres citespan-authoritative-meili citespan-authoritative-minio; do inspect_authoritative_container "$resource" || return 1; done
+        for volume in citespan-postgres-data citespan-meili-data citespan-minio-data; do inspect_authoritative_volume "$volume" || return 1; done
+        test -n "\${{backup_dir:-}}" && test -d "$backup_dir" || return 1
+        find "$backup_dir" -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum || return 1
+    }}
+    old_backup_identity() {{ find "$orphan_backup_dir" -type f -print0 | sort -z | xargs -0 sha256sum; }}
+    preservation_identity | sha256sum >> "$preservation_before" || {{ record_orphan 'operation=preservation-proof result=refused cause=authoritative-resource-inspection-failed'; echo "orphan recovery blocked: authoritative resource proof failed; evidence=$orphan_evidence" >&2; exit 70; }}
+    receipt_before=$(mktemp /tmp/citespan-receipt-before.XXXXXX) || {{ echo "orphan recovery blocked: receipt evidence creation failed; evidence=$orphan_evidence" >&2; exit 70; }}
+    chmod 600 "$receipt_before"
+    sha256sum "$runtime_file" "$recovery_receipt" > "$receipt_before" || {{ echo "orphan recovery blocked: runtime or receipt proof failed; evidence=$orphan_evidence" >&2; exit 70; }}
+    old_backup_before=$(mktemp /tmp/citespan-old-backup-before.XXXXXX) || {{ echo "orphan recovery blocked: old backup evidence creation failed; evidence=$orphan_evidence" >&2; exit 70; }}
+    chmod 600 "$old_backup_before"
+    old_backup_identity > "$old_backup_before" || {{ echo "orphan recovery blocked: old backup proof failed; evidence=$orphan_evidence" >&2; exit 70; }}
+    record_orphan "operation=preservation-proof phase=before digest=$(sha256sum \"$preservation_before\" | cut -d' ' -f1)"
+    docker stop {ORPHAN_CONTAINER_ID} >/dev/null 2>&1 || {{ record_orphan "operation=stop identity={ORPHAN_CONTAINER_ID} result=failed"; echo "orphan recovery failed: exact container stop failed; evidence=$orphan_evidence" >&2; exit 70; }}
+    docker rm {ORPHAN_CONTAINER_ID} >/dev/null 2>&1 || {{ record_orphan "operation=remove identity={ORPHAN_CONTAINER_ID} result=failed"; echo "orphan recovery failed: exact container removal failed; evidence=$orphan_evidence" >&2; exit 70; }}
+    inspect_orphan {ORPHAN_CONTAINER_ID} post-removal
+    [ "$orphan_inspect_state" = absent ] || {{ record_orphan "operation=post-removal result=incomplete-cleanup state=$orphan_inspect_state"; echo "orphan recovery failed: exact container absence is unproved; evidence=$orphan_evidence" >&2; exit 70; }}
+    preservation_after=$(mktemp /tmp/citespan-preservation-after.XXXXXX) || {{ echo "orphan recovery failed: post-preservation evidence creation failed; evidence=$orphan_evidence" >&2; exit 70; }}
+    chmod 600 "$preservation_after"
+    preservation_identity | sha256sum >> "$preservation_after" || {{ echo "orphan recovery failed: authoritative resource changed or disappeared; evidence=$orphan_evidence" >&2; exit 70; }}
+    receipt_after=$(mktemp /tmp/citespan-receipt-after.XXXXXX) || {{ echo "orphan recovery failed: receipt evidence creation failed; evidence=$orphan_evidence" >&2; exit 70; }}
+    chmod 600 "$receipt_after"
+    sha256sum "$runtime_file" "$recovery_receipt" > "$receipt_after" || {{ echo "orphan recovery failed: runtime or receipt changed or disappeared; evidence=$orphan_evidence" >&2; exit 70; }}
+    old_backup_after=$(mktemp /tmp/citespan-old-backup-after.XXXXXX) || {{ echo "orphan recovery failed: old backup evidence creation failed; evidence=$orphan_evidence" >&2; exit 70; }}
+    chmod 600 "$old_backup_after"
+    old_backup_identity > "$old_backup_after" || {{ echo "orphan recovery failed: old backup changed or disappeared; evidence=$orphan_evidence" >&2; exit 70; }}
+    cmp -s "$preservation_before" "$preservation_after" || {{ record_orphan 'operation=preservation-proof result=failed cause=authoritative-state-mismatch'; echo "orphan recovery failed: authoritative state changed; evidence=$orphan_evidence" >&2; exit 70; }}
+    cmp -s "$receipt_before" "$receipt_after" || {{ record_orphan 'operation=preservation-proof result=failed cause=authoritative-receipt-changed'; echo "orphan recovery failed: authoritative receipt changed; evidence=$orphan_evidence" >&2; exit 70; }}
+    cmp -s "$old_backup_before" "$old_backup_after" || {{ record_orphan 'operation=preservation-proof result=failed cause=old-backup-changed'; echo "orphan recovery failed: immutable old backup changed; evidence=$orphan_evidence" >&2; exit 70; }}
+    record_orphan "operation=orphan-recovery result=complete identity={ORPHAN_CONTAINER_ID} name={ORPHAN_CONTAINER_NAME} volume_deletion=none"
+    cleanup_orphan_temps
+    trap - EXIT
+}}
+'''
+
+
+def _cleanup_inspection_script() -> str:
+    """Return the tri-state container inspection used by rollback cleanup."""
+    return r'''    inspect_container_state() {
+        inspect_operation="$1"
+        inspect_identity="$2"
+        inspect_output=$(mktemp "$rollback_evidence.inspect.XXXXXX") || { cleanup_status=70; cleanup_cause='inspection buffer creation failed'; return 1; }
+        chmod 600 "$inspect_output" 2>/dev/null || { cleanup_status=70; cleanup_cause='inspection buffer protection failed'; rm -f "$inspect_output"; return 1; }
+        if docker inspect --format '{{.Id}}\t{{.Name}}\t{{.State.Running}}\t{{.State.Status}}' "$inspect_identity" >"$inspect_output" 2>&1; then
+            inspect_status=0
+        else
+            inspect_status=$?
+        fi
+        inspect_cause=$(sanitize_probe_output "$(cat "$inspect_output" 2>/dev/null)")
+        printf '%s\n' "$inspect_operation: identity=$inspect_identity docker_exit_status=$inspect_status cause=$inspect_cause" >> "$recovery_log"
+        if ! rm -f "$inspect_output" || [ -e "$inspect_output" ]; then
+            cleanup_status=70
+            cleanup_cause="${inspect_cause:+$inspect_cause; }inspection buffer removal failed"
+            return 1
+        fi
+        if [ "$inspect_status" -eq 0 ]; then
+            IFS=$'\t' read -r inspect_id inspect_name inspect_running inspect_status_name <<<"$inspect_cause"
+            if [ "$inspect_running" != true ] && [ "$inspect_running" != false ]; then
+                cleanup_status=70
+                cleanup_cause='container running state is not true or false'
+                return 1
+            fi
+            inspect_state=present
+            inspect_running="$inspect_running"
+        elif [ "$inspect_status" -ne 0 ] && printf '%s\n' "$inspect_cause" | grep -Fqx "Error: No such object: $inspect_identity"; then
+            inspect_state=absent
+        elif [ "$inspect_status" -ne 0 ] && printf '%s\n' "$inspect_cause" | grep -Fqx "No such object: $inspect_identity"; then
+            inspect_state=absent
+        else
+            inspect_state=unknown
+        fi
+        return 0
+    }
+'''
+
+
 def _deployment_command_authoritative(payload: dict[str, Any]) -> str:
     """Build a candidate-only transaction over one authoritative data-service state."""
     expected_commit = _expected_commit(payload)
@@ -2454,91 +3745,199 @@ def _deployment_command_authoritative(payload: dict[str, Any]) -> str:
     receipt_validate = shlex.quote(_receipt_validate())
     minio_preflight = _minio_source_preflight_script()
     reconciliation = _authoritative_reconciliation_script(receipt_writer_source)
+    orphan_recovery = _guarded_orphan_recovery_script()
     rollback_script = f"""rollback() {{
     status=$?
+    set +e
+    rollback_evidence="${{recovery_log}}.failure"
+    umask 077
+    : > "$rollback_evidence"
+    chmod 600 "$rollback_evidence"
+    exec >>"$rollback_evidence" 2>&1
+    : > "$recovery_log"
+    chmod 600 "$recovery_log"
+    record_recovery() {{
+        if ! printf '%s\\n' "$1" >> "$recovery_log" 2>/dev/null; then
+            rollback_incomplete=1
+        fi
+    }}
+    record_failure() {{
+        printf '%s\\n' "$1" >> "$rollback_evidence"
+    }}
+    cleanup_command() {{
+        cleanup_operation="$1"
+        shift
+        cleanup_diagnostic=$(mktemp "$rollback_evidence.cleanup.XXXXXX") || {{
+            cleanup_status=70
+            cleanup_cause='diagnostic buffer creation failed'
+            return 1
+        }}
+        chmod 600 "$cleanup_diagnostic" 2>/dev/null || {{
+            cleanup_status=70
+            cleanup_cause='diagnostic buffer protection failed'
+            rm -f "$cleanup_diagnostic"
+            return 1
+        }}
+        "$@" >"$cleanup_diagnostic" 2>&1
+        cleanup_status=$?
+        cleanup_cause=$(sanitize_probe_output "$(cat "$cleanup_diagnostic" 2>/dev/null)")
+        if ! rm -f "$cleanup_diagnostic" || [ -e "$cleanup_diagnostic" ]; then
+            cleanup_status=70
+            cleanup_cause="${{cleanup_cause:+$cleanup_cause; }}diagnostic buffer removal failed"
+            return 1
+        fi
+        return "$cleanup_status"
+    }}
+    record_cleanup_failure() {{
+        record_recovery "$cleanup_operation: failed exit_status=$cleanup_status cause=$cleanup_cause"
+        record_failure "recovery failed: $cleanup_operation exit_status=$cleanup_status cause=$cleanup_cause"
+        rollback_incomplete=1
+    }}
+    {_cleanup_inspection_script()}
     if [ "$status" -ne 0 ]; then
-        phase_failure "$failed_step" "$status"
-        echo "deployment failed at $failed_step" >&2
+        safe_failed_step=$(sanitize_probe_output "$failed_step")
+        if ! phase_failure "$safe_failed_step" "$status"; then
+            rollback_incomplete=1
+        fi
+        record_failure "deployment failed at $safe_failed_step"
         if [ "$cutover_committed" -eq 1 ]; then
-            echo 'rollback skipped after metadata commit; prior-container retirement failed' >&2
+            record_recovery 'rollback skipped after metadata commit; prior-container retirement failed'
+            record_failure 'rollback skipped after metadata commit; prior-container retirement failed'
         else
             if [ "$route_active" -eq 1 ]; then
-                if ! cp -p "$caddy_backup" /etc/caddy/Caddyfile; then
-                    echo 'recovery failed: restore route' >&2
-                    echo 'restore route: failed' >> "$recovery_log"
-                    rollback_incomplete=1
+                if ! cleanup_command 'restore route' cp -p "$caddy_backup" /etc/caddy/Caddyfile; then
+                    record_cleanup_failure
                 else
-                    echo 'restore route: ok' >> "$recovery_log"
+                    record_recovery 'restore route: ok'
                 fi
-                if ! caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile; then
-                    echo 'recovery failed: validate route' >&2
-                    echo 'validate route: failed' >> "$recovery_log"
-                    rollback_incomplete=1
+                if ! cleanup_command 'validate route' caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile; then
+                    record_cleanup_failure
                 else
-                    echo 'validate route: ok' >> "$recovery_log"
+                    record_recovery 'validate route: ok'
                 fi
-                if ! systemctl reload caddy; then
-                    echo 'recovery failed: reload route' >&2
-                    echo 'reload route: failed' >> "$recovery_log"
-                    rollback_incomplete=1
+                if ! cleanup_command 'reload route' systemctl reload caddy; then
+                    record_cleanup_failure
                 else
-                    echo 'reload route: ok' >> "$recovery_log"
+                    record_recovery 'reload route: ok'
                 fi
+            else
+                record_recovery 'restore route: skipped'
             fi
             if [ -f "$backup_dir/.citespan-deployment.json" ]; then
-                if ! cp -p "$backup_dir/.citespan-deployment.json" "$deployment_metadata"; then
-                    echo 'recovery failed: restore metadata' >&2
-                    rollback_incomplete=1
+                if ! cleanup_command "restore metadata identity=$deployment_metadata" cp -p "$backup_dir/.citespan-deployment.json" "$deployment_metadata"; then
+                    record_cleanup_failure
                 else
-                    echo 'restore metadata: ok' >> "$recovery_log"
+                    record_recovery 'restore metadata: ok'
                 fi
+            else
+                record_recovery 'restore metadata: skipped'
             fi
-            if [ -f "$backup_dir/.citespan-demo-marker.json" ] && ! cp -p "$backup_dir/.citespan-demo-marker.json" "$demo_marker"; then
-                echo 'recovery failed: restore demo marker' >&2
-                rollback_incomplete=1
+            if [ -f "$backup_dir/.citespan-demo-marker.json" ] && ! cleanup_command "restore demo marker identity=$demo_marker" cp -p "$backup_dir/.citespan-demo-marker.json" "$demo_marker"; then
+                record_cleanup_failure
+            elif [ -f "$backup_dir/.citespan-demo-marker.json" ]; then
+                record_recovery 'restore demo marker: ok'
+            else
+                record_recovery 'restore demo marker: skipped'
             fi
-            if [ -f "$backup_dir/.citespan-runtime.env" ] && ! cp -p "$backup_dir/.citespan-runtime.env" {DEPLOY_PATH}/.citespan-runtime.env; then
-                echo 'recovery failed: restore runtime' >&2
-                rollback_incomplete=1
+            if [ -f "$backup_dir/.citespan-runtime.env" ] && ! cleanup_command "restore runtime identity=$runtime" cp -p "$backup_dir/.citespan-runtime.env" {DEPLOY_PATH}/.citespan-runtime.env; then
+                record_cleanup_failure
+            elif [ -f "$backup_dir/.citespan-runtime.env" ]; then
+                record_recovery 'restore runtime: ok'
+            else
+                record_recovery 'restore runtime: skipped'
             fi
-            if [ "$previous_backend_running" -eq 1 ] && ! docker start "$previous_backend" >/dev/null; then
-                echo 'recovery failed: restart prior backend' >&2
-                rollback_incomplete=1
+            if [ "$previous_backend_running" -eq 1 ] && ! cleanup_command "restart prior backend identity=$previous_backend" docker start "$previous_backend"; then
+                record_cleanup_failure
+            elif [ "$previous_backend_running" -eq 1 ]; then
+                record_recovery 'restart prior backend: ok'
+            else
+                record_recovery 'restart prior backend: skipped'
             fi
-            if [ "$previous_static_running" -eq 1 ] && ! docker start "$previous_static" >/dev/null; then
-                echo 'recovery failed: restart prior static' >&2
-                rollback_incomplete=1
+            if [ "$previous_static_running" -eq 1 ] && ! cleanup_command "restart prior static identity=$previous_static" docker start "$previous_static"; then
+                record_cleanup_failure
+            elif [ "$previous_static_running" -eq 1 ]; then
+                record_recovery 'restart prior static: ok'
+            else
+                record_recovery 'restart prior static: skipped'
             fi
             if [ -n "${{candidate_static:-}}" ]; then
-                if ! docker info >/dev/null 2>&1; then
-                    echo 'recovery failed: Docker unavailable while removing candidate static container' >&2
-                    rollback_incomplete=1
-                elif docker inspect "$candidate_static" >/dev/null 2>&1; then
-                    if [ "$(docker inspect -f '{{{{.State.Running}}}}' "$candidate_static")" = true ] && ! docker stop "$candidate_static" >/dev/null; then
-                        echo 'recovery failed: stop candidate static container' >&2
-                        rollback_incomplete=1
+                if ! cleanup_command 'remove candidate static: Docker unavailable' docker info; then
+                    record_cleanup_failure
+                elif cleanup_operation="inspect candidate static identity=$candidate_static"; ! inspect_container_state "inspect candidate static identity" "$candidate_static"; then
+                    record_cleanup_failure
+                elif [ "$inspect_state" = present ]; then
+                    record_recovery 'remove candidate static: inspect=present'
+                    candidate_static_running="$inspect_running"
+                    candidate_static_stopped=0
+                    if [ "$candidate_static_running" = true ]; then
+                        if ! cleanup_command "stop candidate static identity=$candidate_static" docker stop "$candidate_static"; then
+                            record_cleanup_failure
+                        else
+                            record_recovery 'stop candidate static: ok'
+                            candidate_static_stopped=1
+                        fi
+                    elif [ "$candidate_static_running" = false ]; then
+                        record_recovery 'stop candidate static: skipped; already stopped'
+                        candidate_static_stopped=1
+                    else
+                        record_recovery 'remove candidate static: skipped after unknown running state'
+                        cleanup_status=70
+                        cleanup_cause='candidate static running state is unknown'
+                        record_cleanup_failure
                     fi
-                    if ! docker rm "$candidate_static" >/dev/null; then
-                        echo 'recovery failed: remove candidate static container' >&2
-                        rollback_incomplete=1
+                    if [ "$candidate_static_stopped" -eq 1 ]; then
+                    if ! cleanup_command "remove candidate static identity=$candidate_static" docker rm "$candidate_static"; then
+                        record_cleanup_failure
+                    else
+                        record_recovery 'remove candidate static: ok'
                     fi
-                    if docker inspect "$candidate_static" >/dev/null 2>&1; then
-                        echo 'recovery failed: candidate static container still exists' >&2
-                        rollback_incomplete=1
+                    cleanup_operation="verify candidate static removal identity=$candidate_static"
+                    if ! inspect_container_state "verify candidate static removal" "$candidate_static"; then
+                        record_cleanup_failure
+                    elif [ "$inspect_state" = absent ]; then
+                        record_recovery "remove candidate static: inspect=absent identity=$candidate_static"
+                    else
+                        cleanup_status=70
+                        cleanup_cause="candidate static removal is unproved state=$inspect_state"
+                        record_cleanup_failure
                     fi
+                    fi
+                elif [ "$inspect_state" = absent ]; then
+                    record_recovery "remove candidate static: inspect=absent identity=$candidate_static exit_status=$inspect_status cause=$inspect_cause"
+                else
+                    cleanup_status=70
+                    cleanup_cause='candidate static inspection is incomplete'
+                    record_cleanup_failure
                 fi
+            else
+                record_recovery 'remove candidate static: skipped'
             fi
-            if [ -n "${{compose_override:-}}" ] && ! docker compose --project-name "$CITESPAN_DEPLOYMENT_ID" --env-file {DEPLOY_PATH}/.citespan-runtime.env -f {DEPLOY_PATH}/{DEMO_COMPOSE} -f "$compose_override" down --remove-orphans; then
-                echo 'recovery failed: remove candidate services' >&2
-                rollback_incomplete=1
-            fi
-            if [ "$rollback_incomplete" -ne 0 ]; then
-                echo "recovery incomplete; see $recovery_log" >&2
-                exit 70
+            if [ -n "${{compose_override:-}}" ] && ! cleanup_command "remove candidate services identity=$CITESPAN_DEPLOYMENT_ID" docker compose --project-name "$CITESPAN_DEPLOYMENT_ID" --env-file {DEPLOY_PATH}/.citespan-runtime.env -f {DEPLOY_PATH}/{DEMO_COMPOSE} -f "$compose_override" down --remove-orphans; then
+                record_cleanup_failure
+            elif [ -n "${{compose_override:-}}" ]; then
+                record_recovery 'remove candidate services: ok'
+            else
+                record_recovery 'remove candidate services: skipped'
             fi
         fi
     fi
-    rm -f "${{compose_override:-}}"
+    if [ -n "${{compose_override:-}}" ]; then
+        if cleanup_command "remove compose override identity=$compose_override" rm -f "$compose_override"; then
+            record_recovery 'remove compose override: ok'
+        else
+            record_cleanup_failure
+            cleanup_failed=1
+            status=70
+        fi
+    else
+        record_recovery 'remove compose override: skipped'
+    fi
+    if [ "$rollback_incomplete" -ne 0 ]; then
+        record_recovery 'rollback result: incomplete'
+        record_failure "recovery incomplete; see $recovery_log"
+        exit 70
+    fi
+    record_recovery 'rollback result: complete'
     exit "$status"
 }}
 trap rollback EXIT
@@ -2546,6 +3945,7 @@ trap rollback EXIT
     command = (
         "set -Eeuo pipefail; failed_step=bootstrap; route_active=0; route_switched=0; rollback_incomplete=0; cutover_committed=0; cleanup_failed=0; "
         "trap 'failed_step=\"$BASH_COMMAND\"' ERR; "
+        + " test -f /etc/caddy/Caddyfile; "
         + minio_preflight
         + " minio_source_preflight; "
         f"domain={domain}; expected={expected}; run_id={run_id}; "
@@ -2554,6 +3954,8 @@ trap rollback EXIT
         f"export CITESPAN_SYNTHETIC_MARKER={shlex.quote(CANONICAL_DEMO_MARKER)}; "
         f"deployment_metadata={DEPLOYMENT_METADATA}; demo_marker={DEMO_MARKER}; receipt={DEPLOY_PATH}/.citespan-authoritative-receipt.json; backup_dir={DEPLOY_PATH}/.citespan-backups/$(date -u +%Y%m%d%H%M%S%N); mkdir -p \"$backup_dir\"; phase_trace=\"$backup_dir/release-phase-trace.log\"; umask 077; : > \"$phase_trace\"; chmod 600 \"$phase_trace\"; printf 'release phase trace=%s\\n' \"$phase_trace\" >&2; phase_start() {{ printf '%s phase=%s status=start\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \"$1\" >> \"$phase_trace\"; }}; phase_end() {{ printf '%s phase=%s status=end exit_code=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \"$1\" \"$2\" >> \"$phase_trace\"; }}; phase_failure() {{ printf '%s phase=%s status=failure exit_code=%s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" \"$1\" \"$2\" >> \"$phase_trace\"; }}; phase_start \"bootstrap\"; "
         f"runtime={DEPLOY_PATH}/.citespan-runtime.env; if [ ! -f \"$runtime\" ]; then umask 077; neo4j_password=$(openssl rand -hex 32); postgres_password=$(openssl rand -hex 32); meili_master_key=$(openssl rand -hex 32); minio_root_user=$(openssl rand -hex 16); minio_root_password=$(openssl rand -hex 32); secret_key=$(openssl rand -hex 32); temporary_runtime=$(mktemp \"$runtime.XXXXXX\"); printf 'DEMO_MODE=1\\nCITESPAN_SYNTHETIC_ONLY=1\\nOPENAI_API_KEY=\\nOPENROUTER_API_KEY=\\nNEO4J_PASSWORD=%s\\nPOSTGRES_USER=ufdr_user\\nPOSTGRES_DB=ufdr_analyzer\\nPOSTGRES_PASSWORD=%s\\nMEILI_MASTER_KEY=%s\\nMINIO_ROOT_USER=%s\\nMINIO_ROOT_PASSWORD=%s\\nMINIO_ACCESS_KEY=%s\\nMINIO_SECRET_KEY=%s\\nSECRET_KEY=%s\\n' \"$neo4j_password\" \"$postgres_password\" \"$meili_master_key\" \"$minio_root_user\" \"$minio_root_password\" \"$minio_root_user\" \"$minio_root_password\" \"$secret_key\" > \"$temporary_runtime\"; chmod 600 \"$temporary_runtime\"; mv -f \"$temporary_runtime\" \"$runtime\"; fi; python3 -c {runtime_check} \"$runtime\"; set -a; . \"$runtime\"; set +a; "
+        + orphan_recovery
+        + " guarded_orphan_recovery; "
         "previous_deployment_id=; previous_backend=; previous_static=; previous_frontend=; candidate_backend=; candidate_static=; "
         "previous_backend_running=0; previous_static_running=0; "
         "candidate_metadata=; prior_metadata=; compose_override=; recovery_log=; caddy_backup=; "
@@ -2566,7 +3968,7 @@ trap rollback EXIT
         "previous_backend=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(\"backend_container\") or sys.argv[2] + \"-backend\")' \"$deployment_metadata\" \"$previous_deployment_id\"); "
         "previous_static=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"static_container\"])' \"$deployment_metadata\"); "
         "authoritative_network=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"authoritative_network\"])' \"$deployment_metadata\"); authoritative_postgres=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"authoritative_postgres\"])' \"$deployment_metadata\"); authoritative_meili=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"authoritative_meili\"])' \"$deployment_metadata\"); authoritative_minio=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"authoritative_minio\"])' \"$deployment_metadata\"); "
-        "docker inspect \"$previous_backend\" > \"$backup_dir/prior-backend.inspect.json\"; docker inspect \"$previous_static\" > \"$backup_dir/prior-static.inspect.json\"; "
+        "docker inspect --format '{{.Id}}\\t{{.Name}}\\t{{.State.Status}}\\t{{.Config.Image}}' \"$previous_backend\" > \"$backup_dir/prior-backend.inspect.txt\"; docker inspect --format '{{.Id}}\\t{{.Name}}\\t{{.State.Status}}\\t{{.Config.Image}}' \"$previous_static\" > \"$backup_dir/prior-static.inspect.txt\"; "
         "if [ \"$(docker inspect -f '{{.State.Running}}' \"$previous_backend\")\" = true ]; then previous_backend_running=1; fi; "
         "if [ \"$(docker inspect -f '{{.State.Running}}' \"$previous_static\")\" = true ]; then previous_static_running=1; fi; "
         "fi; "
@@ -2612,13 +4014,13 @@ trap rollback EXIT
         f"mkdir -p \"$backup_dir/static-content\"; frontend_builder=node:22-alpine; docker run --rm -v {DEPLOY_PATH}:/workspace -w /workspace/frontend -e {shlex.quote(f'NEXT_PUBLIC_API_URL=https://{domain_value}/api')} -e NEXT_PUBLIC_DEMO_MODE=1 \"$frontend_builder\" sh -c 'npm ci && npm run build'; test -d {DEPLOY_PATH}/frontend/out; cp -a {DEPLOY_PATH}/frontend/out/. \"$backup_dir/static-content/\"; static_content_dir=\"$backup_dir/static-content\"; "
         "candidate_static=$CITESPAN_DEPLOYMENT_ID-static; docker run -d --name \"$candidate_static\" -p 127.0.0.1:$candidate_frontend_port:80 -v \"$static_content_dir:/usr/share/nginx/html:ro\" nginx:1.29-alpine; "
         "test -n \"$(docker ps -q --filter name=^/$candidate_static$)\"; "
-        "failed_step=candidate-static-health; curl --fail --silent --show-error http://127.0.0.1:$candidate_frontend_port/ | grep -qi CiteSpan; "
+        "failed_step=candidate-static-health; candidate_static_body=\"$backup_dir/candidate-static.html\"; if ! curl --fail --silent --show-error http://127.0.0.1:$candidate_frontend_port/ >\"$candidate_static_body\"; then exit 1; fi; grep -qi CiteSpan \"$candidate_static_body\"; "
         "if ! curl --fail --silent --show-error http://127.0.0.1:$backend_port/health/ >/dev/null; then exit 1; fi; "
         "caddy_backup=\"$backup_dir/Caddyfile\"; "
         "failed_step=route-stage; route_file=\"$backup_dir/citespan-route\"; printf '%s\\n' '# BEGIN CITESPAN ROUTE' \"$domain {\" '    handle_path /api/* {' \"        reverse_proxy 127.0.0.1:$backend_port\" '    }' \"    reverse_proxy 127.0.0.1:$frontend_port\" '}' '# END CITESPAN ROUTE' > \"$route_file\"; "
         "CITESPAN_ROUTE_FILE=\"$route_file\" python3 -c 'import os; from pathlib import Path; p=Path(\"/etc/caddy/Caddyfile\"); route=Path(os.environ[\"CITESPAN_ROUTE_FILE\"]).read_text(); text=p.read_text(); begin=\"# BEGIN CITESPAN ROUTE\"; end=\"# END CITESPAN ROUTE\"; start=text.find(begin); finish=text.find(end, start); assert text.count(begin) <= 1 and text.count(end) <= 1; assert (start < 0 and finish < 0) or (start >= 0 and finish > start); prefix=text if start < 0 else text[:start]; suffix=\"\" if start < 0 else text[finish+len(end):]; tmp=p.with_name(\".Caddyfile.citespan.tmp\"); tmp.write_text(prefix+route+suffix); tmp.replace(p)'; "
         "failed_step=caddy-validate; route_active=1; route_switched=1; caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile; failed_step=route-reload; systemctl reload caddy; "
-        f"failed_step=public-route-check; curl --fail --silent --show-error --tlsv1.2 https://$domain/ | grep -qi CiteSpan; "
+        f"failed_step=public-route-check; public_route_body=\"$backup_dir/public-route.html\"; if ! curl --fail --silent --show-error --tlsv1.2 https://$domain/ >\"$public_route_body\"; then exit 1; fi; grep -qi CiteSpan \"$public_route_body\"; "
         f"failed_step=metadata-commit; verified_commit=$(git -C {DEPLOY_PATH} rev-parse HEAD); test \"$verified_commit\" = {expected}; test \"$(printf %s \"$verified_commit\" | wc -c)\" -eq 40; marker_tmp=\"$backup_dir/demo-marker.json.tmp\"; "
         f"python3 -c "
         + shlex.quote(_metadata_writer_script())
@@ -2683,10 +4085,14 @@ def _observation_command() -> str:
     )
 
 
-def _prepare(payload: dict[str, Any]) -> dict[str, Any]:
+def _prepare(
+    payload: dict[str, Any], *, validate_process_evidence: bool = True
+) -> dict[str, Any]:
+    _validate_raw_input(payload)
+    action = _action(payload)
+    if validate_process_evidence:
+        _validate_host_process_evidence()
     action = _provider_payload(payload)
-    _check_payload_secrets(payload)
-    _check_payload_runtime_placeholders(payload)
     demo_mode = _enforce_hosted_demo_mode(payload)
     release_text = _release_text()
     for name in _credential_scan_findings(release_text):

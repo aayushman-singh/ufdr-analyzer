@@ -1,5 +1,5 @@
 "use client"
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import { FileTree } from "@/components/ui/file-tree"
 import { HierarchicalTree } from "@/components/ui/heirarchial-tree"
 import { BackendDataDisplay } from "@/components/ui/backend-data-display"
@@ -26,6 +26,35 @@ interface BackendData {
   aleapp_report_path?: string;
   aleapp_web_url?: string;
 }
+
+interface FileInfo {
+  valid: true;
+  file_size_gb: number;
+  file_path: string;
+  readable: boolean;
+}
+
+function isCompleteFileInfo(value: unknown): value is FileInfo {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const data = value as Partial<FileInfo>;
+  return (
+    data.valid === true &&
+    typeof data.file_path === "string" &&
+    data.file_path.trim().length > 0 &&
+    typeof data.file_size_gb === "number" &&
+    Number.isFinite(data.file_size_gb) &&
+    data.file_size_gb >= 0 &&
+    data.readable === true
+  );
+}
+
+type ValidationState =
+  | {status: "missing"; filePath: string}
+  | {status: "pending"; filePath: string}
+  | {status: "valid"; filePath: string; fileInfo: FileInfo}
+  | {status: "failed"; filePath: string; message: string};
 
 // Function to extract file structure from ALEAPP report
 const extractAleappFileStructure = async (backendData: BackendData | null) => {
@@ -296,13 +325,18 @@ export default function UploadPage() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [showStructure, setShowStructure] = useState(false);
   const [maximizeHierarchical, setMaximizeHierarchical] = useState(false);
-  const [fileInfo, setFileInfo] = useState<{valid: boolean; file_size_gb: number; file_path: string; readable: boolean} | null>(null);
+  const [validationState, setValidationState] = useState<ValidationState>({
+    status: "missing",
+    filePath: "",
+  });
   const [isValidating, setIsValidating] = useState(false);
   const [backendData, setBackendData] = useState<BackendData | null>(null);
   const [aleappStructure, setAleappStructure] = useState<AleappStructure | null>(null);
   const [isLoadingStructure, setIsLoadingStructure] = useState(false);
   const [isResettingSample, setIsResettingSample] = useState(false);
   const [resetError, setResetError] = useState<string | null>(null);
+  const selectedFilePathRef = useRef("");
+  const validationGenerationRef = useRef(0);
   const router = useRouter();
 
   const validateFilePath = useCallback(async (pathToValidate?: string) => {
@@ -310,38 +344,54 @@ export default function UploadPage() {
       return;
     }
     const path = pathToValidate || filePath;
+    const generation = validationGenerationRef.current;
     if (!path.trim()) {
+      setValidationState({status: "missing", filePath: path});
       return;
     }
 
     setIsValidating(true);
+    setValidationState({status: "pending", filePath: path});
     try {
       const response = await authedFetch(
         `${API_BASE_URL}/ingest/validate-path?file_path=${encodeURIComponent(
           path
         )}`
       );
-      const data = await response.json();
+      const data = (await response.json()) as Partial<FileInfo> & {error?: string};
 
-      if (data.valid) {
-        setFileInfo(data);
+      if (
+        generation !== validationGenerationRef.current ||
+        path !== selectedFilePathRef.current
+      ) {
+        return;
+      }
+
+      if (response.ok && isCompleteFileInfo(data)) {
+        setValidationState({
+          status: "valid",
+          filePath: path,
+          fileInfo: data,
+        });
       } else {
-        alert(`Invalid file path: ${data.error}`);
-        setFileInfo(null);
+        const message = data.error || "The selected file did not pass validation.";
+        setValidationState({status: "failed", filePath: path, message});
+        alert(`Invalid file path: ${message}`);
       }
     } catch (error) {
       console.error("Validation failed:", error);
-      setFileInfo(null);
-      // Don't show alert for network errors, just log them
-      if (error instanceof TypeError && error.message.includes('fetch')) {
-        console.log("Backend server not running - validation skipped");
-      } else {
-        alert(
-          "Failed to validate file path. Please check the server connection."
-        );
+      const message = "Failed to validate the selected file. Check the server connection and retry.";
+      if (
+        generation === validationGenerationRef.current &&
+        path === selectedFilePathRef.current
+      ) {
+        setValidationState({status: "failed", filePath: path, message});
+        alert(message);
       }
     } finally {
-      setIsValidating(false);
+      if (generation === validationGenerationRef.current) {
+        setIsValidating(false);
+      }
     }
   }, [demoMode, filePath]);
 
@@ -359,8 +409,10 @@ export default function UploadPage() {
   }, [demoMode, filePath, validateFilePath]);
 
   const handleFilePathChange = (path: string) => {
+    validationGenerationRef.current += 1;
+    selectedFilePathRef.current = path;
     setFilePath(path);
-    setFileInfo(null);
+    setValidationState({status: "missing", filePath: path});
   };
 
   const handleSelectFile = async () => {
@@ -370,8 +422,10 @@ export default function UploadPage() {
     if (window.electronAPI) {
       const selectedPath = await window.electronAPI.selectFile();
       if (selectedPath) {
+        validationGenerationRef.current += 1;
+        selectedFilePathRef.current = selectedPath;
         setFilePath(selectedPath);
-        setFileInfo(null);
+        setValidationState({status: "missing", filePath: selectedPath});
         // Automatically validate the selected file
         await validateFilePath(selectedPath);
       }
@@ -389,9 +443,13 @@ export default function UploadPage() {
       return;
     }
 
-    // If validation failed due to network issues, allow proceeding anyway
-    if (fileInfo && !fileInfo.valid) {
-      alert("Please fix the file path before proceeding.");
+    if (
+      validationState.status !== "valid" ||
+      validationState.filePath !== filePath ||
+      !isCompleteFileInfo(validationState.fileInfo) ||
+      validationState.fileInfo.file_path !== filePath
+    ) {
+      alert("Validate the selected file successfully before starting analysis.");
       return;
     }
 
@@ -582,19 +640,34 @@ export default function UploadPage() {
                       </div>
                     )}
 
-                    {fileInfo && (
+                    {validationState.status === "valid" && (
                       <div className="bg-signal/10 border border-signal/30 rounded-lg p-4">
                         <div className="flex items-center space-x-2 text-signal mb-2">
                           <div className="w-2 h-2 bg-signal rounded-full"></div>
                           <span className="font-medium">File Validated</span>
                         </div>
                         <div className="text-sm text-signal space-y-1">
-                          <div>File Size: {fileInfo.file_size_gb} GB</div>
-                          <div>Path: {fileInfo.file_path}</div>
+                           <div>File Size: {validationState.fileInfo.file_size_gb} GB</div>
+                           <div>Path: {validationState.fileInfo.file_path}</div>
                           <div>
-                            Readable: {fileInfo.readable ? "Yes" : "No"}
+                             Readable: {validationState.fileInfo.readable ? "Yes" : "No"}
                           </div>
                         </div>
+                      </div>
+                    )}
+
+                    {validationState.status === "failed" && (
+                      <div role="alert" className="bg-destructive/10 border border-destructive/30 rounded-lg p-4 text-destructive">
+                        <div className="font-medium">File validation failed</div>
+                        <div className="text-sm mt-1">{validationState.message}</div>
+                        <Button
+                          variant="outline"
+                          className="mt-3"
+                          onClick={() => validateFilePath(validationState.filePath)}
+                          disabled={isValidating}
+                        >
+                          Retry validation
+                        </Button>
                       </div>
                     )}
 
@@ -603,7 +676,11 @@ export default function UploadPage() {
                         variant="signal"
                         size="lg"
                         onClick={handleStartAnalysis}
-                        disabled={isAnalyzing || (fileInfo?.valid === false)}
+                        disabled={
+                          isAnalyzing ||
+                          validationState.status !== "valid" ||
+                          validationState.filePath !== filePath
+                        }
                       >
                         {isAnalyzing ? "Processing..." : "Start Analysis"}
                       </Button>

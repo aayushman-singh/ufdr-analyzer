@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -15,10 +16,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+import release
+
 
 ROOT = Path(__file__).resolve().parents[1]
 AUTHORIZED_LIVE_ORIGIN = "https://citespan.169.58.64.150.nip.io"
 EXTERNAL_PROOF_ROOT = Path.home() / ".citespan" / "release-proof"
+PROJECT_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
+PYTHON_PLAYWRIGHT_VERSION = "1.55.0"
 PLAYWRIGHT_BROWSERS_PATH = ROOT / ".venv" / "playwright-browsers"
 CANONICAL_DEMO_RUN_ID = "11111111-1111-4111-8111-111111111111"
 CANONICAL_DEMO_ARTIFACT_ROW_ID = "22222222-2222-4222-8222-222222222222"
@@ -61,6 +66,11 @@ class LiveUrlValidationError(ValueError):
     """The verifier target is outside the authorized live origin."""
 
 
+def _validate_host_process_contract() -> dict[str, object]:
+    """Use the release guard before the browser touches the deployed product."""
+    return release._validate_host_process_evidence()
+
+
 def _validate_live_url(value: object) -> str:
     """Require the exact authorized HTTPS origin and canonical root path."""
     if not isinstance(value, str):
@@ -83,6 +93,36 @@ def _validate_live_url(value: object) -> str:
     ):
         raise LiveUrlValidationError("--url must be the authorized CiteSpan HTTPS origin")
     return AUTHORIZED_LIVE_ORIGIN
+
+
+def _require_project_python() -> None:
+    expected = PROJECT_PYTHON.resolve()
+    try:
+        actual = Path(sys.executable).resolve()
+    except OSError as exc:
+        raise RuntimeError(
+            "live verification requires the project virtual-environment Python"
+        ) from exc
+    if actual != expected:
+        raise RuntimeError(
+            "live verification must use the project virtual-environment Python: "
+            f"{expected}"
+        )
+
+
+def _require_python_playwright_version() -> None:
+    try:
+        actual = importlib.metadata.version("playwright")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise RuntimeError(
+            "live verification requires Python Playwright "
+            f"{PYTHON_PLAYWRIGHT_VERSION} in the project virtual environment"
+        ) from exc
+    if actual != PYTHON_PLAYWRIGHT_VERSION:
+        raise RuntimeError(
+            "live verification requires Python Playwright "
+            f"{PYTHON_PLAYWRIGHT_VERSION}, found {actual}"
+        )
 
 
 def _canonical_content_digest(value: str) -> str:
@@ -421,6 +461,8 @@ def _run_browser_flow(playwright, live_url: str, run_id: str, question: str, out
 
 
 def main() -> int:
+    _require_project_python()
+    _require_python_playwright_version()
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default=os.environ.get("CITESPAN_URL", AUTHORIZED_LIVE_ORIGIN))
     parser.add_argument("--run-id", default=os.environ.get("CITESPAN_DEMO_RUN_ID"))
@@ -439,6 +481,7 @@ def main() -> int:
     if not args.deployment_id:
         raise ValueError("--deployment-id must identify the observed deployment")
     _assert_exported_routes_use_trailing_slash()
+    _validate_host_process_contract()
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:

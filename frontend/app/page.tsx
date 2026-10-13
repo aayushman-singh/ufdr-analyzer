@@ -52,7 +52,8 @@ export default function Home() {
        <div className="max-w-7xl py-16 px-14 mx-auto w-full">
       <h2 className="text-3xl font-light text-foreground mb-2">Key Features</h2>
       <p className="text-muted-foreground font-light mb-8">
-        Transform your data background with any file formats.
+        Query the canonical synthetic sample in natural language and trace each
+        result to its source row and evidence span.
       </p>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -96,12 +97,12 @@ export default function Home() {
         >
           <div className="max-w-lg">
             <h3 className="text-left text-base md:text-xl lg:text-3xl font-semibold text-foreground">
-              Advanced Analytics &amp; Reporting
+              Deterministic demo planner
             </h3>
             <p className="mt-4 text-left text-base text-muted-foreground">
-              Get interactive timelines, visual link analysis, and automated
-                  reports out of the box. Identify key entities, relationships,
-                  and patterns effortlessly to build stronger cases.
+              The hosted planner is deterministic, not a live large language
+              model. The demonstrated task is natural-language querying with
+              citations tied to evidence spans.
             </p>
           </div>
           <img
@@ -146,7 +147,7 @@ export default function Home() {
                 <div className="bg-surface-1 rounded-lg p-4">
                   <p className="text-sm text-muted-foreground mb-2">Query:</p>
                   <p className="text-foreground font-mono text-sm">
-                    &ldquo;Generate timeline of all communication with contact &apos;John Smith&apos;&rdquo;
+                    &ldquo;Show bank transfers mentioned in the synthetic sample&rdquo;
                   </p>
                 </div>
               </div>

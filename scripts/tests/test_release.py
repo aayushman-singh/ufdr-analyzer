@@ -1,16 +1,22 @@
 import base64
 import json
+import ctypes
 import errno
 import stat
 import hashlib
 import os
+import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import io
+import time
+import uuid
 from pathlib import Path
 from pathlib import PurePosixPath
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -21,6 +27,8 @@ import release
 
 ROOT = Path(__file__).resolve().parents[2]
 PYTHON = str(ROOT / ".venv" / "Scripts" / "python.exe")
+_BASH_FIXTURE_ROOT = None
+_NATIVE_FIXTURE_ROOT = None
 EXPECTED_COMMIT = release._git("rev-parse", "HEAD")
 SYNTHETIC_OPENROUTER_TOKEN = "sk-or-v1-" + ("1" * 20)
 SYNTHETIC_OPENROUTER_SUFFIX = "1" * 20
@@ -77,61 +85,567 @@ def test_origin_validation_failure_does_not_include_the_remote_value():
 
 
 def _git_bash_executable() -> Path:
-    """Resolve Bash without assuming a host install path."""
-    candidates = []
-    for name in ("bash.exe", "bash"):
-        resolved = shutil.which(name)
-        if resolved:
-            candidates.append(Path(resolved).resolve())
-    git = shutil.which("git.exe") or shutil.which("git")
-    if git:
-        git_path = Path(git).resolve()
-        candidates.extend(
-            [
-                git_path.parent.parent / "usr" / "bin" / "bash.exe",
-                Path(subprocess.check_output([str(git_path), "--exec-path"], text=True).strip()).parent / "bash.exe",
-            ]
+    """Resolve the Bash installed with the selected Git executable."""
+    git_value = shutil.which("git.exe") or shutil.which("git")
+    if not git_value:
+        raise RuntimeError("supported Git Bash executable is not available: Git executable is not installed")
+
+    git_path = Path(git_value).resolve()
+    git_root = git_path.parent.parent
+    candidate = git_root / "usr" / "bin" / "bash.exe"
+    if not candidate.is_file():
+        raise RuntimeError(
+            "supported Git Bash executable is not available: "
+            f"Git executable={git_path} expected Bash={candidate}"
         )
-    for candidate in candidates:
-        if not candidate.is_file() or "WindowsApps" in str(candidate):
-            continue
+
+    try:
         probe = subprocess.run(
             [
                 str(candidate),
                 "-lc",
-                "test -r \"$(cygpath -w \"$1\")\"",
+                "set -Eeuo pipefail; command -v cygpath >/dev/null; test -r \"$(cygpath -w \"$1\")\"",
                 "bash",
                 str(Path(tempfile.gettempdir()).resolve()),
             ],
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
-        if probe.returncode == 0:
-            return candidate
-    raise RuntimeError("supported Git Bash executable is not available")
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "supported Git Bash executable capability check timed out: "
+            f"Git executable={git_path} Bash={candidate} timeout={exc.timeout}s"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            "supported Git Bash executable could not start capability check: "
+            f"Git executable={git_path} Bash={candidate} error={exc}"
+        ) from exc
+    if probe.returncode != 0:
+        raise RuntimeError(
+            "supported Git Bash executable failed capability check: "
+            f"Git executable={git_path} Bash={candidate} returncode={probe.returncode} "
+            f"stdout={probe.stdout[-2000:]} stderr={probe.stderr[-2000:]}"
+        )
+    return candidate
+
+
+def _windows_creation_token(pid):
+    class FileTime(ctypes.Structure):
+        _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetProcessTimes.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+    ]
+    kernel32.GetProcessTimes.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.OpenProcess(0x1000, 0, pid)
+    if not handle:
+        raise RuntimeError(
+            f"exact Bash fixture identity read failed for pid {pid}: WinError {ctypes.get_last_error()}"
+        )
+    creation = FileTime()
+    exit_time = FileTime()
+    kernel_time = FileTime()
+    user_time = FileTime()
+    try:
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        ):
+            raise RuntimeError(
+                f"exact Bash fixture identity read failed for pid {pid}: WinError {ctypes.get_last_error()}"
+            )
+        return str((creation.high << 32) | creation.low)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _windows_current_working_directory(pid):
+    if os.name != "nt":
+        raise RuntimeError("Windows current-directory lookup requested on a non-Windows host")
+
+    class ProcessBasicInformation(ctypes.Structure):
+        _fields_ = [("exit_status", ctypes.c_void_p), ("peb", ctypes.c_void_p), ("affinity", ctypes.c_void_p), ("base_priority", ctypes.c_long), ("process_id", ctypes.c_void_p), ("parent_process_id", ctypes.c_void_p)]
+
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [("length", ctypes.c_ushort), ("maximum_length", ctypes.c_ushort), ("buffer", ctypes.c_void_p)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.ReadProcessMemory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    kernel32.ReadProcessMemory.restype = ctypes.c_int
+    kernel32.DuplicateHandle.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.DuplicateHandle.restype = ctypes.c_int
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.GetFinalPathNameByHandleW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32]
+    kernel32.GetFinalPathNameByHandleW.restype = ctypes.c_uint32
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    ntdll.NtQueryInformationProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
+    ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+    process = kernel32.OpenProcess(0x1050, 0, pid)
+    if not process:
+        raise RuntimeError(f"actual current cwd read failed for pid {pid}: OpenProcess WinError {ctypes.get_last_error()}")
+
+    def read(address, target):
+        count = ctypes.c_size_t()
+        if not kernel32.ReadProcessMemory(process, ctypes.c_void_p(address), ctypes.byref(target), ctypes.sizeof(target), ctypes.byref(count)):
+            raise RuntimeError(f"actual current cwd read failed for pid {pid}: ReadProcessMemory WinError {ctypes.get_last_error()}")
+
+    try:
+        basic = ProcessBasicInformation()
+        returned = ctypes.c_ulong()
+        status = ntdll.NtQueryInformationProcess(process, 0, ctypes.byref(basic), ctypes.sizeof(basic), ctypes.byref(returned))
+        if status != 0 or not basic.peb:
+            raise RuntimeError(f"actual current cwd read failed for pid {pid}: NtQueryInformationProcess status={status}")
+        pointer_type = ctypes.c_uint64 if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_uint32
+        parameters = pointer_type()
+        read(int(basic.peb) + (0x20 if ctypes.sizeof(ctypes.c_void_p) == 8 else 0x10), parameters)
+        if not parameters.value:
+            raise RuntimeError(f"actual current cwd read failed for pid {pid}: process parameters are unavailable")
+        directory = UnicodeString()
+        read(int(parameters.value) + (0x38 if ctypes.sizeof(ctypes.c_void_p) == 8 else 0x24), directory)
+        if not directory.buffer or not directory.length:
+            raise RuntimeError(f"actual current cwd read failed for pid {pid}: current directory path is unavailable")
+        remote_handle = ctypes.c_void_p()
+        read(int(parameters.value) + (0x48 if ctypes.sizeof(ctypes.c_void_p) == 8 else 0x2C), remote_handle)
+        if not remote_handle.value:
+            raise RuntimeError(f"actual current cwd read failed for pid {pid}: current directory handle is unavailable")
+        duplicated = ctypes.c_void_p()
+        if not kernel32.DuplicateHandle(process, remote_handle, kernel32.GetCurrentProcess(), ctypes.byref(duplicated), 0, 0, 2):
+            raise RuntimeError(f"actual current cwd read failed for pid {pid}: DuplicateHandle WinError {ctypes.get_last_error()}")
+        try:
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = kernel32.GetFinalPathNameByHandleW(duplicated, buffer, len(buffer), 0)
+            if not length or length >= len(buffer):
+                raise RuntimeError(f"actual current cwd read failed for pid {pid}: GetFinalPathNameByHandleW WinError {ctypes.get_last_error()}")
+            value = buffer.value
+            return value[4:] if value.startswith("\\\\?\\") else value
+        finally:
+            kernel32.CloseHandle(duplicated)
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def _bash_process_metadata(pid):
+    if os.name != "nt":
+        proc_root = Path("/proc") / str(pid)
+        fields = (proc_root / "stat").read_text(encoding="utf-8").split()
+        return {
+            "pid": pid,
+            "parent_pid": int(fields[3]),
+            "creation": fields[21],
+            "executable": str((proc_root / "exe").resolve()),
+            "command": (proc_root / "cmdline").read_bytes().replace(b"\x00", b" ").decode(errors="replace").strip(),
+            "cwd": str((proc_root / "cwd").resolve()),
+        }
+    command = (
+        "$p = Get-CimInstance Win32_Process -Filter 'ProcessId = "
+        f"{pid}'; if ($null -eq $p) {{ exit 3 }}; $p | Select-Object "
+        "ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress"
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Bash fixture identity lookup failed for pid {pid}: rc={result.returncode} "
+            f"stdout={result.stdout[-2000:]} stderr={result.stderr[-2000:]}"
+        )
+    value = json.loads(result.stdout)
+    return {
+        "pid": int(value["ProcessId"]),
+        "parent_pid": int(value["ParentProcessId"]),
+        "creation": _windows_creation_token(pid),
+        "executable": str(value.get("ExecutablePath") or ""),
+        "command": str(value.get("CommandLine") or ""),
+        "cwd": _windows_current_working_directory(pid),
+    }
+
+
+def _windows_command_line_argv(command):
+    if os.name != "nt":
+        raise RuntimeError("Windows command-line parsing requested on a non-Windows host")
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32.CommandLineToArgvW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    count = ctypes.c_int()
+    values = shell32.CommandLineToArgvW(command, ctypes.byref(count))
+    if not values:
+        raise RuntimeError(f"Windows command-line parsing failed: WinError {ctypes.get_last_error()}")
+    try:
+        return [values[index] for index in range(count.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(values)
+
+
+def _bash_pid_exists(pid):
+    if os.name != "nt":
+        return (Path("/proc") / str(pid)).exists()
+    command = f"$p = Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}'; if ($null -eq $p) {{ exit 3 }}"
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode == 3:
+        return False
+    raise RuntimeError(
+        f"Bash fixture existence lookup failed for pid {pid}: rc={result.returncode} "
+        f"stdout={result.stdout[-2000:]} stderr={result.stderr[-2000:]}"
+    )
+
+
+def _bash_process_tree(root_pid, *, terminal_pids=None):
+    terminal_pids = set(terminal_pids or ())
+    if os.name == "nt":
+        command = (
+            "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,"
+            "ExecutablePath,CommandLine | ConvertTo-Json -Compress"
+        )
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Bash fixture tree lookup failed: rc={result.returncode} stdout={result.stdout[-2000:]} "
+                f"stderr={result.stderr[-2000:]}"
+            )
+        raw = json.loads(result.stdout)
+        rows = raw if isinstance(raw, list) else [raw]
+        process_graph = {}
+        for row in rows:
+            if row.get("ProcessId") is None:
+                continue
+            pid = int(row["ProcessId"])
+            process_graph[pid] = {
+                "pid": pid,
+                "parent_pid": int(row["ParentProcessId"]),
+                "executable": str(row.get("ExecutablePath") or ""),
+                "command": str(row.get("CommandLine") or ""),
+            }
+        selected = []
+        pending = [root_pid]
+        while pending:
+            parent_pid = pending.pop()
+            current = process_graph.get(parent_pid)
+            if current is None:
+                raise RuntimeError(
+                    f"Bash fixture tree lookup failed: selected pid {parent_pid} is missing from the parent graph"
+                )
+            selected.append(current)
+            pending.extend(
+                item["pid"] for item in process_graph.values() if item["parent_pid"] == parent_pid
+            )
+        metadata = {}
+        for item in selected:
+            try:
+                metadata[item["pid"]] = {
+                    **item,
+                    "cwd": _windows_current_working_directory(item["pid"]),
+                    "creation": _windows_creation_token(item["pid"]),
+                }
+            except RuntimeError:
+                if item["pid"] in terminal_pids:
+                    continue
+                raise
+    else:
+        process_graph = {}
+        for entry in Path("/proc").iterdir():
+            if entry.name.isdigit():
+                try:
+                    pid = int(entry.name)
+                    stat_fields = (entry / "stat").read_text(encoding="utf-8").split()
+                    command = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode(errors="replace").strip()
+                    process_graph[pid] = {
+                        "pid": pid,
+                        "parent_pid": int(stat_fields[3]),
+                        "executable": str((entry / "exe").resolve()),
+                        "command": command,
+                    }
+                except (FileNotFoundError, OSError, ValueError):
+                    continue
+        selected = []
+        pending = [root_pid]
+        while pending:
+            parent_pid = pending.pop()
+            current = process_graph.get(parent_pid)
+            if current is None:
+                raise RuntimeError(
+                    f"Bash fixture tree lookup failed: selected pid {parent_pid} is missing from the parent graph"
+                )
+            selected.append(current)
+            pending.extend(
+                item["pid"] for item in process_graph.values() if item["parent_pid"] == parent_pid
+            )
+        metadata = {item["pid"]: _bash_process_metadata(item["pid"]) for item in selected}
+    tree = []
+    pending = [root_pid]
+    while pending:
+        parent = pending.pop()
+        current = metadata[parent]
+        current = dict(current)
+        tree.append(current)
+        pending.extend(item["pid"] for item in metadata.values() if item["parent_pid"] == parent)
+    return tree
+
+
+def _bash_canonical_path(path):
+    value = str(path or "")
+    if not value:
+        return ""
+    return os.path.normcase(os.path.normpath(value)).casefold() if os.name == "nt" else value
+
+
+def _bash_command_contains_path(command, path):
+    normalized_command = str(command or "").replace("/", "\\").casefold()
+    normalized_path = _bash_canonical_path(path).replace("/", "\\")
+    return re.search(
+        rf"(?<![a-z0-9_.\\/-]){re.escape(normalized_path)}(?![a-z0-9_.\\/-])",
+        normalized_command,
+    ) is not None
+
+
+def _assert_owned_bash_tree(process):
+    owner = process._citespan_bash_owner
+    terminal_pids = owner.setdefault("terminal_pids", set())
+    for item in owner["tree"]:
+        if item["pid"] == process.pid or item["pid"] in terminal_pids:
+            continue
+        try:
+            _bash_process_metadata(item["pid"])
+        except RuntimeError as exc:
+            if ("rc=3" in str(exc) or "No such file or directory" in str(exc)) or not _bash_pid_exists(item["pid"]):
+                terminal_pids.add(item["pid"])
+                continue
+            raise
+    current = _bash_process_tree(process.pid, terminal_pids=terminal_pids)
+    if not current or current[0]["pid"] != process.pid:
+        raise RuntimeError(f"owned Bash fixture cleanup denied: root {process.pid} is not current")
+    recorded = {item["pid"]: item for item in owner["tree"]}
+    for item in current:
+        expected = recorded.get(item["pid"])
+        if expected is None or item["creation"] != expected["creation"]:
+            raise RuntimeError(
+                f"owned Bash fixture cleanup denied: unrecorded or changed process identity current={item}"
+            )
+        if not item["executable"]:
+            raise RuntimeError(f"owned Bash fixture cleanup denied: executable is unavailable current={item}")
+        if not item["cwd"]:
+            raise RuntimeError(f"owned Bash fixture cleanup denied: worktree is unavailable current={item}")
+        if _bash_canonical_path(item["cwd"]) != owner["cwd"]:
+            raise RuntimeError(f"owned Bash fixture cleanup denied: worktree changed current={item}")
+        if not item["command"]:
+            raise RuntimeError(f"owned Bash fixture cleanup denied: missing command identity current={item}")
+    root_argv = _windows_command_line_argv(current[0]["command"]) if os.name == "nt" else current[0]["command"].split()
+    expected_root_tail = owner["wrapper_argv"]
+    if os.name == "nt":
+        root_argv = root_argv[1:]
+    if root_argv[-len(expected_root_tail) :] != expected_root_tail:
+        raise RuntimeError(
+            f"owned Bash fixture cleanup denied: root command changed expected={owner['argv']} current={current[0]}"
+        )
+    if not current[0]["cwd"]:
+        raise RuntimeError(f"owned Bash fixture cleanup denied: root worktree is unavailable current={current[0]}")
+    if os.name == "nt" and owner["marker"] not in current[0]["command"]:
+        raise RuntimeError(f"owned Bash fixture cleanup denied: owner marker is absent current={current[0]}")
+    return current
+
+
+def _assert_bash_identities_stopped(recorded):
+    for item in recorded:
+        try:
+            current = _bash_process_metadata(item["pid"])
+        except RuntimeError as exc:
+            if "rc=3" in str(exc) or "No such file or directory" in str(exc):
+                continue
+            raise RuntimeError(f"owned Bash fixture cleanup failed: cannot prove stopped identity {item}: {exc}") from exc
+        if current["creation"] == item["creation"]:
+            raise RuntimeError(f"owned Bash fixture cleanup failed: recorded identity remains active: {current}")
+        raise RuntimeError(f"owned Bash fixture cleanup failed: PID was reused: recorded={item} current={current}")
+
+
+def _run_owned_bash_fixture(argv, *, cwd, env, timeout=20):
+    """Run one fixture process with a proved, fully reaped owned tree."""
+    stdout_fd, stdout_name = tempfile.mkstemp(prefix="citespan-bash-", suffix=".stdout.log")
+    stderr_fd, stderr_name = tempfile.mkstemp(prefix="citespan-bash-", suffix=".stderr.log")
+    os.close(stdout_fd)
+    os.close(stderr_fd)
+    stdout_path = Path(stdout_name)
+    stderr_path = Path(stderr_name)
+    stdout_file = stdout_path.open("wb")
+    stderr_file = stderr_path.open("wb")
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+    process = None
+    launch_env = env.copy()
+    marker = uuid.uuid4().hex
+    launch_env["CITESPAN_TEST_PROCESS_OWNER"] = marker
+    wrapper_fd, wrapper_name = tempfile.mkstemp(prefix="citespan-bash-wrapper-", suffix=".sh")
+    os.close(wrapper_fd)
+    wrapper_path = Path(wrapper_name)
+    wrapper_path.write_text(
+        "#!/usr/bin/env bash\n"
+        "owner_marker=\"$1\"; shift\n"
+        "if [[ -z \"$owner_marker\" || \"$owner_marker\" != \"$CITESPAN_TEST_PROCESS_OWNER\" ]]; then exit 97; fi\n"
+        "IFS= read -r release || exit 98\n"
+        "[[ \"$release\" == release ]] || exit 99\n"
+        "\"$@\" & child=$!\n"
+        "wait \"$child\"\n"
+        "status=$?\n"
+        "exit \"$status\"\n",
+        encoding="utf-8",
+    )
+    launch_argv = [str(item) for item in argv]
+    expected_cwd = _bash_canonical_path(Path(cwd).resolve())
+    if os.name == "nt":
+        launch_argv = [launch_argv[0], _bash_path(wrapper_path), marker, *launch_argv]
+    else:
+        launch_argv = [launch_argv[0], str(wrapper_path), marker, *launch_argv]
+    try:
+        process = subprocess.Popen(
+            launch_argv,
+            cwd=cwd,
+            env=launch_env,
+            stdin=subprocess.PIPE,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            creationflags=creationflags,
+            start_new_session=os.name != "nt",
+        )
+        stdout_file.close()
+        stderr_file.close()
+        tree = _bash_process_tree(process.pid)
+        if not tree or tree[0]["pid"] != process.pid:
+            raise RuntimeError(f"owned Bash fixture launch failed: root identity was not captured pid={process.pid}")
+        process._citespan_bash_owner = {
+            "argv": [str(item) for item in argv],
+            "cwd": expected_cwd,
+            "marker": marker,
+            "wrapper": _bash_path(wrapper_path) if os.name == "nt" else str(wrapper_path),
+            "wrapper_argv": [
+                _bash_path(wrapper_path) if os.name == "nt" else str(wrapper_path),
+                marker,
+                *[str(item) for item in argv],
+            ],
+            "tree": tree,
+        }
+        _assert_owned_bash_tree(process)
+        process.stdin.write(b"release\n")
+        process.stdin.flush()
+        process._citespan_bash_owner["released"] = True
+        process._citespan_bash_owner["tree"] = _bash_process_tree(
+            process.pid, terminal_pids=process._citespan_bash_owner["terminal_pids"]
+        )
+        _assert_owned_bash_tree(process)
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            _assert_owned_bash_tree(process)
+            if os.name == "nt":
+                kill = subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                if kill.returncode != 0:
+                    raise RuntimeError(
+                        f"owned Bash fixture cleanup failed after full tree proof: pid={process.pid} "
+                        f"taskkill_rc={kill.returncode} stdout={kill.stdout[-2000:]} "
+                        f"stderr={kill.stderr[-2000:]} stdout_path={stdout_path} stderr_path={stderr_path}"
+                    ) from exc
+            else:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired as cleanup_exc:
+                raise RuntimeError(
+                    f"owned Bash fixture did not terminate: pid={process.pid} "
+                    f"stdout_path={stdout_path} stderr_path={stderr_path}"
+                ) from cleanup_exc
+            _assert_bash_identities_stopped(process._citespan_bash_owner["tree"])
+            stdout = stdout_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+            stderr = stderr_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+            raise RuntimeError(
+                f"owned Bash fixture timed out: pid={process.pid} timeout={timeout}s "
+                f"stdout={stdout} stderr={stderr} stdout_path={stdout_path} stderr_path={stderr_path}"
+            ) from exc
+        _assert_bash_identities_stopped(process._citespan_bash_owner["tree"])
+        stdout = stdout_path.read_text(encoding="utf-8", errors="replace")
+        stderr = stderr_path.read_text(encoding="utf-8", errors="replace")
+        stdout_path.unlink()
+        stderr_path.unlink()
+        return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+    except Exception as exc:
+        if process is not None and process.poll() is None:
+            raise RuntimeError(
+                f"owned Bash fixture failed with live process; output paths retained: "
+                f"stdout_path={stdout_path} stderr_path={stderr_path}; error={exc}"
+            ) from exc
+        cleanup_errors = []
+        for path in (stdout_path, stderr_path):
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")[-4000:]
+            except OSError as cleanup_error:
+                cleanup_errors.append(f"path={path} read_error={cleanup_error}")
+            else:
+                cleanup_errors.append(f"path={path} retained_output={content}")
+        raise RuntimeError(
+            f"owned Bash fixture failed: primary={exc}; output cleanup errors={'; '.join(cleanup_errors)}; "
+            f"stdout_path_retained={stdout_path} stderr_path_retained={stderr_path}"
+        ) from exc
+    finally:
+        if not stdout_file.closed:
+            stdout_file.close()
+        if not stderr_file.closed:
+            stderr_file.close()
+        if process is not None and process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        if process is None or process.poll() is not None:
+            wrapper_path.unlink(missing_ok=True)
 
 
 def _bash_path(path: Path) -> str:
     """Convert a native path only when it enters a Bash command."""
-    bash_tmp_root_result = subprocess.run(
-        [
-            str(_git_bash_executable()),
-            "-lc",
-            "cygpath -w /tmp",
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    bash_tmp_root = Path(bash_tmp_root_result.stdout.strip()).resolve()
     resolved_path = path.resolve()
-    if resolved_path.is_relative_to(bash_tmp_root):
-        relative = resolved_path.relative_to(bash_tmp_root)
-        return PurePosixPath("/tmp", *relative.parts).as_posix()
-
+    if _NATIVE_FIXTURE_ROOT is not None:
+        fixture_root = _NATIVE_FIXTURE_ROOT
+        if resolved_path == fixture_root or fixture_root in resolved_path.parents:
+            relative_path = resolved_path.relative_to(fixture_root)
+            return PurePosixPath(
+                _BASH_FIXTURE_ROOT, *relative_path.parts
+            ).as_posix()
     result = subprocess.run(
-        [str(_git_bash_executable()), "-lc", 'cygpath -u "$1"', "bash", str(path.resolve())],
+        [str(_git_bash_executable()), "-lc", 'cygpath -u "$1"', "bash", str(resolved_path)],
         capture_output=True,
         text=True,
         check=True,
@@ -139,41 +653,71 @@ def _bash_path(path: Path) -> str:
     return result.stdout.strip()
 
 
-def _bash_writable_temp_root() -> Path:
-    """Return one verified fixture root derived from the native temp directory."""
-    root = Path(tempfile.gettempdir()).resolve() / "citespan-release-test-fixtures"
-    if root == ROOT or ROOT in root.parents:
-        raise RuntimeError(f"fixture root is inside the source checkout: {root}")
+def _native_fixture_path(bash_path: str) -> Path:
+    """Map a Bash fixture path through the verified session root only."""
+    if _BASH_FIXTURE_ROOT is None or _NATIVE_FIXTURE_ROOT is None:
+        raise RuntimeError("fixture root is not initialized")
+    bash_root = PurePosixPath(_BASH_FIXTURE_ROOT)
+    candidate = PurePosixPath(bash_path)
     try:
-        root.mkdir(parents=True, exist_ok=True)
-        probe = Path(tempfile.mkdtemp(prefix="citespan-bash-probe-", dir=root))
-        try:
-            probe_bash_path = _bash_path(probe)
-            result = subprocess.run(
-                [
-                    str(_git_bash_executable()),
-                    "-lc",
-                    'touch "$1/.citespan-write-probe" && rm "$1/.citespan-write-probe"',
-                    "bash",
-                    probe_bash_path,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"Git Bash access failed for {probe}: {result.stderr.strip()}"
-                )
-        finally:
-            _remove_fixture_path(probe, "fixture probe")
-            if probe.exists():
-                raise RuntimeError(f"fixture probe cleanup failed: {probe}")
-    except Exception as exc:
-        if isinstance(exc, RuntimeError):
-            raise
-        raise RuntimeError(f"fixture root operation failed for {root}: {exc}") from exc
-    return root
+        relative_path = candidate.relative_to(bash_root)
+    except ValueError as exc:
+        raise RuntimeError(f"fixture path escapes the verified root: {bash_path}") from exc
+    if any(part in {"", ".", ".."} for part in relative_path.parts):
+        raise RuntimeError(f"fixture path is not normalized: {bash_path}")
+    native_path = (_NATIVE_FIXTURE_ROOT / Path(*relative_path.parts)).resolve(strict=False)
+    if native_path != _NATIVE_FIXTURE_ROOT and _NATIVE_FIXTURE_ROOT not in native_path.parents:
+        raise RuntimeError(f"fixture path escapes the verified root: {bash_path}")
+    return native_path
+
+
+def _bash_writable_temp_root() -> Path:
+    """Return one stable fixture root created and verified by Git Bash."""
+    global _BASH_FIXTURE_ROOT, _NATIVE_FIXTURE_ROOT
+    if _NATIVE_FIXTURE_ROOT is not None:
+        return _NATIVE_FIXTURE_ROOT
+
+    bash = _git_bash_executable()
+    result = subprocess.run(
+        [
+            str(bash),
+            "-lc",
+            (
+                'set -Eeuo pipefail; '
+                'root="$(mktemp -d "/tmp/citespan-release-test-fixtures-XXXXXX")"; '
+                'test -d "$root"; '
+                'touch "$root/.citespan-write-probe"; '
+                'test -r "$root/.citespan-write-probe"; '
+                'rm "$root/.citespan-write-probe"; '
+                'printf "%s\\n" "$root"'
+            ),
+            "bash",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=5,
+    )
+    bash_root = result.stdout.strip()
+    if not bash_root.startswith("/tmp/citespan-release-test-fixtures-"):
+        raise RuntimeError(f"Git Bash returned an invalid fixture root: {bash_root!r}")
+
+    native_result = subprocess.run(
+        [str(bash), "-lc", 'cygpath -w "$1"', "bash", bash_root],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=5,
+    )
+    native_root = Path(native_result.stdout.strip()).resolve()
+    if native_root == ROOT or ROOT in native_root.parents:
+        raise RuntimeError(f"fixture root is inside the source checkout: {native_root}")
+    if not native_root.is_dir():
+        raise RuntimeError(f"Git Bash fixture root is not a directory: {native_root}")
+
+    _BASH_FIXTURE_ROOT = bash_root
+    _NATIVE_FIXTURE_ROOT = native_root
+    return native_root
 
 
 def _remove_fixture_path(path: Path, label: str) -> None:
@@ -237,10 +781,22 @@ def _remove_fixture_path(path: Path, label: str) -> None:
         raise RuntimeError(f"{label} cleanup failed: operation=rmtree path={path}: path remains")
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _fixture_session():
+    root = _bash_writable_temp_root()
+    try:
+        yield
+    finally:
+        try:
+            if root.exists():
+                _remove_fixture_path(root, "session fixture root")
+        except Exception as exc:
+            print(f"session fixture root cleanup failed: {exc}", file=sys.stderr, flush=True)
+
+
 @pytest.fixture
 def bash_tmp_path():
-    root = _bash_writable_temp_root()
-    path = Path(tempfile.mkdtemp(prefix="citespan-release-test-", dir=root))
+    path = Path(tempfile.mkdtemp(prefix="citespan-release-test-", dir=_bash_writable_temp_root()))
     try:
         yield path
     finally:
@@ -277,6 +833,7 @@ def _rollback_fixture_state(deploy_root: Path, caddy_root: Path) -> str:
     compose='docker compose --project-name citespan-candidate'
     recovery_log={_bash_path(deploy_root / "recovery.log")}
     phase_trace={_bash_path(deploy_root / "phase-trace.log")}
+    sanitize_probe_output() {{ printf '%s' "$1"; }}
     phase_failure() {{ printf 'phase=%s status=failure exit_code=%s\\n' "$1" "$2" >> "$phase_trace"; }}
     mkdir -p "$backup_dir"
     : > "$phase_trace"
@@ -454,6 +1011,292 @@ def valid_payload(**extra):
     }
     payload.update(extra)
     return payload
+
+
+def test_host_process_evidence_uses_only_the_fixed_private_directory(tmp_path, monkeypatch):
+    evidence_root = tmp_path / "host-process-evidence"
+    monkeypatch.setattr(release, "HOST_PROCESS_EVIDENCE_ROOT", evidence_root)
+
+    with pytest.raises(RuntimeError, match="host process evidence"):
+        release._validate_host_process_evidence()
+
+
+def test_host_process_evidence_rejects_malformed_historical_input(tmp_path, monkeypatch):
+    evidence_root = tmp_path / "host-process-evidence"
+    evidence_root.mkdir()
+    for filename in release.HOST_PROCESS_EVIDENCE_FILES:
+        (evidence_root / filename).write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(release, "HOST_PROCESS_EVIDENCE_ROOT", evidence_root)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"historical host process evidence invalid recorded-node-identities-942\.json: expected a non-empty list",
+    ):
+        release._validate_host_process_evidence()
+
+
+def _current_frontend_evidence(**overrides):
+    evidence = {
+        "product_frontend_processes": [],
+        "native_module_holders": [],
+        "read_errors": [],
+        "listening_ports": [],
+    }
+    evidence.update(overrides)
+    return evidence
+
+
+@pytest.mark.parametrize("field", ["read_errors", "listening_ports"])
+def test_current_frontend_observation_rejects_missing_measured_fields(field):
+    evidence = _current_frontend_evidence()
+    del evidence[field]
+
+    with pytest.raises(RuntimeError, match=rf"missing required measured fields=.*{field}"):
+        release._current_frontend_observation(evidence, "current-frontend-processes-1004.json")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("read_errors", None),
+        ("read_errors", [""]),
+        ("read_errors", [None]),
+        ("listening_ports", None),
+        ("listening_ports", [0]),
+        ("listening_ports", [-1]),
+        ("listening_ports", ["4100"]),
+        ("listening_ports", [True]),
+    ],
+)
+def test_current_frontend_observation_rejects_malformed_measured_fields(field, value):
+    with pytest.raises(RuntimeError, match=rf"{field}"):
+        release._current_frontend_observation(
+            _current_frontend_evidence(**{field: value}),
+            "current-frontend-processes-1004.json",
+        )
+
+
+def test_current_frontend_observation_accepts_explicit_empty_measurements():
+    assert release._current_frontend_observation(
+        _current_frontend_evidence(), "current-frontend-processes-1004.json"
+    ) == {"processes": [], "holders": [], "ports": []}
+
+
+def test_prepare_validates_host_process_evidence_before_release_side_effects(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        release,
+        "_validate_host_process_evidence",
+        lambda: (_ for _ in ()).throw(RuntimeError("host process evidence is missing")),
+    )
+    monkeypatch.setattr(release, "_provider_payload", lambda _payload: events.append("payload"))
+
+    with pytest.raises(RuntimeError, match="host process evidence"):
+        release._prepare(valid_payload())
+    assert events == []
+
+
+def test_execute_validates_host_process_evidence_before_deployment_side_effects(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        release,
+        "_validate_host_process_evidence",
+        lambda: (_ for _ in ()).throw(RuntimeError("host process evidence is missing")),
+    )
+    monkeypatch.setattr(release, "_provider_payload", lambda _payload: events.append("payload"))
+    monkeypatch.setattr(release, "_ssh", lambda _command: events.append("ssh"))
+
+    with pytest.raises(RuntimeError, match="host process evidence"):
+        release._execute(valid_payload())
+    assert events == []
+
+
+def test_native_fingerprint_ignores_access_time_only_changes(tmp_path):
+    path = tmp_path / "native.node"
+    path.write_bytes(b"native-bytes")
+    before = os.lstat(path)
+    preserved_fields = (
+        "st_mode",
+        "st_ino",
+        "st_dev",
+        "st_nlink",
+        "st_uid",
+        "st_gid",
+        "st_size",
+        "st_mtime",
+        "st_mtime_ns",
+        "st_ctime",
+        "st_ctime_ns",
+        "st_birthtime",
+        "st_birthtime_ns",
+    )
+    after = SimpleNamespace(
+        **{
+            field: getattr(before, field)
+            for field in preserved_fields
+            if hasattr(before, field)
+        },
+        st_atime=before.st_atime + 1,
+        st_atime_ns=before.st_atime_ns + 1_000_000_000,
+    )
+
+    assert release._native_fingerprint(path, before) == release._native_fingerprint(path, after)
+
+
+def test_native_release_uses_script_root_when_dependency_root_is_patched(tmp_path, monkeypatch):
+    native_path = tmp_path / release.HOST_NATIVE_MODULE
+    native_path.parent.mkdir(parents=True)
+    native_path.write_bytes(b"native-bytes")
+    monkeypatch.setattr(release, "SCRIPT_ROOT", tmp_path)
+    monkeypatch.setattr(release, "ROOT", tmp_path / "dependency-fixture")
+
+    assert release._prove_host_native_release() == {"state": "restored"}
+    assert native_path.read_bytes() == b"native-bytes"
+
+
+def test_prepare_rejects_pure_input_before_host_evidence(monkeypatch):
+    monkeypatch.setattr(
+        release,
+        "_validate_host_process_evidence",
+        lambda: (_ for _ in ()).throw(RuntimeError("evidence must not run")),
+    )
+
+    with pytest.raises(RuntimeError, match="literal credential"):
+        release._prepare(
+            {
+                **valid_payload(),
+                "environment": {"OPENROUTER_API_KEY": "literal-target-secret"},
+            }
+        )
+
+
+def test_historical_roles_use_measured_flags_paths_and_normalized_family():
+    native_path = release.HOST_NATIVE_MODULE.as_posix()
+    node_records = [
+        {"pid": pid, "creation": f"creation-{pid}", "previously_loaded_native_module": pid <= 29}
+        for pid in range(1, 117)
+    ]
+    lock_records = [
+        {
+            "pid": pid,
+            "creation": f"creation-{pid}",
+            "locked_module_loaded": pid <= 29,
+            "loaded_module_paths": [native_path] if pid <= 29 else [],
+        }
+        for pid in range(1, 117)
+    ]
+    family_records = [
+        {
+            "pid": pid,
+            "creation": f"creation-{pid}",
+            "family_relation": release.HISTORICAL_FAMILY_RELATION,
+            "role": "lightningcss_loader" if pid <= 29 else "related_test_family",
+        }
+        for pid in range(1, 117)
+    ]
+    family_records.extend(
+        {
+            "pid": pid,
+            "creation": f"creation-{pid}",
+            "family_relation": release.WRAPPER_FAMILY_RELATION,
+            "role": "related_test_family",
+        }
+        for pid in range(117, 146)
+    )
+
+    roles, _ = release._derive_historical_roles(node_records, lock_records, family_records)
+
+    assert {pid for (pid, _), record in roles.items() if record["role"] == "lightningcss_loader"} == set(range(1, 30))
+    assert sum(
+        record["family_relation"] == release.HISTORICAL_FAMILY_RELATION
+        for record in family_records
+    ) == 116
+    assert sum(
+        record["family_relation"] == release.WRAPPER_FAMILY_RELATION
+        for record in family_records
+    ) == 29
+
+
+def test_normalized_family_binding_returns_flat_current_identity_and_parent_evidence():
+    historical = {
+        "pid": 42,
+        "creation": "child-token",
+        "script_paths": [],
+        "argv_role": ["node", "postcss.js"],
+    }
+    parent_observations = [{"pid": 41, "state": "verified_absent_historical_parent"}]
+    current = {
+        "pid": 42,
+        "creation": "child-token",
+        "parent_pid": 41,
+        "cwd": "C:/work/frontend",
+        "executable": "C:/node.exe",
+        "argv": ["node", "postcss.js"],
+        "argv_sha256": "a" * 64,
+        "native_command_sha256": "b" * 64,
+        "module_paths": [],
+        "files": [],
+        "ports": [],
+        "parent_observations": parent_observations,
+        "role": "related_test_family",
+        "family_relation": release.HISTORICAL_FAMILY_RELATION,
+    }
+
+    [bound] = release._bind_normalized_family_records([historical], [current])
+
+    assert "current_observation" not in bound
+    assert bound["parent_observations"] == parent_observations
+    assert bound["parent_pid"] == 41
+    assert bound["current_modules"] == []
+
+
+def test_normalized_family_binding_rejects_missing_parent_evidence():
+    historical = {"pid": 42, "creation": "child-token"}
+    current = {
+        "pid": 42,
+        "creation": "child-token",
+        "parent_observations": [],
+    }
+
+    with pytest.raises(RuntimeError, match="no parent observations"):
+        release._bind_normalized_family_records([historical], [current])
+
+
+def test_historical_roles_reject_cross_source_role_disagreement():
+    node_records = [
+        {"pid": pid, "creation": f"creation-{pid}", "previously_loaded_native_module": pid == 1}
+        for pid in range(1, 117)
+    ]
+    lock_records = [
+        {
+            "pid": pid,
+            "creation": f"creation-{pid}",
+            "locked_module_loaded": pid == 1,
+            "loaded_module_paths": [release.HOST_NATIVE_MODULE.as_posix()] if pid == 1 else [],
+        }
+        for pid in range(1, 117)
+    ]
+    family_records = [
+        {
+            "pid": pid,
+            "creation": f"creation-{pid}",
+            "family_relation": release.HISTORICAL_FAMILY_RELATION,
+            "role": "related_test_family",
+        }
+        for pid in range(1, 117)
+    ]
+    family_records.extend(
+        {
+            "pid": pid,
+            "creation": f"creation-{pid}",
+            "family_relation": release.WRAPPER_FAMILY_RELATION,
+            "role": "related_test_family",
+        }
+        for pid in range(117, 146)
+    )
+
+    with pytest.raises(RuntimeError, match="loader role disagrees"):
+        release._derive_historical_roles(node_records, lock_records, family_records)
 
 
 @pytest.mark.parametrize("value", [release.AUTHORIZED_LIVE_ORIGIN, release.AUTHORIZED_LIVE_ORIGIN + "/"])
@@ -1173,12 +2016,13 @@ def test_execute_fails_closed_without_deployment_evidence():
             release._execute(valid_payload())
 
 
-def test_deployment_command_executes_checked_recovery_and_restores_prior_state(tmp_path):
+def test_deployment_command_executes_checked_recovery_and_restores_prior_state(bash_tmp_path):
     command = release._deployment_command(valid_payload())
     start = command.index("rollback() {")
     end = command.index("\ntrap rollback EXIT\n", start)
     rollback_function = command[start:end]
 
+    tmp_path = bash_tmp_path
     deploy_root = tmp_path / "deploy"
     caddy_root = tmp_path / "etc"
     bin_root = tmp_path / "bin"
@@ -1196,11 +2040,10 @@ def test_deployment_command_executes_checked_recovery_and_restores_prior_state(t
     call_log.touch()
     docker_stub = bin_root / "docker"
     docker_stub.write_text(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\n"
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\n"
+        "if [ \"$1\" = inspect ] && [ \"$2\" = --format ] && [ \"$4\" = candidate-static ]; then printf 'candidate-static\\t/candidate-static\\ttrue\\trunning\\n'; exit 0; fi\n"
         "case \"$*\" in\n"
         "  'info') exit 0;;\n"
-        "  'inspect candidate-static') exit 0;;\n"
-        "  'inspect -f {{.State.Running}} candidate-static') echo true;;\n"
         "  'stop candidate-static') exit 0;;\n"
         "  'rm candidate-static') exit 0;;\n"
         "  *' up -d '*) exit 1;;\n"
@@ -1239,7 +2082,10 @@ false
     )
 
     assert result.returncode == 70
-    assert "recovery incomplete" in result.stderr
+    recovery = (deploy_root / "recovery.log").read_text(encoding="utf-8")
+    failure_evidence = (deploy_root / "recovery.log.failure").read_text(encoding="utf-8")
+    assert "rollback result: incomplete" in recovery
+    assert "recovery incomplete" in failure_evidence
     assert (deploy_root / ".citespan-deployment.json").read_text() == '{"deployment_id":"citespan-previous"}\n'
     runtime_lines = (deploy_root / ".citespan-runtime.env").read_text().splitlines()
     runtime = dict(line.split("=", 1) for line in runtime_lines)
@@ -1262,13 +2108,250 @@ false
     assert any("compose" in call and "down --remove-orphans" in call for call in calls)
     assert calls.index("start previous-backend") < calls.index("start previous-static")
     assert calls.index("start previous-static") < next(i for i, call in enumerate(calls) if "down --remove-orphans" in call)
-    assert "inspect -f {{.State.Running}} candidate-static" in calls
+    assert any("inspect --format" in call and "candidate-static" in call for call in calls)
     assert calls.index("stop candidate-static") < calls.index("rm candidate-static")
-    assert "deployment failed at forced_failure" in result.stderr
-    assert "|| true" not in command
+    assert "deployment failed at forced_failure" in failure_evidence
+    assert failure_evidence.strip()
+    assert result.stdout == ""
+    assert result.stderr == ""
+    orphan_start = command.index("guarded_orphan_recovery")
+    orphan_command = command[orphan_start:]
+    assert "|| true" not in orphan_command
+    assert (
+        'if ps -eo pid=,ppid=,args= >"$process_rows_file" 2>&1; then\n'
+        "        process_query_status=0\n"
+        "    else\n"
+        "        process_query_status=$?"
+    ) in orphan_command
+    assert '[ "$process_query_status" -eq 0 ] ||' in orphan_command
     assert "docker volume rm" not in command
     assert "tar " not in command
     assert "recovery.log" in command
+
+
+def test_rollback_survives_closed_output_pipes_and_preserves_authoritative_state(bash_tmp_path):
+    command = release._deployment_command(valid_payload())
+    start = command.index("rollback() {")
+    end = command.index("\ntrap rollback EXIT\n", start)
+    rollback_function = command[start:end]
+    tmp_path = bash_tmp_path
+    deploy_root = tmp_path / "deploy"
+    caddy_root = tmp_path / "etc"
+    bin_root = tmp_path / "bin"
+    for path in (deploy_root, caddy_root, bin_root):
+        path.mkdir(parents=True)
+    (deploy_root / ".citespan-deployment.json").write_text("prior metadata\n", encoding="utf-8")
+    (deploy_root / ".citespan-demo-marker.json").write_text("prior marker\n", encoding="utf-8")
+    (deploy_root / ".citespan-runtime.env").write_text(_complete_runtime_fixture(), encoding="utf-8")
+    (deploy_root / ".citespan-authoritative-receipt.json").write_text("receipt\n", encoding="utf-8")
+    (deploy_root / "authoritative-volume.marker").write_text("volume\n", encoding="utf-8")
+    (caddy_root / "Caddyfile").write_text("previous-route\n", encoding="utf-8")
+    call_log = tmp_path / "calls.log"
+    call_log.touch()
+    docker_stub = bin_root / "docker"
+    docker_stub.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\n"
+        "if [ \"$1\" = inspect ] && [ \"$2\" = --format ] && [ \"$4\" = candidate-static ]; then if [ -f \"$CANDIDATE_REMOVED\" ]; then echo 'Error: No such object: candidate-static' >&2; exit 1; fi; printf 'candidate-static\\t/candidate-static\\ttrue\\trunning\\n'; exit 0; fi\n"
+        "case \"$*\" in\n"
+        "  'info') exit 0;;\n"
+        "  'stop candidate-static') exit 0;;\n"
+        "  'rm candidate-static') touch \"$CANDIDATE_REMOVED\";;\n"
+        "  'run '*) touch \"$CANDIDATE_STARTED\";;\n"
+        "  *'compose'*'down --remove-orphans'*) exit 0;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    docker_stub.chmod(0o755)
+    for name in ("caddy", "systemctl"):
+        stub = bin_root / name
+        stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        stub.chmod(0o755)
+
+    function = rollback_function.replace("/opt/citespan", _bash_path(deploy_root)).replace(
+        "/etc/caddy/Caddyfile", _bash_path(caddy_root / "Caddyfile")
+    )
+    script_path = tmp_path / "closed-pipes.sh"
+    script_path.write_text(
+        f"#!/usr/bin/env bash\nset -Eeuo pipefail\n{_rollback_fixture_state(deploy_root, caddy_root)}\n"
+        f"{function}\ntrap rollback EXIT\ndocker run -d --name candidate-static nginx:1.29-alpine\nsleep 1\nfalse\n",
+        encoding="utf-8",
+    )
+    process = subprocess.Popen(
+        [str(_git_bash_executable()), _bash_path(script_path)],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{_bash_path(bin_root)}:{os.environ['PATH']}",
+            "CALL_LOG": _bash_path(call_log),
+            "CANDIDATE_REMOVED": _bash_path(tmp_path / "candidate-removed"),
+            "CANDIDATE_STARTED": _bash_path(tmp_path / "candidate-started"),
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    candidate_started = tmp_path / "candidate-started"
+    deadline = time.monotonic() + 20
+    while not candidate_started.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert candidate_started.exists()
+    process.stdout.close()
+    process.stderr.close()
+    result_code = process.wait(timeout=20)
+
+    assert result_code == 1
+    recovery = (deploy_root / "recovery.log").read_text(encoding="utf-8")
+    assert "rollback result: complete" in recovery
+    assert "remove candidate static: ok" in recovery
+    failure_evidence = (deploy_root / "recovery.log.failure").read_text(encoding="utf-8")
+    assert "deployment failed at forced_failure" in failure_evidence
+    assert (deploy_root / ".citespan-authoritative-receipt.json").read_text() == "receipt\n"
+    assert (deploy_root / "authoritative-volume.marker").read_text() == "volume\n"
+    assert (deploy_root / ".citespan-deployment.json").read_text() == "prior metadata\n"
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert "stop candidate-static" in calls
+    assert "rm candidate-static" in calls
+    assert any("down --remove-orphans" in call for call in calls)
+    assert not any("citespan-postgres-data" in call or "citespan-meili-data" in call for call in calls)
+
+
+def test_rollback_sanitizes_failed_cleanup_diagnostics_with_closed_output_pipes(bash_tmp_path):
+    command = release._deployment_command(valid_payload())
+    start = command.index("rollback() {")
+    end = command.index("\ntrap rollback EXIT\n", start)
+    rollback_function = command[start:end]
+    tmp_path = bash_tmp_path
+    deploy_root = tmp_path / "deploy"
+    caddy_root = tmp_path / "etc"
+    bin_root = tmp_path / "bin"
+    for path in (deploy_root, caddy_root, bin_root):
+        path.mkdir(parents=True)
+    (deploy_root / ".citespan-deployment.json").write_text("prior metadata\n", encoding="utf-8")
+    (deploy_root / ".citespan-demo-marker.json").write_text("prior marker\n", encoding="utf-8")
+    (deploy_root / ".citespan-runtime.env").write_text(_complete_runtime_fixture(), encoding="utf-8")
+    (deploy_root / ".citespan-authoritative-receipt.json").write_text("receipt\n", encoding="utf-8")
+    (deploy_root / "authoritative-volume.marker").write_text("volume\n", encoding="utf-8")
+    (caddy_root / "Caddyfile").write_text("previous-route\n", encoding="utf-8")
+    call_log = tmp_path / "calls.log"
+    call_log.touch()
+    sentinel = "unlabelled-postgres-secret-sentinel"
+    docker_stub = bin_root / "docker"
+    docker_stub.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\n"
+        "if [ \"$1\" = inspect ] && [ \"$2\" = --format ] && [ \"$4\" = candidate-static ]; then if [ -f \"$CANDIDATE_REMOVED\" ]; then echo 'Error: No such object: candidate-static' >&2; exit 1; fi; printf 'candidate-static\\t/candidate-static\\ttrue\\trunning\\n'; exit 0; fi\n"
+        "case \"$*\" in\n"
+        "  'info') exit 0;;\n"
+        "  'stop candidate-static') exit 0;;\n"
+        "  'rm candidate-static') touch \"$CANDIDATE_REMOVED\";;\n"
+        "  *'compose'*'down --remove-orphans'*) printf 'cleanup failed with %s in a longer diagnostic\\n' \"$POSTGRES_PASSWORD\" >&2; exit 23;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    docker_stub.chmod(0o755)
+    for name in ("caddy", "systemctl"):
+        stub = bin_root / name
+        stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        stub.chmod(0o755)
+
+    sanitizer = "\n".join(f"    {line}" for line in release._readiness_sanitizer().splitlines())
+    fixture = _rollback_fixture_state(deploy_root, caddy_root).replace(
+        "    sanitize_probe_output() { printf '%s' \"$1\"; }\n", sanitizer + "\n"
+    )
+    function = rollback_function.replace("/opt/citespan", _bash_path(deploy_root)).replace(
+        "/etc/caddy/Caddyfile", _bash_path(caddy_root / "Caddyfile")
+    )
+    script_path = tmp_path / "closed-pipes-cleanup-failure.sh"
+    script_path.write_text(
+        f"#!/usr/bin/env bash\nset -Eeuo pipefail\nset -a\n. {_bash_path(deploy_root / '.citespan-runtime.env')}\nset +a\nPOSTGRES_PASSWORD={sentinel}\nexport POSTGRES_PASSWORD\n"
+        f"{fixture}\n{function}\ntrap rollback EXIT\ndocker run -d --name candidate-static nginx:1.29-alpine\nsleep 1\nfalse\n",
+        encoding="utf-8",
+    )
+    process = subprocess.Popen(
+        [str(_git_bash_executable()), _bash_path(script_path)],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{_bash_path(bin_root)}:{os.environ['PATH']}",
+            "CALL_LOG": _bash_path(call_log),
+            "CANDIDATE_REMOVED": _bash_path(tmp_path / "candidate-removed"),
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    process.stdout.close()
+    process.stderr.close()
+    result_code = process.wait(timeout=20)
+
+    assert result_code == 70
+    recovery = (deploy_root / "recovery.log").read_text(encoding="utf-8")
+    failure_evidence = (deploy_root / "recovery.log.failure").read_text(encoding="utf-8")
+    assert "remove candidate services identity=citespan-candidate: failed exit_status=23" in recovery
+    assert "cause=cleanup failed with [REDACTED] in a longer diagnostic" in recovery
+    assert "remove candidate services identity=citespan-candidate" in failure_evidence
+    assert "exit_status=23" in failure_evidence
+    assert "rollback result: incomplete" in recovery
+    assert "recovery incomplete" in failure_evidence
+    assert sentinel not in recovery
+    assert sentinel not in failure_evidence
+    assert (deploy_root / ".citespan-authoritative-receipt.json").read_text() == "receipt\n"
+    assert (deploy_root / "authoritative-volume.marker").read_text() == "volume\n"
+    assert not list(deploy_root.glob("recovery.log.failure.cleanup.*"))
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert "stop candidate-static" in calls
+    assert "rm candidate-static" in calls
+    assert any("down --remove-orphans" in call for call in calls)
+    assert not any("dependent-success" in call for call in calls)
+
+
+def test_content_checks_handle_large_successful_curl_output_without_sigpipe(tmp_path):
+    command = release._deployment_command(valid_payload())
+    assert 'curl --fail --silent --show-error http://127.0.0.1:$candidate_frontend_port/ >"$candidate_static_body"' in command
+    assert 'curl --fail --silent --show-error --tlsv1.2 https://$domain/ >"$public_route_body"' in command
+    assert "curl --fail --silent --show-error http://127.0.0.1:$candidate_frontend_port/ | grep" not in command
+    script = tmp_path / "content-check.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\nset -Eeuo pipefail\n"
+        "curl() { printf '%*sCiteSpan%*s\\n' 120000 '' 120000 ''; }\n"
+        "body=body.html\nif ! curl --fail --silent --show-error https://example.invalid/ >\"$body\"; then exit 1; fi\n"
+        "grep -qi CiteSpan \"$body\"\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [str(_git_bash_executable()), _bash_path(script)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("mode", ["curl-failure", "content-mismatch"])
+def test_content_checks_preserve_curl_and_content_failures(tmp_path, mode):
+    script = tmp_path / f"content-check-{mode}.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\nset -Eeuo pipefail\n"
+        "curl() { if [ \"$CHECK_MODE\" = curl-failure ]; then return 22; else printf 'unrelated content\\n'; fi; }\n"
+        "body=body.html\n"
+        "if ! curl --fail --silent --show-error https://example.invalid/ >\"$body\"; then exit 1; fi\n"
+        "grep -qi CiteSpan \"$body\"\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [str(_git_bash_executable()), _bash_path(script)],
+        cwd=tmp_path,
+        env={**os.environ, "CHECK_MODE": mode},
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 1
+
+
+def test_backend_healthcheck_uses_trailing_slash_endpoint():
+    dockerfile = (ROOT / "docker/services/Dockerfile.backend").read_text(encoding="utf-8")
+    assert "CMD curl -f http://localhost:8000/health/ || exit 1" in dockerfile
+    assert "CMD curl -f http://localhost:8000/health || exit 1" not in dockerfile
 
 
 @pytest.mark.parametrize(
@@ -1280,12 +2363,13 @@ false
     ],
 )
 def test_candidate_static_cleanup_is_idempotent_and_fails_loudly(
-    tmp_path, container_state, expected_returncode, expected_error
+    bash_tmp_path, container_state, expected_returncode, expected_error
 ):
     command = release._deployment_command(valid_payload())
     start = command.index("rollback() {")
     end = command.index("\ntrap rollback EXIT\n", start)
     rollback_function = command[start:end]
+    tmp_path = bash_tmp_path
     deploy_root = tmp_path / "deploy"
     caddy_root = tmp_path / "etc"
     bin_root = tmp_path / "bin"
@@ -1300,14 +2384,15 @@ def test_candidate_static_cleanup_is_idempotent_and_fails_loudly(
     docker_stub = bin_root / "docker"
     docker_stub.write_text(
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\n"
+        "if [ \"$1\" = inspect ] && [ \"$2\" = --format ] && [ \"$4\" = candidate-static ]; then\n"
+        "  if [ -f \"$CANDIDATE_REMOVED\" ] || [ \"$CITESPAN_CONTAINER_STATE\" = missing ]; then echo 'Error: No such object: candidate-static' >&2; exit 1; fi\n"
+        "  if [ \"$CITESPAN_CONTAINER_STATE\" = stopped ]; then printf 'candidate-static\\t/candidate-static\\tfalse\\texited\\n'; else printf 'candidate-static\\t/candidate-static\\ttrue\\trunning\\n'; fi\n"
+        "  exit 0\n"
+        "fi\n"
         "case \"$*\" in\n"
         "  'info') exit 0;;\n"
-        "  'inspect candidate-static')\n"
-        "    [ \"$CITESPAN_CONTAINER_STATE\" != missing ] && [ \"$(grep -c '^inspect candidate-static$' \"$CALL_LOG\")\" -eq 1 ];;\n"
-        "  'inspect -f {{.State.Running}} candidate-static')\n"
-        "    [ \"$CITESPAN_CONTAINER_STATE\" = stopped ] && echo false || echo true;;\n"
         "  'stop candidate-static') [ \"$CITESPAN_CONTAINER_STATE\" != stop-fails ];;\n"
-        "  'rm candidate-static') exit 0;;\n"
+        "  'rm candidate-static') touch \"$CANDIDATE_REMOVED\";;\n"
         "  'start previous-backend'|'start previous-static') exit 0;;\n"
         "  *'compose'*'down --remove-orphans'*) exit 0;;\n"
         "  *'inspect'*candidate-static*) echo 'unexpected inspect format' >&2; exit 64;;\n"
@@ -1334,6 +2419,7 @@ def test_candidate_static_cleanup_is_idempotent_and_fails_loudly(
         "PATH": f"{_bash_path(bin_root)}:{os.environ['PATH']}",
         "CALL_LOG": _bash_path(call_log),
         "CITESPAN_CONTAINER_STATE": container_state,
+        "CANDIDATE_REMOVED": _bash_path(tmp_path / "candidate-removed"),
     }
     first = subprocess.run(
         [str(_git_bash_executable()), _bash_path(script_path)],
@@ -1343,6 +2429,7 @@ def test_candidate_static_cleanup_is_idempotent_and_fails_loudly(
         text=True,
         timeout=20,
     )
+    first_failure_evidence = (deploy_root / "recovery.log.failure").read_text(encoding="utf-8")
     second = subprocess.run(
         [str(_git_bash_executable()), _bash_path(script_path)],
         cwd=ROOT,
@@ -1355,24 +2442,25 @@ def test_candidate_static_cleanup_is_idempotent_and_fails_loudly(
     assert first.returncode == expected_returncode, (
         f"first stderr={first.stderr!r} stdout={first.stdout!r} calls={call_log.read_text()!r}"
     )
-    second_expected_returncode = 1 if expected_error else expected_returncode
+    second_expected_returncode = 70 if container_state == "stop-fails" else (1 if expected_error else expected_returncode)
     assert second.returncode == second_expected_returncode, (
         f"second stderr={second.stderr!r} stdout={second.stdout!r}"
     )
     if expected_error:
-        assert expected_error in first.stderr
+        assert expected_error in first_failure_evidence
     calls = call_log.read_text(encoding="utf-8").splitlines()
-    assert calls.count("inspect -f {{.State.Running}} candidate-static") == (
-        1 if container_state == "stopped" or container_state == "stop-fails" else 0
-    ), f"calls={calls!r} first stderr={first.stderr!r} second stderr={second.stderr!r}"
+    expected_inspections = 3 if container_state == "stopped" else 2
+    assert sum("inspect --format" in call and "candidate-static" in call for call in calls) == expected_inspections, (
+        f"calls={calls!r} first stderr={first.stderr!r} second stderr={second.stderr!r}"
+    )
     if container_state == "stopped":
         assert calls.count("rm candidate-static") == 1
         assert "stop candidate-static" not in calls
     elif container_state == "missing":
         assert "rm candidate-static" not in calls
     else:
-        assert calls.count("stop candidate-static") == 1
-        assert calls.count("rm candidate-static") == 1
+        assert calls.count("stop candidate-static") == 2
+        assert "rm candidate-static" not in calls
 
 
 def test_generated_deployment_command_has_valid_bash_syntax(tmp_path):
@@ -1439,27 +2527,44 @@ def test_generated_recovery_runs_real_bash_and_preserves_prior_state(bash_tmp_pa
         encoding="utf-8",
     )
     (deploy_root / ".citespan-runtime.env").write_text(_complete_runtime_fixture(), encoding="utf-8")
+    orphan_backup = deploy_root / ".citespan-backups" / Path(release.ORPHAN_BACKUP_DIR).name
+    orphan_backup.mkdir(parents=True)
+    (deploy_root / ".citespan-authoritative-receipt.json").write_text("receipt\n", encoding="utf-8")
+    (orphan_backup / "old-action-evidence.log").write_text("old action\n", encoding="utf-8")
     (deploy_root / "authoritative-data.txt").write_text("prior-data\n", encoding="utf-8")
     (caddy_root / "Caddyfile").write_text("previous-route\n", encoding="utf-8")
 
     call_log = tmp_path / "calls.log"
     call_log.touch()
     (bin_root / "docker").write_text(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\n"
-            "case \"$*\" in\n"
-            "  *'inspect -f {{.Id}} candidate-id'*) echo candidate-id ;;\n"
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\n"
+                "if [ \"$1\" = inspect ] && [ \"$2\" = --format ] && [ \"$4\" = " + release.ORPHAN_CONTAINER_ID + " ]; then\n"
+                "  echo 'Error: No such object: " + release.ORPHAN_CONTAINER_ID + "' >&2\n"
+                "  exit 1\n"
+                "fi\n"
+                "case \"$*\" in\n"
+                "  *'inspect -f {{.Id}} candidate-id'*) echo candidate-id ;;\n"
             "  *'inspect -f {{.Name}} candidate-id'*) printf '/%s-backend\\n' \"$CITESPAN_DEPLOYMENT_ID\" ;;\n"
             "  *'inspect -f {{.State.Status}} candidate-id'*) echo running ;;\n"
             "  *'inspect -f {{if .State.Health}}'*) echo none ;;\n"
             "  *'inspect -f {{.State.Running}} '*) echo true ;;\n"
         "  *'inspect -f {{.Name}} '*) container=; for argument do container=$argument; done; printf '/%s\\n' \"$container\" ;;\n"
-        "  *'inspect '*) printf '%s\\n' '[{\"Id\":\"prior-id\",\"Name\":\"previous\",\"State\":{\"Running\":true},\"Config\":{\"Env\":[\"CITESPAN_SYNTHETIC_ONLY=1\"]}}]' ;;\n"
+            f"  'stop {release.ORPHAN_CONTAINER_ID}') exit 0 ;;\n"
+            f"  'rm {release.ORPHAN_CONTAINER_ID}') touch \"$ORPHAN_REMOVED\" ;;\n"
+            "  *'inspect --format'*'authoritative-postgres'*) printf 'postgres-id\\t/citespan-authoritative-postgres\\tfalse\\texited\\tpostgres:17-alpine\\tcitespan-authoritative-network,\\tvolume:citespan-postgres-data:/var/lib/postgresql/data:true,\\n' ;;\n"
+            "  *'inspect --format'*'authoritative-meili'*) printf 'meili-id\\t/citespan-authoritative-meili\\tfalse\\texited\\tgetmeili/meilisearch:v1.15\\tcitespan-authoritative-network,\\tvolume:citespan-meili-data:/meili_data:true,\\n' ;;\n"
+            "  *'inspect --format'*'authoritative-minio'*) printf 'minio-id\\t/citespan-authoritative-minio\\tfalse\\texited\\tcitespan-minio-source:RELEASE.2025-10-15T17-29-55Z\\tcitespan-authoritative-network,\\tvolume:citespan-minio-data:/data:true,\\n' ;;\n"
+            "  *'inspect '*) printf '%s\\n' '[{\"Id\":\"prior-id\",\"Name\":\"previous\",\"State\":{\"Running\":true},\"Config\":{\"Env\":[\"CITESPAN_SYNTHETIC_ONLY=1\"]}}]' ;;\n"
         "  *'pg_isready'*) exit 0 ;;\n"
         "  *'7700/health'*) printf 'available\\n' ;;\n"
         "  *'9000/minio/health/live'*) exit 0 ;;\n"
         "  *'base64 -d'*) printf 'EMPTY\\n' ;;\n"
         "  *' exec '*) exit 0 ;;\n"
-        "  *' network inspect '*|*' volume inspect '*) printf 'ok\\n' ;;\n"
+            "  *'network inspect --format'*'citespan-authoritative-network'*) printf 'network-id\\tcitespan-authoritative-network\\tbridge\\tlocal\\t10.0.0.0/24:10.0.0.1,\\n' ;;\n"
+            "  *'volume inspect --format'*'citespan-postgres-data'*) printf 'citespan-postgres-data\\tlocal\\t/var/lib/docker/volumes/citespan-postgres-data\\tlocal\\n' ;;\n"
+            "  *'volume inspect --format'*'citespan-meili-data'*) printf 'citespan-meili-data\\tlocal\\t/var/lib/docker/volumes/citespan-meili-data\\tlocal\\n' ;;\n"
+            "  *'volume inspect --format'*'citespan-minio-data'*) printf 'citespan-minio-data\\tlocal\\t/var/lib/docker/volumes/citespan-minio-data\\tlocal\\n' ;;\n"
+            "  *' network inspect '*|*' volume inspect '*) printf 'ok\\n' ;;\n"
         "  *' config --format json'*) printf '%s\\n' \"{\\\"services\\\":{\\\"backend\\\":{\\\"ports\\\":[{\\\"host_ip\\\":\\\"127.0.0.1\\\",\\\"published\\\":${CITESPAN_BACKEND_PORT},\\\"target\\\":8000,\\\"protocol\\\":\\\"tcp\\\"}]}}}\" ;;\n"
         "  *'up -d --no-deps --build backend'*) if [ \"$CITESPAN_FAIL_STEP\" = pre_cutover ]; then printf '%s\\n' \"injected failure: $CITESPAN_FAIL_STEP\" >> \"$CALL_LOG\"; echo \"injected failure: $CITESPAN_FAIL_STEP\" >&2; exit 42; fi ;;\n"
         "  *'ps -q '*) echo candidate-id ;;\n"
@@ -1533,20 +2638,20 @@ def test_generated_recovery_runs_real_bash_and_preserves_prior_state(bash_tmp_pa
     )
     script_path = tmp_path / "generated-recovery.sh"
     script_path.write_text(f"#!/usr/bin/env bash\n{command}\n", encoding="utf-8")
+    git_bash_bin = _bash_path(_git_bash_executable().parent)
     env = {
         **os.environ,
-        "PATH": f"{_bash_path(bin_root)}:{os.environ['PATH']}",
+        "PATH": f"{_bash_path(bin_root)}:{git_bash_bin}:{os.environ['PATH']}",
         "CALL_LOG": _bash_path(call_log),
         "CITESPAN_FAIL_STEP": failure,
+        "ORPHAN_REMOVED": _bash_path(tmp_path / "orphan-removed"),
         "CITESPAN_ROUTE_NATIVE": str(bash_tmp_native_root / "citespan-route"),
         "CITESPAN_CADDY_NATIVE": str(caddy_root / "Caddyfile"),
     }
-    result = subprocess.run(
+    result = _run_owned_bash_fixture(
         [str(_git_bash_executable()), _bash_path(script_path)],
         cwd=ROOT,
         env=env,
-        capture_output=True,
-        text=True,
         timeout=20,
     )
 
@@ -1569,9 +2674,9 @@ def test_generated_recovery_runs_real_bash_and_preserves_prior_state(bash_tmp_pa
         )
     compose_calls = [index for index, call in enumerate(calls) if "compose" in call]
     assert compose_calls, f"{failure} did not invoke Compose\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}\ncalls:\n{calls}"
-    assert any(f"pull {release.MINIO_BUILDER_IMAGE}" in call for call in calls)
-    assert any(f"pull {release.MINIO_RUNTIME_IMAGE}" in call for call in calls)
-    assert any(f"--tag {release.MINIO_IMAGE}" in call for call in calls)
+    assert any(f"pull {release.MINIO_BUILDER_IMAGE}" in call for call in calls), calls
+    assert any(f"pull {release.MINIO_RUNTIME_IMAGE}" in call for call in calls), calls
+    assert any(f"--tag {release.MINIO_IMAGE}" in call for call in calls), calls
     assert not any("volume rm" in call for call in calls)
     if failure == "pre_cutover":
         up_index = next(index for index, call in enumerate(calls) if "up -d --no-deps --build backend" in call)
@@ -2091,12 +3196,16 @@ def test_deployment_records_boundary_phase_before_and_after_application_candidat
 def test_deployment_boundary_failure_keeps_phase_trace_in_rollback_path():
     command = release._deployment_command(valid_payload())
 
-    assert 'phase_failure "$failed_step" "$status"' in command
+    assert 'phase_failure "$safe_failed_step" "$status"' in command
     assert 'phase_trace="$backup_dir/release-phase-trace.log"' in command
     assert 'phase_start "application-candidate"' in command
     assert 'phase_end "application-candidate" 0' in command
-    assert command.index('phase_failure "$failed_step" "$status"') < command.index(
-        'rm -f "${compose_override:-}"'
+    private_redirect = 'exec >>"$rollback_evidence" 2>&1'
+    assert command.index(private_redirect) < command.index(
+        'phase_failure "$safe_failed_step" "$status"'
+    )
+    assert command.index('phase_failure "$safe_failed_step" "$status"') < command.index(
+        "record_recovery 'rollback result: complete'"
     )
 
 
@@ -3026,8 +4135,37 @@ def test_live_verifier_provisioning_is_pinned_to_project_python_and_browser_path
         release._provision_live_verifier()
 
     commands = [call.args[0] for call in run.call_args_list]
-    assert ["C:/project/.venv/Scripts/python.exe", "-m", "pip", "install", "--disable-pip-version-check", "playwright==1.55.0"] in commands
+    assert [
+        "C:/project/.venv/Scripts/python.exe",
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-deps",
+        "--require-hashes",
+        "--only-binary=:all:",
+        f"{release.PYTHON_PLAYWRIGHT_WHEEL_URL}#sha256={release.PYTHON_PLAYWRIGHT_WHEEL_SHA256}",
+    ] in commands
     assert ["C:/project/.venv/Scripts/python.exe", "-m", "playwright", "install", "chromium"] in commands
+
+
+def test_python_playwright_provisioning_contract_has_matching_wheel_metadata():
+    assert release.PYTHON_PLAYWRIGHT_WHEEL == (
+        f"playwright-{release.PYTHON_PLAYWRIGHT_VERSION}-py3-none-win_amd64.whl"
+    )
+    assert release.PYTHON_PLAYWRIGHT_WHEEL_URL.endswith(
+        f"/{release.PYTHON_PLAYWRIGHT_WHEEL}"
+    )
+    assert len(release.PYTHON_PLAYWRIGHT_WHEEL_SHA256) == 64
+    int(release.PYTHON_PLAYWRIGHT_WHEEL_SHA256, 16)
+
+
+@pytest.mark.parametrize("field", ["PYTHON_PLAYWRIGHT_WHEEL_URL", "PYTHON_PLAYWRIGHT_WHEEL_SHA256"])
+def test_python_playwright_provisioning_rejects_invalid_integrity_metadata(field, monkeypatch):
+    value = "https://example.invalid/wrong.whl" if field.endswith("URL") else "not-a-sha256"
+    monkeypatch.setattr(release, field, value)
+    with pytest.raises(RuntimeError, match="Python Playwright"):
+        release._validate_python_playwright_contract()
 
 
 def test_live_verifier_provisioning_rejects_unknown_exit_code_and_records_private_evidence(tmp_path):
@@ -3050,7 +4188,10 @@ def test_live_verifier_provisioning_rejects_unknown_exit_code_and_records_privat
         "pip",
         "install",
         "--disable-pip-version-check",
-        "playwright==1.55.0",
+        "--no-deps",
+        "--require-hashes",
+        "--only-binary=:all:",
+        f"{release.PYTHON_PLAYWRIGHT_WHEEL_URL}#sha256={release.PYTHON_PLAYWRIGHT_WHEEL_SHA256}",
     ]
     assert value["returncode"] == "unknown"
     assert value["stdout"] == "installer output"
@@ -3117,7 +4258,7 @@ def test_deployment_command_is_repeatable_and_isolates_only_citespan_resources()
     assert '"sample_id": "canonical-v1"' in seed
     assert 'os.environ["CITESPAN_SYNTHETIC_MARKER"]' in seed
     candidate_static_health = (
-        "curl --fail --silent --show-error http://127.0.0.1:$candidate_frontend_port/ | grep -qi CiteSpan"
+        'candidate_static_body="$backup_dir/candidate-static.html"; if ! curl --fail --silent --show-error http://127.0.0.1:$candidate_frontend_port/ >"$candidate_static_body"; then exit 1; fi; grep -qi CiteSpan "$candidate_static_body"'
     )
     route_switch = 'CITESPAN_ROUTE_FILE="$route_file"'
     assert command.index(candidate_static_health) < command.index(route_switch)
@@ -3431,8 +4572,8 @@ def test_repeat_deployment_reuses_protected_credentials_and_keeps_existing_data(
 
     assert 'if [ -f "$deployment_metadata" ]; then' in command
     assert 'previous_backend=$(python3' in command
-    assert 'prior-backend.inspect.json' in command
-    assert 'prior-static.inspect.json' in command
+    assert 'prior-backend.inspect.txt' in command
+    assert 'prior-static.inspect.txt' in command
     assert 'CITESPAN_AUTHORITATIVE_POSTGRES' in command
     assert 'CITESPAN_AUTHORITATIVE_MEILI' in command
     assert 'CITESPAN_AUTHORITATIVE_MINIO' in command
@@ -3456,7 +4597,7 @@ def test_static_cutover_uses_unique_candidate_and_non_forced_cleanup():
     cleanup = command.index('if [ -n "${candidate_static:-}" ]')
     compose_cleanup = command.index('docker compose --project-name "$CITESPAN_DEPLOYMENT_ID"', cleanup)
     assert command.index('docker stop "$candidate_static"', cleanup) < command.index('docker rm "$candidate_static"', cleanup)
-    assert command.index('candidate static container still exists', cleanup) < compose_cleanup
+    assert command.index('inspect=absent', cleanup) < compose_cleanup
 
 
 def test_atomic_metadata_writer_emits_authoritative_json(tmp_path):
@@ -3833,10 +4974,531 @@ def test_restart_contract_fails_loudly_when_recovery_is_incomplete():
 
     assert "rollback_incomplete=0" in command
     assert "recovery incomplete; see $recovery_log" in command
-    assert "recovery failed: restore route" in command
-    assert "recovery failed: restart prior backend" in command
-    assert "recovery failed: remove candidate services" in command
+    assert "inspect_container_state()" in command
+    assert "docker_exit_status=$inspect_status" in command
+    assert "candidate static inspection is incomplete" in command
+    assert "candidate static removal is unproved" in command
     assert "exit 70" in command
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_state", "expected_status"),
+    [
+        ("permission", "unknown", 70),
+        ("missing", "absent", 0),
+        ("malformed", "unknown", 70),
+    ],
+)
+def test_generated_cleanup_inspection_distinguishes_absence_from_failure(
+    bash_tmp_path, mode, expected_state, expected_status
+):
+    evidence = bash_tmp_path / "recovery.log"
+    script = f'''#!/usr/bin/env bash
+set -Eeuo pipefail
+mode={mode}
+rollback_evidence={_bash_path(bash_tmp_path / "rollback")}
+recovery_log={_bash_path(evidence)}
+mutation_log={_bash_path(bash_tmp_path / "mutations")}
+mkdir -p "$rollback_evidence"
+: > "$recovery_log"
+sanitize_probe_output() {{ sed -E 's/super-secret/<REDACTED>/g' <<<"$1"; }}
+docker() {{
+    if [ "$1" = inspect ]; then
+        case "$mode" in
+            permission) echo 'permission denied: super-secret' >&2; return 13 ;;
+            missing) echo 'Error: No such object: target' >&2; return 1 ;;
+            malformed) echo 'daemon unavailable: super-secret' >&2; return 125 ;;
+        esac
+    fi
+    if [ "$1" = stop ] || [ "$1" = rm ]; then echo "$1" >> "$mutation_log"; fi
+    return 0
+}}
+{release._cleanup_inspection_script()}
+inspect_container_state initial target
+printf '%s\\n' "$inspect_state"
+if [ "$inspect_state" = unknown ]; then exit 70; fi
+test "$inspect_state" = {expected_state}
+'''
+    script_path = bash_tmp_path / "inspect.sh"
+    script_path.write_text(script, encoding="utf-8")
+    result = subprocess.run(
+        [str(_git_bash_executable()), _bash_path(script_path)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert (result.returncode == 0) is (expected_status == 0), result.stderr
+    evidence_text = evidence.read_text(encoding="utf-8")
+    assert "identity=target" in evidence_text
+    assert "docker_exit_status=" in evidence_text
+    assert "super-secret" not in evidence_text
+    if expected_state == "absent":
+        assert not (bash_tmp_path / "mutations").exists()
+    if expected_status != 0:
+        assert expected_state == "unknown"
+
+
+def test_generated_cleanup_refuses_running_state_inspection_failure_and_post_removal_denial(
+    bash_tmp_path,
+):
+    command = release._deployment_command(valid_payload())
+
+    assert "State.Running" in command
+    assert "container running state is not true or false" in command
+    assert "remove candidate static: skipped after unknown running state" in command
+    assert "verify candidate static removal" in command
+    assert "candidate static removal is unproved state=$inspect_state" in command
+    assert "inspect=absent" in command
+
+
+def test_guarded_orphan_recovery_is_exact_and_preserves_authoritative_state():
+    recovery = release._guarded_orphan_recovery_script()
+
+    assert release.ORPHAN_CONTAINER_ID in recovery
+    assert release.ORPHAN_CONTAINER_NAME in recovery
+    assert "identity-or-ownership-mismatch" in recovery
+    assert "old release or frontend builder is alive" in recovery
+    assert "citespan-authoritative-network" in recovery
+    assert "citespan-postgres-data" in recovery
+    assert "citespan-meili-data" in recovery
+    assert "citespan-minio-data" in recovery
+    assert "cmp -s \"$preservation_before\" \"$preservation_after\"" in recovery
+    assert "docker rm -v" not in recovery
+    assert "docker volume rm" not in recovery
+    assert "result=already-confirmed-absent" in recovery
+    assert "result=incomplete-cleanup" in recovery
+    assert 'if ps -eo pid=,ppid=,args= >"$process_rows_file" 2>&1; then' in recovery
+    assert "process_query_status=0" in recovery
+    assert "process_query_status=$?" in recovery
+    assert '"$process_query_status" -eq 0' in recovery
+    assert "current_ancestry" in recovery
+    assert "process-ancestry-ambiguous" in recovery
+    assert "docker inspect --format" in recovery
+    assert "{{.State.Status}}" in recovery
+    assert "com.docker.compose.project" in recovery
+    assert "com.docker.compose.service" in recovery
+    assert "com.citespan.release.action" not in recovery
+    assert "com.citespan.deployment" not in recovery
+    assert "docker network inspect --format" in recovery
+    assert "docker volume inspect --format" in recovery
+    assert ".Config.Env" not in recovery
+    assert ".State.Health" not in recovery
+    assert "OPENROUTER_API_KEY" in recovery
+    assert "process query failed" in recovery
+    assert "process-match-query-failed" in recovery
+
+
+def _run_present_orphan_fixture(tmp_path, mode="success"):
+    deploy_root = tmp_path / "deploy"
+    bin_root = tmp_path / "bin"
+    deploy_root.mkdir()
+    bin_root.mkdir()
+    authoritative_backup = deploy_root / ".citespan-backups" / "authoritative"
+    orphan_backup = deploy_root / ".citespan-backups" / Path(release.ORPHAN_BACKUP_DIR).name
+    authoritative_backup.mkdir(parents=True)
+    orphan_backup.mkdir(parents=True)
+    (authoritative_backup / "authoritative-action.log").write_text("authoritative\n", encoding="utf-8")
+    if mode != "missing_old_evidence":
+        (orphan_backup / "old-action-evidence.log").write_text("old action\n", encoding="utf-8")
+    else:
+        orphan_backup.rmdir()
+    (deploy_root / ".citespan-authoritative-receipt.json").write_text("receipt\n", encoding="utf-8")
+    (deploy_root / ".citespan-runtime.env").write_text("SECRET_KEY=super-secret\n", encoding="utf-8")
+    removed = tmp_path / "orphan-removed"
+    final_absence = tmp_path / "orphan-final-absence"
+    calls = tmp_path / "calls.log"
+    calls.touch()
+    docker_script = f'''#!/bin/sh
+printf '%s\\n' "$*" >> "$CALLS"
+    if [ "$1" = inspect ] && [ "$2" = --format ]; then
+        identity="$4"
+        if [ "$identity" = "{release.ORPHAN_CONTAINER_ID}" ]; then
+            case "$3" in
+                *'\\t'*) echo 'orphan format contains a literal backslash-t' >&2; exit 91 ;;
+            esac
+            [ "$(printf '%s' "$3" | tr -cd '\t' | wc -c)" -eq 4 ] || {{ echo 'orphan format does not contain four real tabs' >&2; exit 92; }}
+            if [ -e "$REMOVED" ]; then
+            if [ "$MODE" = post_denial ]; then
+                echo 'permission denied secret=super-secret' >&2
+                exit 13
+            fi
+            touch "$FINAL_ABSENCE"
+            echo "Error: No such object: $identity" >&2
+            exit 1
+        fi
+        case "$MODE" in
+            wrong_id) printf 'wrong-id\\t/{release.ORPHAN_CONTAINER_NAME}\\tcreated\\t{release.ORPHAN_DEPLOYMENT_ID}\\tbackend\\n' ;;
+            wrong_name) printf '{release.ORPHAN_CONTAINER_ID}\\t/wrong-name\\tcreated\\t{release.ORPHAN_DEPLOYMENT_ID}\\tbackend\\n' ;;
+            literal_backslash_t) printf '{release.ORPHAN_CONTAINER_ID}\\\\t/{release.ORPHAN_CONTAINER_NAME}\\\\tcreated\\\\t{release.ORPHAN_DEPLOYMENT_ID}\\\\tbackend\\n' ;;
+            wrong_field_count) printf '{release.ORPHAN_CONTAINER_ID}\\t/{release.ORPHAN_CONTAINER_NAME}\\tcreated\\t{release.ORPHAN_DEPLOYMENT_ID}\\n' ;;
+            empty_field) printf '{release.ORPHAN_CONTAINER_ID}\\t\\tcreated\\t{release.ORPHAN_DEPLOYMENT_ID}\\tbackend\\n' ;;
+            invalid_state) printf '{release.ORPHAN_CONTAINER_ID}\\t/{release.ORPHAN_CONTAINER_NAME}\\tunknown\\t{release.ORPHAN_DEPLOYMENT_ID}\\tbackend\\n' ;;
+            inspect_denial) echo 'permission denied secret=super-secret' >&2; exit 13 ;;
+            wrong_project) printf '{release.ORPHAN_CONTAINER_ID}\\t/{release.ORPHAN_CONTAINER_NAME}\\tcreated\\twrong-project\\tbackend\\n' ;;
+            wrong_service) printf '{release.ORPHAN_CONTAINER_ID}\\t/{release.ORPHAN_CONTAINER_NAME}\\tcreated\\t{release.ORPHAN_DEPLOYMENT_ID}\\tfrontend\\n' ;;
+            *) printf '{release.ORPHAN_CONTAINER_ID}\\t/{release.ORPHAN_CONTAINER_NAME}\\tcreated\\t{release.ORPHAN_DEPLOYMENT_ID}\\tbackend\\n' ;;
+        esac
+        exit 0
+    fi
+    printf 'authoritative-id\\t/%s\\trunning\\tfalse\\timage\\tnetwork,\\tvolume:data:/data:true,\\n' "$identity"
+    exit 0
+fi
+if [ "$1" = network ] || [ "$1" = volume ]; then
+    printf 'resource\\tlocal\\t/path\\tlocal\\n'
+    exit 0
+fi
+case "$1" in
+    stop) exit 0 ;;
+    rm) touch "$REMOVED"; exit 0 ;;
+esac
+exit 0
+'''
+    (bin_root / "docker").write_text(docker_script, encoding="utf-8")
+    (bin_root / "docker").chmod(0o755)
+    (bin_root / "ps").write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  '-o pid=,ppid= -p '*) printf '123 1\\n' ;;\n"
+        "  '-eo pid=,ppid=,args='*)\n"
+        "    if [ \"$MODE\" = process_alive ]; then printf '456 1 npm build\\n'; fi\n"
+        "    if [ \"$MODE\" = process_ambiguous ]; then printf 'malformed process row\\n'; fi\n"
+        "    ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    (bin_root / "ps").chmod(0o755)
+    (bin_root / "python3").write_text(
+        f"#!/bin/sh\nexec {_bash_path(Path(PYTHON))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    (bin_root / "python3").chmod(0o755)
+    orphan_temp_root = tmp_path / "orphan-recovery-tmp"
+    orphan_temp_root.mkdir()
+    recovery = release._guarded_orphan_recovery_script()
+    for template in (
+        "/tmp/citespan-orphan-recovery.XXXXXX",
+        "/tmp/citespan-orphan-inspect.XXXXXX",
+        "/tmp/citespan-process-rows.XXXXXX",
+        "/tmp/citespan-preservation-before.XXXXXX",
+        "/tmp/citespan-preservation-after.XXXXXX",
+        "/tmp/citespan-receipt-before.XXXXXX",
+        "/tmp/citespan-receipt-after.XXXXXX",
+        "/tmp/citespan-old-backup-before.XXXXXX",
+        "/tmp/citespan-old-backup-after.XXXXXX",
+    ):
+        recovery = recovery.replace(
+            template,
+            _bash_path(orphan_temp_root / Path(template).name),
+        )
+    script = (
+        "#!/usr/bin/env bash\nset -Eeuo pipefail\n"
+        + recovery.replace("/opt/citespan", _bash_path(deploy_root)).replace(
+            release.ORPHAN_BACKUP_DIR,
+            _bash_path(orphan_backup),
+        )
+        + "guarded_orphan_recovery\n"
+    )
+    script_path = tmp_path / "present-orphan.sh"
+    script_path.write_text(script, encoding="utf-8")
+    env = {
+        **os.environ,
+        "PATH": f"{_bash_path(bin_root)}:/usr/bin:/bin:{os.environ['PATH']}",
+        "CALLS": _bash_path(calls),
+        "MODE": mode,
+        "REMOVED": _bash_path(removed),
+        "FINAL_ABSENCE": _bash_path(final_absence),
+        "backup_dir": _bash_path(authoritative_backup),
+        "SECRET_KEY": "super-secret",
+    }
+    result = subprocess.run(
+        [str(_git_bash_executable()), _bash_path(script_path)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    return result, calls.read_text(encoding="utf-8").splitlines(), removed, deploy_root, final_absence
+
+
+def test_generated_present_orphan_recovery_removes_only_exact_container_and_preserves_state(
+    bash_tmp_path,
+):
+    result, calls, removed, deploy_root, final_absence = _run_present_orphan_fixture(bash_tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert removed.exists()
+    assert final_absence.exists()
+    assert any(f"stop {release.ORPHAN_CONTAINER_ID}" == call for call in calls)
+    assert any(f"rm {release.ORPHAN_CONTAINER_ID}" == call for call in calls)
+    assert not any("volume rm" in call or "rm -v" in call for call in calls)
+    assert sum("network inspect" in call for call in calls) == 2
+    assert sum("volume inspect" in call for call in calls) == 6
+    assert (deploy_root / ".citespan-authoritative-receipt.json").read_text() == "receipt\n"
+    assert (deploy_root / ".citespan-runtime.env").read_text() == "SECRET_KEY=super-secret\n"
+    assert (deploy_root / ".citespan-backups" / "authoritative" / "authoritative-action.log").read_text() == "authoritative\n"
+    assert (deploy_root / ".citespan-backups" / Path(release.ORPHAN_BACKUP_DIR).name / "old-action-evidence.log").read_text() == "old action\n"
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "wrong_id",
+        "wrong_name",
+        "literal_backslash_t",
+        "wrong_field_count",
+        "empty_field",
+        "wrong_project",
+        "wrong_service",
+        "invalid_state",
+        "missing_old_evidence",
+        "process_alive",
+        "process_ambiguous",
+        "inspect_denial",
+        "post_denial",
+    ],
+)
+def test_generated_present_orphan_recovery_refuses_identity_evidence_and_process_failures(
+    bash_tmp_path, mode
+):
+    result, calls, removed, _, final_absence = _run_present_orphan_fixture(bash_tmp_path, mode)
+
+    assert result.returncode == 70
+    if mode == "post_denial":
+        assert removed.exists()
+        assert not final_absence.exists()
+        assert any(f"stop {release.ORPHAN_CONTAINER_ID}" == call for call in calls)
+        assert any(f"rm {release.ORPHAN_CONTAINER_ID}" == call for call in calls)
+        evidence_bash_path = next(
+            part.split("=", 1)[1]
+            for part in (result.stderr + result.stdout).split()
+            if part.startswith("evidence=")
+        )
+        evidence_path = _native_fixture_path(evidence_bash_path)
+        assert evidence_path.exists()
+        assert evidence_path.is_relative_to(bash_tmp_path.resolve())
+        assert 'chmod 600 "$orphan_evidence"' in release._guarded_orphan_recovery_script()
+        evidence = evidence_path.read_text(encoding="utf-8")
+        assert "operation=post-removal result=incomplete-cleanup" in evidence
+        assert "result=incomplete-cleanup" in evidence
+        assert "super-secret" not in evidence
+        assert not any(path != evidence_path for path in evidence_path.parent.iterdir())
+    else:
+        assert not removed.exists()
+        assert not any(
+            call in {f"stop {release.ORPHAN_CONTAINER_ID}", f"rm {release.ORPHAN_CONTAINER_ID}"}
+            for call in calls
+        )
+    assert "super-secret" not in result.stdout + result.stderr
+
+
+def test_generated_orphan_identity_format_uses_four_real_tabs(bash_tmp_path):
+    result, calls, _, _, _ = _run_present_orphan_fixture(bash_tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    orphan_inspections = [
+        call for call in calls if call.startswith(f"inspect --format") and release.ORPHAN_CONTAINER_ID in call
+    ]
+    assert orphan_inspections
+    format_prefix = "inspect --format "
+    format_suffix = f" {release.ORPHAN_CONTAINER_ID}"
+    format_argument = orphan_inspections[0][
+        len(format_prefix) : -len(format_suffix)
+    ]
+    assert format_argument.count("\t") == 4
+    assert "\\t" not in format_argument
+
+
+@pytest.mark.parametrize(
+    ("process_rows", "expected_rows"),
+    [
+        (
+            ["101 1 bash release.py " + release.ORPHAN_ACTION_KEY],
+            ["pid=101 ppid=1 argv=bash release.py " + release.ORPHAN_ACTION_KEY],
+        ),
+        (["102 1 npm build"], ["pid=102 ppid=1 argv=npm build"]),
+        (["103 1 npm run build --production"], ["pid=103 ppid=1 argv=npm run build --production"]),
+        (["104 1 next build"], ["pid=104 ppid=1 argv=next build"]),
+        (["105 999 npm build"], ["pid=105 ppid=999 argv=npm build"]),
+        (["106 1 npm-cli build"], ["pid=106 ppid=1 argv=npm-cli build"]),
+        (["107 1 next.cmd build"], ["pid=107 ppid=1 argv=next.cmd build"]),
+        (["108 1 sh -c 'next build'"], ["pid=108 ppid=1 argv=sh -c 'next build'"]),
+        (["109 1 bash -c 'next build'"], ["pid=109 ppid=1 argv=bash -c 'next build'"]),
+        (["110 1 bash -seuo pipefail"], ["pid=110 ppid=1 argv=bash -seuo pipefail"]),
+    ],
+)
+def test_guarded_orphan_recovery_uses_exact_parsed_process_sequences(
+    tmp_path, process_rows, expected_rows
+):
+    recovery = release._guarded_orphan_recovery_script()
+    source_start = recovery.index("\n", recovery.index("<<'PY'")) + 1
+    source_end = recovery.index("\nPY", source_start)
+    ps = tmp_path / "ps.cmd"
+    ps.write_text("\n".join(process_rows) + "\n", encoding="utf-8")
+    result = subprocess.run(
+        [PYTHON, "-c", recovery[source_start:source_end], "999", str(ps)],
+        env={**os.environ, "CITESPAN_ORPHAN_ACTION_KEY": release.ORPHAN_ACTION_KEY},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == expected_rows
+    assert "shlex.split" in recovery
+    assert "is_npm_build" in recovery
+    assert "is_next_build" in recovery
+    assert "is_old_release_transport" in recovery
+    assert "is_shell_builder" in recovery
+    assert "current_ancestry" in recovery
+    assert "process enumeration or parsing is ambiguous" in recovery
+
+
+def test_guarded_orphan_recovery_excludes_current_ancestry_transport_and_builders(tmp_path):
+    recovery = release._guarded_orphan_recovery_script()
+    source_start = recovery.index("\n", recovery.index("<<'PY'")) + 1
+    source_end = recovery.index("\nPY", source_start)
+    ps = tmp_path / "ps.cmd"
+    ps.write_text(
+        "999 1 bash -seuo pipefail\n"
+        "1000 1 next build\n"
+        "1001 1 bash -c 'next build'\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [PYTHON, "-c", recovery[source_start:source_end], "999", str(ps)],
+        env={**os.environ, "CITESPAN_ORPHAN_ACTION_KEY": release.ORPHAN_ACTION_KEY},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "pid=1000 ppid=1 argv=next build",
+        "pid=1001 ppid=1 argv=bash -c 'next build'",
+    ]
+
+
+def test_guarded_orphan_recovery_accepts_only_bounded_action_key_forms(tmp_path):
+    recovery = release._guarded_orphan_recovery_script()
+    source_start = recovery.index("\n", recovery.index("<<'PY'")) + 1
+    source_end = recovery.index("\nPY", source_start)
+    ps = tmp_path / "ps.cmd"
+    ps.write_text(
+        "101 1 bash release.py " + release.ORPHAN_ACTION_KEY + "\n"
+        "102 1 bash -c 'release.py " + release.ORPHAN_ACTION_KEY + "'\n"
+        "103 1 bash -c 'echo " + release.ORPHAN_ACTION_KEY + "suffix'\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [PYTHON, "-c", recovery[source_start:source_end], "999", str(ps)],
+        env={**os.environ, "CITESPAN_ORPHAN_ACTION_KEY": release.ORPHAN_ACTION_KEY},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "pid=101 ppid=1 argv=bash release.py " + release.ORPHAN_ACTION_KEY,
+        "pid=102 ppid=1 argv=bash -c 'release.py " + release.ORPHAN_ACTION_KEY + "'",
+    ]
+
+
+def test_guarded_orphan_recovery_fails_closed_on_process_query_parse_ambiguity(tmp_path):
+    recovery = release._guarded_orphan_recovery_script()
+    source_start = recovery.index("\n", recovery.index("<<'PY'")) + 1
+    source_end = recovery.index("\nPY", source_start)
+    ps = tmp_path / "ps.cmd"
+    ps.write_text('101 1 "unterminated\n', encoding="utf-8")
+
+    result = subprocess.run(
+        [PYTHON, "-c", recovery[source_start:source_end], "999", str(ps)],
+        env={**os.environ, "CITESPAN_ORPHAN_ACTION_KEY": release.ORPHAN_ACTION_KEY},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 70
+    assert "ambiguous-process-argv" in result.stdout
+
+
+def test_guarded_orphan_recovery_fails_closed_on_unparseable_shell_command(tmp_path):
+    recovery = release._guarded_orphan_recovery_script()
+    source_start = recovery.index("\n", recovery.index("<<'PY'")) + 1
+    source_end = recovery.index("\nPY", source_start)
+    ps = tmp_path / "ps.cmd"
+    ps.write_text('101 1 bash -c "\'unterminated"\n', encoding="utf-8")
+
+    result = subprocess.run(
+        [PYTHON, "-c", recovery[source_start:source_end], "999", str(ps)],
+        env={**os.environ, "CITESPAN_ORPHAN_ACTION_KEY": release.ORPHAN_ACTION_KEY},
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 70
+    assert "ambiguous-shell-command" in result.stdout
+
+
+def test_guarded_orphan_recovery_initializes_private_inputs_before_diagnostics():
+    recovery = release._guarded_orphan_recovery_script()
+    command = release._deployment_command(valid_payload())
+
+    assert release.ORPHAN_BACKUP_DIR in command
+    assert 'set -a; . "$runtime"; set +a;' in command
+    assert command.index('set -a; . "$runtime"; set +a;') < command.index(
+        "guarded_orphan_recovery"
+    )
+    assert recovery.index(
+        f"recovery_receipt={release.DEPLOY_PATH}/.citespan-authoritative-receipt.json"
+    ) < recovery.index(
+        "ps -eo pid=,ppid=,args="
+    )
+    assert 'test -f "$recovery_receipt" && test -f "$runtime_file"' in recovery
+
+
+def test_generated_authoritative_container_format_reports_observed_network_identity(bash_tmp_path):
+    recovery = release._guarded_orphan_recovery_script()
+    format_function = next(
+        line for line in recovery.splitlines() if line.startswith("    inspect_authoritative_container()")
+    )
+    expected_format = (
+        "{{.Id}}\t{{.Name}}\t{{.State.Status}}\t{{.Config.Image}}\t"
+        "{{range $network, $_ := .NetworkSettings.Networks}}{{$network}},{{end}}\t"
+        "{{range .Mounts}}{{.Type}}:{{.Name}}:{{.Destination}}:{{.RW}},{{end}}"
+    )
+    script = f'''#!/usr/bin/env bash
+set -Eeuo pipefail
+docker() {{
+    test "$1" = inspect
+    test "$2" = --format
+    test "$3" = "$EXPECTED_FORMAT"
+    printf '%s\\n' "container-id\\tcitespan-authoritative-postgres\\trunning\\tpostgres:17-alpine\\t$FIXTURE_NETWORK,\\tvolume:citespan-postgres-data:/var/lib/postgresql/data:true,"
+}}
+{format_function}
+inspect_authoritative_container citespan-authoritative-postgres
+'''
+    script_path = bash_tmp_path / "network-format.sh"
+    script_path.write_text(script, encoding="utf-8")
+
+    result = subprocess.run(
+        [str(_git_bash_executable()), _bash_path(script_path)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env={**os.environ, "EXPECTED_FORMAT": expected_format, "FIXTURE_NETWORK": "citespan-authoritative-network"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "citespan-authoritative-network" in result.stdout
+    expected_format = (
+        "docker inspect --format '{{.Id}}\t{{.Name}}\t{{.State.Status}}\t"
+        "{{.Config.Image}}\t{{range $network, $_ := .NetworkSettings.Networks}}"
+        "{{$network}},{{end}}\t{{range .Mounts}}"
+        "{{.Type}}:{{.Name}}:{{.Destination}}:{{.RW}},{{end}}'"
+    )
+    assert expected_format in release._guarded_orphan_recovery_script()
 
 
 def test_demo_audit_preserves_multiple_users_and_product_rows_after_clean_flow(tmp_path):
@@ -4171,7 +5833,9 @@ def test_generated_release_initializes_and_updates_protected_receipt_incremental
     command = release._deployment_command(valid_payload())
 
     assert "CITESPAN_SYNTHETIC_MARKER" in command
-    assert command.index("CITESPAN_SYNTHETIC_MARKER") < command.index("receipt=")
+    assert command.index(f"receipt={release.DEPLOY_PATH}/.citespan-authoritative-receipt.json") < command.index(
+        "authoritative receipt does not own existing network"
+    )
     assert "runtime env contains a missing or duplicate key" in command
     assert "runtime env has mismatched MinIO credentials" in command
     assert "resources" in command
@@ -5235,3 +6899,13 @@ def test_backend_demo_policy_blocks_the_entire_ingestion_prefix_and_upload():
     assert 'path.startswith("/ingest/")' in source
     assert "File upload and path ingestion are disabled in demo mode." in source
     assert '@app.post("/demo/reset")' in source
+
+
+def test_public_home_page_does_not_claim_unverified_hosted_features():
+    source = (ROOT / "frontend" / "app" / "page.tsx").read_text(encoding="utf-8")
+    assert "canonical synthetic sample" in source
+    assert "deterministic, not a live large language" in source
+    assert "any file formats" not in source
+    assert "interactive timelines" not in source
+    assert "visual link analysis" not in source
+    assert "automated" not in source
