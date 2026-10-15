@@ -62,7 +62,11 @@ CANONICAL_EVIDENCE_MANIFEST = {
 }
 
 
-class LiveUrlValidationError(ValueError):
+class PreflightValidationError(ValueError):
+    """The verifier arguments are invalid before any external interaction."""
+
+
+class LiveUrlValidationError(PreflightValidationError):
     """The verifier target is outside the authorized live origin."""
 
 
@@ -93,6 +97,33 @@ def _validate_live_url(value: object) -> str:
     ):
         raise LiveUrlValidationError("--url must be the authorized CiteSpan HTTPS origin")
     return AUTHORIZED_LIVE_ORIGIN
+
+
+def _validate_run_id(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise PreflightValidationError("--run-id must identify the canonical synthetic demo run")
+    if value != CANONICAL_DEMO_RUN_ID:
+        raise PreflightValidationError("--run-id must equal the canonical synthetic demo run ID")
+    return value
+
+
+def _validate_deployment_id(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise PreflightValidationError("--deployment-id must identify the observed deployment")
+    return value
+
+
+def _validate_output_dir(value: object) -> Path | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise PreflightValidationError("--output-dir must be an absolute directory path")
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        raise PreflightValidationError("--output-dir must be an absolute directory path")
+    if candidate.exists() and not candidate.is_dir():
+        raise PreflightValidationError("--output-dir must identify a directory path")
+    return candidate.resolve()
 
 
 def _require_project_python() -> None:
@@ -247,6 +278,34 @@ def _assert_exported_routes_use_trailing_slash() -> None:
         raise RuntimeError("live verification requires exported frontend routes with trailing slashes")
 
 
+def _close_browser_resources(page, context, browser, label: str) -> list[str]:
+    errors = []
+    for resource_name, resource in (("page", page), ("context", context), ("browser", browser)):
+        if resource is None:
+            continue
+        try:
+            resource.close()
+        except Exception as exc:
+            errors.append(
+                f"{label} {resource_name} close failed: {exc!r}\n"
+                f"step={label} resource={resource_name}\n"
+                f"traceback:\n{traceback.format_exc()}"
+            )
+    return errors
+
+
+def _raise_browser_flow_errors(primary_error, cleanup_errors: list[str]) -> None:
+    if primary_error is not None:
+        if cleanup_errors:
+            raise RuntimeError(
+                f"primary browser scenario failure: {primary_error}; "
+                f"cleanup failures: {'; '.join(cleanup_errors)}"
+            ) from primary_error
+        raise primary_error
+    if cleanup_errors:
+        raise RuntimeError("; ".join(cleanup_errors))
+
+
 def _write_proof_artifacts(
     output_dir: Path,
     live_url: str,
@@ -349,9 +408,9 @@ def _run_browser_flow(playwright, live_url: str, run_id: str, question: str, out
         raise RuntimeError("live verification requires the canonical synthetic demo run ID")
     email = f"citespan-proof-{uuid.uuid4().hex}@example.invalid"
     password = f"Proof-{uuid.uuid4().hex}!"
-    browser = playwright.chromium.launch(headless=True)
-    context = browser.new_context()
-    page = context.new_page()
+    browser = None
+    context = None
+    page = None
     query_response: dict | None = None
 
     def capture_query_response(response) -> None:
@@ -359,11 +418,16 @@ def _run_browser_flow(playwright, live_url: str, run_id: str, question: str, out
         if response.request.method == "POST" and response.url.rstrip("/").endswith("/query/plan"):
             query_response = response.json()
 
-    page.on("response", capture_query_response)
     parsed = urlsplit(live_url)
     origin = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
     expected_query_url = f"{origin}/query-plan/"
+    primary_error = None
+    cleanup_errors = []
     try:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+        page.on("response", capture_query_response)
         page.goto(live_url, wait_until="networkidle")
         if "CiteSpan" not in page.title() and "CiteSpan" not in page.locator("body").inner_text():
             raise RuntimeError("live page does not identify as CiteSpan")
@@ -455,14 +519,14 @@ def _run_browser_flow(playwright, live_url: str, run_id: str, question: str, out
             "upload_status": upload_response.status,
             "ingestion_statuses": ingestion_statuses,
         }
+    except BaseException as exc:
+        primary_error = exc
     finally:
-        context.close()
-        browser.close()
+        cleanup_errors = _close_browser_resources(page, context, browser, "live browser flow")
+    _raise_browser_flow_errors(primary_error, cleanup_errors)
 
 
 def main() -> int:
-    _require_project_python()
-    _require_python_playwright_version()
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default=os.environ.get("CITESPAN_URL", AUTHORIZED_LIVE_ORIGIN))
     parser.add_argument("--run-id", default=os.environ.get("CITESPAN_DEMO_RUN_ID"))
@@ -474,14 +538,15 @@ def main() -> int:
     )
     args = parser.parse_args()
     args.url = _validate_live_url(args.url)
-    if not args.run_id:
-        raise ValueError("--run-id must identify the canonical synthetic demo run")
-    if args.run_id != CANONICAL_DEMO_RUN_ID:
-        raise ValueError("--run-id must equal the canonical synthetic demo run ID")
-    if not args.deployment_id:
-        raise ValueError("--deployment-id must identify the observed deployment")
-    _assert_exported_routes_use_trailing_slash()
+    args.run_id = _validate_run_id(args.run_id)
+    args.deployment_id = _validate_deployment_id(args.deployment_id)
+    requested_output_dir = _validate_output_dir(args.output_dir)
+
     _validate_host_process_contract()
+    _require_project_python()
+    _require_python_playwright_version()
+    _assert_exported_routes_use_trailing_slash()
+    release._validate_browser_dependency_readiness(ROOT / "frontend")
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
@@ -489,8 +554,8 @@ def main() -> int:
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(PLAYWRIGHT_BROWSERS_PATH)
 
     output_dir = (
-        Path(args.output_dir).expanduser().resolve()
-        if args.output_dir
+        requested_output_dir
+        if requested_output_dir is not None
         else EXTERNAL_PROOF_ROOT / f"manual-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex}"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -535,7 +600,7 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as exc:
-        if isinstance(exc, LiveUrlValidationError):
+        if isinstance(exc, PreflightValidationError):
             print(json.dumps({"complete": False, "error": _sanitize_failure_text(str(exc))}))
             print(f"live verification failed before external interaction: {exc}", file=sys.stderr)
         else:

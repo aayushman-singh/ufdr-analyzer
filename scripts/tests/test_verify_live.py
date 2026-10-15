@@ -1,5 +1,7 @@
 import json
 import ctypes
+import contextvars
+from contextlib import contextmanager
 import errno
 import hashlib
 import os
@@ -13,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,6 +31,76 @@ import verify_live
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+class _PlatformBoundary:
+    def __init__(self, name):
+        self._name = contextvars.ContextVar("citespan_test_platform_name", default=name)
+
+    @property
+    def name(self):
+        return self._name.get()
+
+    @name.setter
+    def name(self, value):
+        self._name.set(value)
+
+
+_PLATFORM = _PlatformBoundary(os.name)
+
+
+@contextmanager
+def _platform_context(name):
+    token = _PLATFORM._name.set(name)
+    try:
+        yield
+    finally:
+        _PLATFORM._name.reset(token)
+
+
+def test_platform_boundary_keeps_native_pathlib_and_cache_paths():
+    native_path_type = type(Path.cwd())
+    with _platform_context("posix"):
+        assert _PLATFORM.name == "posix"
+        assert os.name == "nt"
+        cache_path = Path("pytest-root") / ".pytest_cache" / "v" / "cache"
+        assert type(cache_path) is native_path_type
+        assert cache_path.parts[-3:] == (".pytest_cache", "v", "cache")
+    assert _PLATFORM.name == os.name
+    assert type(Path("after-success")) is native_path_type
+
+
+def test_platform_boundary_restores_after_failure():
+    with pytest.raises(RuntimeError, match="platform fixture failure"):
+        with _platform_context("posix"):
+            raise RuntimeError("platform fixture failure")
+    assert _PLATFORM.name == os.name
+    assert type(Path("after-failure")) is type(Path.cwd())
+
+
+def test_platform_boundary_is_not_visible_to_concurrent_contexts():
+    observed = []
+    barrier = threading.Barrier(2)
+
+    def observe_platform():
+        barrier.wait()
+        observed.append(_PLATFORM.name)
+
+    with _platform_context("posix"):
+        worker = threading.Thread(target=observe_platform)
+        worker.start()
+        barrier.wait()
+        worker.join(timeout=5)
+
+    assert observed == [os.name]
+
+
+class ProcessIdentityAbsent(RuntimeError):
+    """The identity query completed and found no current process for the PID."""
+
+
+class ProcessIdentityReadError(RuntimeError):
+    """The identity query did not produce trustworthy process evidence."""
 
 
 def test_live_verifier_requires_the_project_virtual_environment(monkeypatch):
@@ -63,6 +136,85 @@ def test_browser_verifier_delegates_host_process_validation(monkeypatch):
 
     assert verify_live._validate_host_process_contract() == expected
     assert calls == [True]
+
+
+def test_main_stops_at_host_process_guard_before_browser_or_network_side_effects(monkeypatch):
+    events = []
+
+    def reject_host_process_evidence():
+        events.append("host-process-guard")
+        raise RuntimeError("host process evidence failed: bounded failure context")
+
+    monkeypatch.setattr(verify_live, "_validate_host_process_contract", reject_host_process_evidence)
+    monkeypatch.setattr(verify_live, "_require_project_python", lambda: events.append("python"))
+    monkeypatch.setattr(verify_live, "_require_python_playwright_version", lambda: events.append("playwright-version"))
+    monkeypatch.setattr(verify_live, "_run_browser_flow", lambda *args: events.append("browser"))
+    monkeypatch.setattr(
+        release,
+        "_validate_browser_dependency_readiness",
+        lambda *_args: events.append("dependency-readiness"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "verify_live.py",
+            "--url",
+            verify_live.AUTHORIZED_LIVE_ORIGIN,
+            "--run-id",
+            verify_live.CANONICAL_DEMO_RUN_ID,
+            "--deployment-id",
+            "citespan-test",
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="host process evidence failed: bounded failure context"):
+        verify_live.main()
+
+    assert events == ["host-process-guard"]
+
+
+class _BrowserResourceProbe:
+    def __init__(self, name, events, error=None):
+        self.name = name
+        self.events = events
+        self.error = error
+        self.close_count = 0
+
+    def close(self):
+        self.close_count += 1
+        self.events.append(self.name)
+        if self.error is not None:
+            raise self.error
+
+
+def test_browser_flow_closes_page_context_and_browser_and_preserves_primary_error():
+    events = []
+    page = _BrowserResourceProbe("page", events, RuntimeError("page close failed"))
+    context = _BrowserResourceProbe("context", events, RuntimeError("context close failed"))
+    browser = _BrowserResourceProbe("browser", events)
+    primary = RuntimeError("query failed")
+
+    with pytest.raises(RuntimeError, match="primary browser scenario failure: query failed") as raised:
+        cleanup = verify_live._close_browser_resources(page, context, browser, "live browser flow")
+        verify_live._raise_browser_flow_errors(primary, cleanup)
+
+    assert "page close failed" in str(raised.value)
+    assert "context close failed" in str(raised.value)
+    assert raised.value.__cause__ is primary
+    assert events == ["page", "context", "browser"]
+    assert page.close_count == context.close_count == browser.close_count == 1
+
+
+def test_browser_flow_cleanup_handles_partial_initialization():
+    events = []
+    context = _BrowserResourceProbe("context", events)
+
+    cleanup = verify_live._close_browser_resources(None, context, None, "live browser flow")
+
+    assert cleanup == []
+    assert events == ["context"]
+    assert context.close_count == 1
 
 
 def _remove_owned_fixture(path: Path, label: str) -> None:
@@ -131,12 +283,12 @@ def _launch_process_tree(argv, *, cwd=None, env=None):
     os.close(output_fd)
     output_path = Path(output_name)
     output_file = output_path.open("wb")
-    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if _PLATFORM.name == "nt" else 0
     launch_env = os.environ.copy() if env is None else env.copy()
     launch_env["CITESPAN_TEST_PROCESS_OWNER"] = uuid.uuid4().hex
     expected_cwd = str(Path(cwd or ROOT).resolve())
     effective_argv = [str(item) for item in argv]
-    if os.name == "nt":
+    if _PLATFORM.name == "nt":
         child_argv = [
             os.environ.get("COMSPEC", "cmd.exe"),
             "/d",
@@ -166,7 +318,7 @@ def _launch_process_tree(argv, *, cwd=None, env=None):
             stdout=output_file,
             stderr=subprocess.STDOUT,
             creationflags=creationflags,
-            start_new_session=os.name != "nt",
+            start_new_session=_PLATFORM.name != "nt",
         )
     except Exception:
         output_file.close()
@@ -174,6 +326,14 @@ def _launch_process_tree(argv, *, cwd=None, env=None):
         raise
     output_file.close()
     process._citespan_output_path = output_path
+    process._citespan_owner = {
+        "cwd": expected_cwd,
+        "argv": [str(item) for item in argv],
+        "effective_argv": effective_argv,
+        "pid": process.pid,
+        "owner_marker": launch_env["CITESPAN_TEST_PROCESS_OWNER"],
+        "creation_identity": None,
+    }
     while True:
         try:
             creation_identity = _process_metadata(process.pid)
@@ -185,50 +345,68 @@ def _launch_process_tree(argv, *, cwd=None, env=None):
                     f"process launch failed before identity capture for pid {process.pid}: "
                     f"returncode={process.returncode} error={exc}; process evidence={output[-4000:]}"
                 ) from exc
+            cleanup_error = None
+            try:
+                _terminate_unverified_process_tree(process, "process identity capture")
+            except RuntimeError as cleanup_exc:
+                cleanup_error = cleanup_exc
+            evidence = _read_process_output(process, retain=True)
             raise RuntimeError(
-                f"process identity capture failed for live pid {process.pid}: {exc}"
+                f"process identity capture failed for live pid {process.pid}: {exc}; "
+                f"process evidence={evidence[-4000:]}; cleanup={cleanup_error}"
             ) from exc
-    process._citespan_owner = {
-        "cwd": expected_cwd,
-        "argv": [str(item) for item in argv],
-        "effective_argv": effective_argv,
-        "pid": process.pid,
-        "creation_identity": creation_identity,
-    }
+    process._citespan_owner["creation_identity"] = creation_identity
     return process
 
 
 def _process_metadata(pid):
-    if os.name == "nt":
+    if _PLATFORM.name == "nt":
         command = (
             "$p = Get-CimInstance Win32_Process -Filter 'ProcessId = "
             f"{pid}'; "
             " if ($null -eq $p) { exit 3 }; $p | Select-Object ProcessId,ParentProcessId,"
             "CreationDate,ExecutablePath,CommandLine | ConvertTo-Json -Compress"
         )
-        result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ProcessIdentityReadError(
+                f"process identity lookup timed out for pid {pid}: timeout={exc.timeout}s "
+                f"stdout={getattr(exc, 'stdout', '')[-2000:]} stderr={getattr(exc, 'stderr', '')[-2000:]}"
+            ) from exc
+        if result.returncode == 3 and not result.stdout.strip() and not result.stderr.strip():
+            raise ProcessIdentityAbsent(f"process identity absent for pid {pid}: rc=3")
         if result.returncode != 0:
-            raise RuntimeError(
+            raise ProcessIdentityReadError(
                 f"process identity lookup failed for pid {pid}: rc={result.returncode} "
                 f"stdout={result.stdout[-2000:]} stderr={result.stderr[-2000:]}"
             )
-        metadata = json.loads(result.stdout)
-        return {
-            "pid": int(metadata["ProcessId"]),
-            "parent_pid": int(metadata["ParentProcessId"]),
-            "creation": _windows_creation_token(pid),
-            "executable": str(metadata.get("ExecutablePath") or ""),
-            "command": str(metadata.get("CommandLine") or ""),
-            "cwd": _windows_current_working_directory(pid),
-        }
-
+        try:
+            metadata = json.loads(result.stdout)
+            return {
+                "pid": int(metadata["ProcessId"]),
+                "parent_pid": int(metadata["ParentProcessId"]),
+                "creation": _windows_creation_token(pid),
+                "executable": str(metadata.get("ExecutablePath") or ""),
+                "command": str(metadata.get("CommandLine") or ""),
+                "cwd": _windows_current_working_directory(pid),
+            }
+        except ProcessIdentityReadError:
+            raise
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            raise ProcessIdentityReadError(
+                f"process identity query returned malformed output for pid {pid}: "
+                f"stdout={result.stdout[-2000:]} stderr={result.stderr[-2000:]}"
+            ) from exc
     proc_root = Path("/proc") / str(pid)
+    if not proc_root.exists():
+        raise ProcessIdentityAbsent(f"process identity absent for pid {pid}: proc entry missing")
     try:
         stat_fields = (proc_root / "stat").read_text(encoding="utf-8").split()
         command = (proc_root / "cmdline").read_bytes().replace(b"\x00", b" ").decode(errors="replace").strip()
@@ -241,11 +419,11 @@ def _process_metadata(pid):
             "cwd": str((proc_root / "cwd").resolve()),
         }
     except (FileNotFoundError, OSError, ValueError) as exc:
-        raise RuntimeError(f"process identity lookup failed for pid {pid}: {exc}") from exc
+        raise ProcessIdentityReadError(f"process identity lookup failed for pid {pid}: {exc}") from exc
 
 
 def _windows_creation_token(pid):
-    if os.name != "nt":
+    if _PLATFORM.name != "nt":
         raise RuntimeError("Windows creation token requested on a non-Windows host")
 
     class FileTime(ctypes.Structure):
@@ -288,7 +466,7 @@ def _windows_creation_token(pid):
 
 
 def _windows_current_working_directory(pid):
-    if os.name != "nt":
+    if _PLATFORM.name != "nt":
         raise RuntimeError("Windows current-directory lookup requested on a non-Windows host")
 
     class ProcessBasicInformation(ctypes.Structure):
@@ -357,7 +535,7 @@ def _windows_current_working_directory(pid):
 
 
 def _current_process_tree(root_pid):
-    if os.name == "nt":
+    if _PLATFORM.name == "nt":
         command = (
             "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,"
             "ExecutablePath,CommandLine | ConvertTo-Json -Compress"
@@ -471,7 +649,7 @@ def _assert_owned_process_tree(process):
         raise RuntimeError(
             f"process cleanup denied: root worktree changed; expected={owner['cwd']} current={current_root['cwd']}"
         )
-    if os.name == "nt":
+    if _PLATFORM.name == "nt":
         _assert_windows_owned_command(current_root, owner)
     elif current_root["command"].split()[: len(owner["argv"])] != owner["argv"]:
         raise RuntimeError(
@@ -500,13 +678,13 @@ def _canonical_path_identity(path):
     value = str(path or "")
     if not value:
         return ""
-    if os.name != "nt":
+    if _PLATFORM.name != "nt":
         return value
     return os.path.normcase(os.path.normpath(value)).casefold()
 
 
 def _windows_command_line_argv(command):
-    if os.name != "nt":
+    if _PLATFORM.name != "nt":
         raise RuntimeError("Windows command-line parsing requested on a non-Windows host")
     shell32 = ctypes.WinDLL("shell32", use_last_error=True)
     shell32.CommandLineToArgvW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
@@ -573,83 +751,381 @@ def _read_process_output(process, *, retain=False):
     return output
 
 
+def _terminate_unverified_process_tree(process, label, timeout=15, owned_port=None):
+    """Close only the directly owned launch handle before identity capture."""
+    owner = getattr(process, "_citespan_owner", None)
+    if owner is None or owner.get("creation_identity") is not None:
+        raise RuntimeError(f"{label} cleanup denied: launch identity state is not unverified")
+    if process.poll() is not None:
+        raise RuntimeError(f"{label} cleanup denied: root process {process.pid} already exited")
+    if [str(item) for item in process.args] != owner["effective_argv"]:
+        raise RuntimeError(
+            f"{label} cleanup denied: launch command changed; expected={owner['effective_argv']} actual={process.args}"
+        )
+    if owner["pid"] != process.pid or not owner["owner_marker"]:
+        raise RuntimeError(f"{label} cleanup denied: launch ownership marker is incomplete")
+    diagnostics = [
+        f"verified direct launch handle pid={process.pid} owner_marker={owner['owner_marker']}; "
+        "descendant ownership is unverified"
+    ]
+    try:
+        process.kill()
+        process.wait(timeout=timeout)
+        if process.poll() is None:
+            raise RuntimeError(f"{label} cleanup failed: root process {process.pid} remains")
+    except Exception as exc:
+        output_path = getattr(process, "_citespan_output_path", None)
+        try:
+            evidence = _read_process_output(process, retain=True)
+        except Exception as output_exc:
+            evidence = f"output read failed={output_exc} output_path_retained={output_path}"
+        raise RuntimeError(
+            f"{label} direct-handle containment failed for pid {process.pid}: {exc}; "
+            f"process evidence={evidence[-4000:]} output_path_retained={output_path}"
+        ) from exc
+    try:
+        diagnostics.append(_measure_post_containment_state(process, label, owned_port=owned_port))
+    except Exception as exc:
+        output_path = getattr(process, "_citespan_output_path", None)
+        try:
+            evidence = _read_process_output(process, retain=True)
+        except Exception as output_exc:
+            evidence = f"output read failed={output_exc} output_path_retained={output_path}"
+        raise RuntimeError(
+            f"{label} post-containment census failed for pid {process.pid}: {exc}; "
+            f"owned_port={owned_port!r}; descendant ownership and stop state are unverified; "
+            f"process evidence={evidence[-4000:]} output_path_retained={output_path}"
+        ) from exc
+    return "\n".join(diagnostics)
+
+
+def _measure_post_containment_state(process, label, *, owned_port=None):
+    try:
+        current = _process_metadata(process.pid)
+    except ProcessIdentityAbsent:
+        if process.poll() is None:
+            raise RuntimeError(
+                f"{label} post-containment census failed: root process reports live but identity is absent "
+                f"for pid {process.pid}"
+            )
+        if owned_port is not None:
+            _assert_port_closed(owned_port, label)
+        return (
+            f"{label} post-containment census root=absent; descendants=unverified; "
+            "tree cleanup is not proved"
+        )
+    except ProcessIdentityReadError as exc:
+        raise RuntimeError(
+            f"{label} post-containment census failed: root process state is unreadable for pid "
+            f"{process.pid}: {exc}"
+        ) from exc
+    raise RuntimeError(
+        f"{label} post-containment census found a potentially related process: "
+        f"pid={process.pid} identity={current}; descendant ownership and stop state are unverified"
+    )
+
+
+def _terminate_verified_windows_identity(item, label, timeout):
+    if _PLATFORM.name != "nt":
+        raise RuntimeError(f"{label} cleanup denied: Windows process handle requested on a non-Windows host")
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetProcessTimes.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+    ]
+    kernel32.GetProcessTimes.restype = ctypes.c_int
+    kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.TerminateProcess.restype = ctypes.c_int
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.OpenProcess(0x101001, 0, int(item["pid"]))
+    if not handle:
+        raise RuntimeError(
+            f"{label} cleanup failed: exact process handle open failed for pid={item['pid']} "
+            f"WinError={ctypes.get_last_error()}"
+        )
+    try:
+        creation = FileTime()
+        exit_time = FileTime()
+        kernel_time = FileTime()
+        user_time = FileTime()
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        ):
+            raise RuntimeError(
+                f"{label} cleanup failed: exact creation identity read failed for pid={item['pid']} "
+                f"WinError={ctypes.get_last_error()}"
+            )
+        observed_creation = str((creation.high << 32) | creation.low)
+        if observed_creation != str(item["creation"]):
+            raise RuntimeError(
+                f"{label} cleanup denied: process identity changed before handle stop: "
+                f"pid={item['pid']} expected_creation={item['creation']} current_creation={observed_creation}"
+            )
+        if not kernel32.TerminateProcess(handle, 1):
+            raise RuntimeError(
+                f"{label} cleanup failed: exact process handle termination failed for pid={item['pid']} "
+                f"WinError={ctypes.get_last_error()}"
+            )
+        wait_result = kernel32.WaitForSingleObject(handle, int(timeout * 1000))
+        if wait_result != 0:
+            raise RuntimeError(
+                f"{label} cleanup failed: exact process handle did not exit for pid={item['pid']} "
+                f"wait_result={wait_result}"
+            )
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _poll_process_terminal_state(item, label):
+    """Read only the native terminal state for one selected identity."""
+    pid = item["pid"]
+    if _PLATFORM.name != "nt":
+        try:
+            current = _process_metadata(pid)
+        except ProcessIdentityAbsent:
+            return {"pid": pid, "state": "verified_absent", "creation": item["creation"]}
+        except ProcessIdentityReadError as exc:
+            raise RuntimeError(
+                f"{label} cleanup failed: cannot prove process identity {pid} is absent: {exc}"
+            ) from exc
+        if current["creation"] != item["creation"]:
+            return {
+                "pid": pid,
+                "state": "pid_reused_after_exit",
+                "creation": item["creation"],
+                "current_creation": current["creation"],
+                "current_identity": current,
+            }
+        return {"pid": pid, "state": "live", "creation": item["creation"]}
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    kernel32.GetProcessTimes.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+    ]
+    kernel32.GetProcessTimes.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.OpenProcess(0x1000, 0, int(pid))
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == 87:
+            return {"pid": pid, "state": "verified_absent", "creation": item["creation"]}
+        raise RuntimeError(
+            f"{label} cleanup failed: terminal handle open failed: pid={pid} WinError={error}"
+        )
+    try:
+        creation = FileTime()
+        exit_code = ctypes.c_uint32()
+        if not kernel32.GetProcessTimes(
+            handle, ctypes.byref(creation), ctypes.byref(FileTime()), ctypes.byref(FileTime()), ctypes.byref(FileTime())
+        ):
+            raise RuntimeError(
+                f"{label} cleanup failed: terminal creation read failed: pid={pid} "
+                f"WinError={ctypes.get_last_error()}"
+            )
+        observed_creation = str((creation.high << 32) | creation.low)
+        if observed_creation != str(item["creation"]):
+            return {
+                "pid": pid,
+                "state": "pid_reused_after_exit",
+                "creation": item["creation"],
+                "current_creation": observed_creation,
+            }
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            raise RuntimeError(
+                f"{label} cleanup failed: terminal state read failed: pid={pid} "
+                f"WinError={ctypes.get_last_error()}"
+            )
+        if exit_code.value == 259:
+            return {"pid": pid, "state": "live", "creation": item["creation"]}
+        return {"pid": pid, "state": "verified_exited", "creation": item["creation"]}
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _stop_verified_process_identities(identities, label, timeout, *, state_map=None, phase_times=None):
+    """Stop one leaf-first batch and cache every terminal identity state."""
+    terminal_states = []
+    state_map = {} if state_map is None else state_map
+    phase_times = {} if phase_times is None else phase_times
+    deadline = time.monotonic() + timeout
+    for item in reversed(list(identities)):
+        pid = item["pid"]
+        cached = state_map.get(pid)
+        if cached is not None and cached["state"] != "live":
+            terminal_states.append(cached)
+            continue
+        identity_started = time.monotonic()
+        try:
+            current = _process_metadata(pid)
+        except ProcessIdentityAbsent:
+            state = {"pid": pid, "state": "already_exited", "creation": item["creation"]}
+            state_map[pid] = state
+            terminal_states.append(state)
+            phase_times["identity_read"] = phase_times.get("identity_read", 0.0) + time.monotonic() - identity_started
+            continue
+        except ProcessIdentityReadError as exc:
+            raise RuntimeError(
+                f"{label} cleanup failed: cannot revalidate process identity before stop: "
+                f"pid={pid} error={exc}"
+            ) from exc
+        phase_times["identity_read"] = phase_times.get("identity_read", 0.0) + time.monotonic() - identity_started
+        for field in ("creation", "executable", "command", "cwd", "parent_pid"):
+            if current.get(field) != item.get(field):
+                raise RuntimeError(
+                    f"{label} cleanup denied: identity changed before stop: pid={pid} "
+                    f"field={field} expected={item.get(field)!r} current={current.get(field)!r}"
+                )
+        if deadline - time.monotonic() <= 0:
+            raise RuntimeError(
+                f"{label} cleanup failed: stop deadline exhausted: pid={pid} identity={item}"
+            )
+        stop_started = time.monotonic()
+        if _PLATFORM.name == "nt":
+            _terminate_verified_windows_identity(item, label, max(0.0, deadline - time.monotonic()))
+        else:
+            os.kill(pid, signal.SIGTERM)
+        phase_times["stop"] = phase_times.get("stop", 0.0) + time.monotonic() - stop_started
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"{label} cleanup failed: terminal poll deadline exhausted: pid={pid} identity={item}"
+                )
+            poll_started = time.monotonic()
+            state = _poll_process_terminal_state(item, label)
+            phase_times["terminal_poll"] = phase_times.get("terminal_poll", 0.0) + time.monotonic() - poll_started
+            if state["state"] != "live":
+                state_map[pid] = state
+                terminal_states.append(state)
+                break
+            time.sleep(min(0.05, remaining))
+    return terminal_states
+
+
 def _terminate_process_tree(process, label, timeout=15, owned_port=None):
     if process is None:
         return ""
     diagnostics = []
     try:
-        if process.poll() is not None:
-            raise RuntimeError(f"root process {process.pid} exited before owned-tree verification")
-        tree = _assert_owned_process_tree(process)
-        recorded_identities = {
-            item["pid"]: item["creation"] for item in tree
-        }
-        diagnostics.append(
-            "verified owned process tree=" + ",".join(str(item["pid"]) for item in tree)
-        )
-        if process.poll() is None:
-            if os.name == "nt":
-                result = subprocess.run(
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    check=False,
-                )
-                diagnostics.append(
-                    f"taskkill rc={result.returncode} stdout={result.stdout[-2000:]} stderr={result.stderr[-2000:]}"
-                )
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        f"taskkill failed with exit code {result.returncode}: "
-                        f"stdout={result.stdout[-2000:]} stderr={result.stderr[-2000:]}"
-                    )
-            else:
-                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        owner = getattr(process, "_citespan_owner", None)
+        if owner is None or not isinstance(owner.get("creation_identity"), dict):
+            raise RuntimeError(f"{label} cleanup denied: exact root identity was not captured")
+        deadline = time.monotonic() + timeout
+        recorded_by_pid = {process.pid: dict(owner["creation_identity"])}
+        state_map = {process.pid: {"pid": process.pid, "state": "live", "creation": owner["creation_identity"]["creation"]}}
+        phase_times = {}
+        while True:
+            census_started = time.monotonic()
             try:
-                process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                if os.name == "nt":
-                    result = subprocess.run(
-                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                        check=False,
+                tree = _assert_owned_process_tree(process)
+            except ProcessIdentityAbsent:
+                if process.poll() is None:
+                    raise
+                tree = [
+                    item for pid, item in recorded_by_pid.items() if pid != process.pid
+                ]
+                state_map[process.pid] = {
+                    "pid": process.pid,
+                    "state": "already_exited",
+                    "creation": owner["creation_identity"]["creation"],
+                }
+            phase_times["census"] = phase_times.get("census", 0.0) + time.monotonic() - census_started
+            for item in tree:
+                previous = recorded_by_pid.get(item["pid"])
+                if previous is not None and previous["creation"] != item["creation"]:
+                    raise RuntimeError(
+                        f"{label} cleanup denied: descendant PID was reused: "
+                        f"pid={item['pid']} recorded={previous} current={item}"
                     )
-                    if result.returncode != 0:
-                        raise RuntimeError(
-                            f"taskkill escalation failed with exit code {result.returncode}: "
-                            f"stdout={result.stdout[-2000:]} stderr={result.stderr[-2000:]}"
-                        )
-                else:
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                process.wait(timeout=timeout)
+                recorded_by_pid[item["pid"]] = item
+                state_map.setdefault(item["pid"], {"pid": item["pid"], "state": "live", "creation": item["creation"]})
+            diagnostics.append(
+                "verified owned process tree=" + ",".join(str(item["pid"]) for item in tree)
+            )
+            descendants = [
+                item
+                for item in tree
+                if item["pid"] != process.pid and state_map[item["pid"]]["state"] == "live"
+            ]
+            if descendants:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        f"{label} cleanup failed: owned descendant drain deadline exhausted; "
+                        f"remaining={descendants} phase_times={phase_times}"
+                    )
+                terminal_states = _stop_verified_process_identities(
+                    descendants,
+                    label,
+                    remaining,
+                    state_map=state_map,
+                    phase_times=phase_times,
+                )
+                for state in terminal_states:
+                    state_map[state["pid"]] = state
+                diagnostics.extend(
+                    f"verified terminal state pid={item['pid']} state={item['state']}"
+                    for item in terminal_states
+                )
+                continue
+            break
+        root_identity = recorded_by_pid[process.pid]
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"{label} cleanup failed: root stop deadline exhausted; phase_times={phase_times}"
+            )
+        terminal_states = _stop_verified_process_identities(
+            [root_identity], label, remaining, state_map=state_map, phase_times=phase_times
+        )
+        for state in terminal_states:
+            state_map[state["pid"]] = state
+        diagnostics.extend(
+            f"verified terminal state pid={item['pid']} state={item['state']}"
+            for item in terminal_states
+        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"{label} cleanup failed: completion deadline exhausted; phase_times={phase_times}")
+        process.wait(timeout=remaining)
         if process.poll() is None:
             raise RuntimeError(f"{label} cleanup failed: root process {process.pid} remains")
-        for pid, creation in recorded_identities.items():
-            try:
-                current = _process_metadata(pid)
-            except RuntimeError as exc:
-                if "rc=3 stdout= stderr=" not in str(exc) and "No such file or directory" not in str(exc):
-                    raise RuntimeError(
-                        f"{label} cleanup failed: cannot prove process identity {pid} is absent: {exc}"
-                    ) from exc
-            else:
-                if current["creation"] == creation:
-                    raise RuntimeError(
-                        f"{label} cleanup failed: recorded process identity remains active: "
-                        f"pid={pid} creation={creation} current={current}"
-                    )
-                raise RuntimeError(
-                    f"{label} cleanup failed: process identity changed while pid remained active: "
-                    f"pid={pid} recorded_creation={creation} current={current}"
-                )
+        if any(state["state"] == "live" for state in state_map.values()):
+            raise RuntimeError(f"{label} cleanup failed: live recorded identities remain; phase_times={phase_times}")
         if owned_port is not None:
             _assert_port_closed(owned_port, label)
         output = _read_process_output(process)
         if output:
             diagnostics.append(f"captured output={output}")
+        diagnostics.append(f"phase_times={phase_times}")
         return "\n".join(diagnostics)
     except Exception as exc:
         output_path = getattr(process, "_citespan_output_path", None)
@@ -658,7 +1134,8 @@ def _terminate_process_tree(process, label, timeout=15, owned_port=None):
         except Exception as output_exc:
             evidence = f"output cleanup error={output_exc} output_path_retained={output_path}"
         raise RuntimeError(
-            f"{label} cleanup failed for pid {process.pid}: {exc}; process evidence={evidence[-4000:]} "
+            f"{label} cleanup failed for pid {process.pid}: {exc}; phase_times={locals().get('phase_times', {})}; "
+            f"process evidence={evidence[-4000:]} "
             f"output_path={output_path}"
         ) from exc
 
@@ -671,6 +1148,39 @@ def _assert_port_closed(port, label):
         except OSError:
             return
     raise RuntimeError(f"{label} cleanup failed: port {port} remains open")
+
+
+def _assert_frontend_resources_released(frontend_port, label):
+    """Require the scoped frontend census to show no owned process or holder."""
+    resources = release._enumerate_fresh_frontend_resources()
+    product_root = str(ROOT.resolve())
+    scope = release._fresh_resource_scope(
+        resources,
+        product_root,
+        scoped_ports={frontend_port},
+    )
+    native_module = release._host_path_identity(
+        (release.SCRIPT_ROOT / release.HOST_NATIVE_MODULE).resolve()
+    )
+    processes = scope["relevant_processes"]
+    holders = [
+        item
+        for item in resources.get("holders", [])
+        if any(
+            isinstance(path, str) and release._host_path_identity(path) == native_module
+            for path in item.get("module_paths", [])
+        )
+    ]
+    ports = [
+        item
+        for item in resources.get("ports", [])
+        if item.get("port") == frontend_port
+    ]
+    if processes or holders or ports:
+        raise RuntimeError(
+            f"{label} cleanup failed: scoped frontend resources remain: "
+            f"processes={processes} native module holders={holders} ports={ports}"
+        )
 
 
 def _close_browser_resources(page, context, browser, label):
@@ -703,6 +1213,389 @@ def _raise_browser_test_errors(primary_error, cleanup_errors):
         raise primary_error
     if cleanup_errors:
         raise RuntimeError("; ".join(cleanup_errors))
+
+
+def _record_cleanup_failure(cleanup_errors, step, exc):
+    cleanup_errors.append(
+        f"cleanup step={step} failed: {type(exc).__name__}: {exc}\n"
+        f"cause={exc.__cause__!r}\n"
+        f"context={exc.__context__!r}\n"
+        f"traceback:\n{traceback.format_exc()}"
+    )
+
+
+def test_launch_identity_timeout_closes_only_the_owned_handle(monkeypatch):
+    process_holder = {}
+    terminate = _terminate_unverified_process_tree
+
+    def timed_out(_pid):
+        raise RuntimeError("process identity lookup timed out for pid 123: timeout=10s")
+
+    def capture_and_terminate(process, label, *args, **kwargs):
+        process_holder["process"] = process
+        return terminate(process, label, *args, **kwargs)
+
+    monkeypatch.setattr(sys.modules[__name__], "_process_metadata", timed_out)
+    monkeypatch.setattr(sys.modules[__name__], "_terminate_unverified_process_tree", capture_and_terminate)
+
+    with pytest.raises(RuntimeError, match=r"identity capture[\s\S]*timed out[\s\S]*cleanup"):
+        process_holder["process"] = _launch_process_tree(
+            [sys.executable, "-c", "import time; time.sleep(60)"]
+        )
+
+    process = process_holder["process"]
+    assert process.poll() is not None
+    assert process._citespan_output_path.exists()
+
+
+def test_unverified_cleanup_does_not_target_descendants(monkeypatch):
+    calls = []
+    alive = {"value": True}
+    process = SimpleNamespace(
+        pid=123,
+        args=["expected-command"],
+        poll=lambda: 0 if not alive["value"] else None,
+        kill=lambda: (calls.append("direct-handle"), alive.__setitem__("value", False)),
+        wait=lambda timeout: (calls.append(("wait", timeout)), alive.__setitem__("value", False)),
+        _citespan_owner={
+            "pid": 123,
+            "effective_argv": ["expected-command"],
+            "owner_marker": "marker",
+            "creation_identity": None,
+        },
+    )
+    monkeypatch.setattr(sys.modules[__name__], "_read_process_output", lambda *_args, **_kwargs: "captured")
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_measure_post_containment_state",
+        lambda *_args, **_kwargs: "post-containment census root=absent; descendants=unverified",
+    )
+
+    _terminate_unverified_process_tree(process, "identity capture")
+
+    assert calls[0] == "direct-handle"
+    assert all(call != "taskkill-tree" for call in calls)
+
+
+def test_unverified_cleanup_fails_when_post_containment_census_is_unreadable(monkeypatch):
+    alive = {"value": True}
+    process = SimpleNamespace(
+        pid=123,
+        args=["expected-command"],
+        poll=lambda: None if alive["value"] else 0,
+        kill=lambda: alive.__setitem__("value", False),
+        wait=lambda timeout: None,
+        _citespan_owner={
+            "pid": 123,
+            "effective_argv": ["expected-command"],
+            "owner_marker": "marker",
+            "creation_identity": None,
+        },
+    )
+    monkeypatch.setattr(sys.modules[__name__], "_read_process_output", lambda *_args, **_kwargs: "captured")
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_process_metadata",
+        lambda _pid: (_ for _ in ()).throw(RuntimeError("metadata timeout")),
+    )
+
+    with pytest.raises(RuntimeError, match=r"post-containment census failed.*metadata timeout"):
+        _terminate_unverified_process_tree(process, "identity capture")
+
+
+def test_unverified_containment_does_not_report_tree_cleanup_success(monkeypatch):
+    alive = {"value": True}
+    process = SimpleNamespace(
+        pid=123,
+        args=["expected-command"],
+        poll=lambda: None if alive["value"] else 0,
+        kill=lambda: alive.__setitem__("value", False),
+        wait=lambda timeout: None,
+        _citespan_owner={
+            "pid": 123,
+            "effective_argv": ["expected-command"],
+            "owner_marker": "marker",
+            "creation_identity": None,
+        },
+    )
+    monkeypatch.setattr(sys.modules[__name__], "_read_process_output", lambda *_args, **_kwargs: "captured")
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_measure_post_containment_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("descendant ownership and stop state are unverified")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="descendant ownership and stop state are unverified"):
+        _terminate_unverified_process_tree(process, "identity capture")
+
+
+def test_verified_identity_stop_rejects_pid_reuse(monkeypatch):
+    identity = {
+        "pid": 123,
+        "creation": "old",
+        "executable": "python.exe",
+        "command": "python worker.py",
+        "cwd": str(ROOT),
+        "parent_pid": 1,
+    }
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_process_metadata",
+        lambda _pid: {**identity, "creation": "replacement"},
+    )
+    kill_calls = []
+    monkeypatch.setattr(os, "kill", lambda *args: kill_calls.append(args))
+
+    with pytest.raises(RuntimeError, match="identity changed before stop"):
+        _stop_verified_process_identities([identity], "verified cleanup", 1)
+    assert kill_calls == []
+
+
+def test_verified_identity_stop_records_a_child_that_exited_before_stop(monkeypatch):
+    identity = {
+        "pid": 124,
+        "creation": "child",
+        "executable": "python.exe",
+        "command": "python child.py",
+        "cwd": str(ROOT),
+        "parent_pid": 123,
+    }
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_process_metadata",
+        lambda _pid: (_ for _ in ()).throw(ProcessIdentityAbsent("verified absent")),
+    )
+    monkeypatch.setattr(os, "kill", lambda *_args: pytest.fail("absent PID must not be stopped"))
+
+    terminal_states = _stop_verified_process_identities([identity], "verified cleanup", 1)
+
+    assert terminal_states == [{"pid": 124, "state": "already_exited", "creation": "child"}]
+
+
+def test_verified_identity_stop_records_an_absent_root(monkeypatch):
+    identity = {
+        "pid": 123,
+        "creation": "root",
+        "executable": "python.exe",
+        "command": "python root.py",
+        "cwd": str(ROOT),
+        "parent_pid": 1,
+    }
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_process_metadata",
+        lambda _pid: (_ for _ in ()).throw(ProcessIdentityAbsent("verified absent")),
+    )
+
+    assert _stop_verified_process_identities([identity], "verified cleanup", 1) == [
+        {"pid": 123, "state": "already_exited", "creation": "root"}
+    ]
+
+
+def test_verified_identity_stop_rejects_pid_reuse_after_natural_child_exit(monkeypatch):
+    identity = {
+        "pid": 124,
+        "creation": "child",
+        "executable": "python.exe",
+        "command": "python child.py",
+        "cwd": str(ROOT),
+        "parent_pid": 123,
+    }
+    observations = iter(["absent", {**identity, "creation": "replacement"}])
+    reads = []
+
+    def metadata(_pid):
+        reads.append(_pid)
+        observation = next(observations)
+        if observation == "absent":
+            raise ProcessIdentityAbsent("child exited")
+        return observation
+
+    monkeypatch.setattr(sys.modules[__name__], "_process_metadata", metadata)
+    monkeypatch.setattr(os, "kill", lambda *_args: pytest.fail("absent PID must not be stopped"))
+
+    assert _stop_verified_process_identities([identity], "verified cleanup", 1) == [
+        {"pid": 124, "state": "already_exited", "creation": "child"}
+    ]
+    assert reads == [124]
+
+
+def test_verified_identity_stop_records_pid_reuse_after_owned_stop(monkeypatch):
+    identity = {
+        "pid": 124,
+        "creation": "child",
+        "executable": "python.exe",
+        "command": "python child.py",
+        "cwd": str(ROOT),
+        "parent_pid": 123,
+    }
+    replacement = {**identity, "creation": "replacement", "command": "python unrelated.py"}
+    observations = iter([identity, replacement, replacement])
+
+    monkeypatch.setattr(sys.modules[__name__], "_process_metadata", lambda _pid: next(observations))
+    monkeypatch.setattr(os, "kill", lambda *_args: None)
+    monkeypatch.setattr(_PLATFORM, "name", "posix")
+
+    assert _stop_verified_process_identities([identity], "verified cleanup", 1) == [
+        {
+            "pid": 124,
+            "state": "pid_reused_after_exit",
+            "creation": "child",
+            "current_creation": "replacement",
+            "current_identity": replacement,
+        }
+    ]
+
+
+def test_verified_identity_stop_rejects_unreadable_post_stop_identity(monkeypatch):
+    identity = {
+        "pid": 124,
+        "creation": "child",
+        "executable": "python.exe",
+        "command": "python child.py",
+        "cwd": str(ROOT),
+        "parent_pid": 123,
+    }
+    observations = iter([identity, ProcessIdentityReadError("access denied")])
+
+    def metadata(_pid):
+        observation = next(observations)
+        if isinstance(observation, BaseException):
+            raise observation
+        return observation
+
+    monkeypatch.setattr(sys.modules[__name__], "_process_metadata", metadata)
+    monkeypatch.setattr(os, "kill", lambda *_args: None)
+    monkeypatch.setattr(_PLATFORM, "name", "posix")
+
+    with pytest.raises(RuntimeError, match="cannot prove process identity 124 is absent: access denied"):
+        _stop_verified_process_identities([identity], "verified cleanup", 1)
+
+
+def test_process_identity_unreadable_query_is_not_absence(monkeypatch):
+    result = SimpleNamespace(returncode=5, stdout="", stderr="access denied")
+    monkeypatch.setattr(_PLATFORM, "name", "nt")
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: result)
+
+    with pytest.raises(ProcessIdentityReadError, match="access denied"):
+        _process_metadata(123)
+
+
+def test_process_identity_malformed_query_is_not_absence(monkeypatch):
+    result = SimpleNamespace(returncode=0, stdout="not-json", stderr="")
+    monkeypatch.setattr(_PLATFORM, "name", "nt")
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: result)
+
+    with pytest.raises(ProcessIdentityReadError, match="malformed output"):
+        _process_metadata(123)
+
+
+def test_verified_identity_stop_handles_mixed_natural_exit_and_exact_stops(monkeypatch):
+    identities = [
+        {
+            "pid": 123,
+            "creation": "root",
+            "executable": "python.exe",
+            "command": "python root.py",
+            "cwd": str(ROOT),
+            "parent_pid": 1,
+        },
+        {
+            "pid": 124,
+            "creation": "exited-child",
+            "executable": "python.exe",
+            "command": "python exited.py",
+            "cwd": str(ROOT),
+            "parent_pid": 123,
+        },
+        {
+            "pid": 125,
+            "creation": "live-child",
+            "executable": "python.exe",
+            "command": "python live.py",
+            "cwd": str(ROOT),
+            "parent_pid": 123,
+        },
+    ]
+    active = {123: identities[0], 125: identities[2]}
+    calls = []
+
+    def metadata(pid):
+        if pid == 124:
+            raise ProcessIdentityAbsent("child exited")
+        if pid not in active:
+            raise ProcessIdentityAbsent("stopped")
+        return dict(active[pid])
+
+    def stop(pid, _signal):
+        calls.append(pid)
+        active.pop(pid)
+
+    monkeypatch.setattr(sys.modules[__name__], "_process_metadata", metadata)
+    monkeypatch.setattr(os, "kill", stop)
+    monkeypatch.setattr(_PLATFORM, "name", "posix")
+
+    terminal_states = _stop_verified_process_identities(identities, "verified cleanup", 1)
+
+    assert calls == [125, 123]
+    assert {item["pid"] for item in terminal_states} == {123, 124, 125}
+
+
+def test_verified_unchanged_identity_set_is_stopped_and_verified(monkeypatch):
+    identities = [
+        {
+            "pid": 123,
+            "creation": "root",
+            "executable": "python.exe",
+            "command": "python root.py",
+            "cwd": str(ROOT),
+            "parent_pid": 1,
+        },
+        {
+            "pid": 124,
+            "creation": "child",
+            "executable": "python.exe",
+            "command": "python child.py",
+            "cwd": str(ROOT),
+            "parent_pid": 123,
+        },
+    ]
+    active = {item["pid"]: item for item in identities}
+    calls = []
+
+    def metadata(pid):
+        if pid not in active:
+            raise ProcessIdentityAbsent("stopped")
+        return dict(active[pid])
+
+    def stop(pid, _signal):
+        calls.append(pid)
+        active.pop(pid)
+
+    monkeypatch.setattr(sys.modules[__name__], "_process_metadata", metadata)
+    monkeypatch.setattr(os, "kill", stop)
+    monkeypatch.setattr(_PLATFORM, "name", "posix")
+    _stop_verified_process_identities(identities, "verified cleanup", 1)
+    assert calls == [124, 123]
+
+
+def test_unverified_process_cleanup_rejects_changed_launch_contract(monkeypatch):
+    process = SimpleNamespace(
+        pid=123,
+        args=["changed-command"],
+        poll=lambda: None,
+        _citespan_owner={
+            "pid": 123,
+            "effective_argv": ["expected-command"],
+            "owner_marker": "marker",
+            "creation_identity": None,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="launch command changed"):
+        _terminate_unverified_process_tree(process, "identity capture")
 
 
 def _validation_evidence_diagnostic(path, generation, cursors, state):
@@ -843,6 +1736,35 @@ def test_dialog_detachment_failure_preserves_primary_and_cleanup_errors():
         _raise_browser_test_errors(primary_error, cleanup_errors)
 
     assert raised.value.__cause__ is primary_error
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        "dialog-detach",
+        "browser-resource-close",
+        "playwright-stop",
+        "process-tree-termination",
+        "api-server-cleanup",
+        "port-proof",
+        "frontend-resource-proof",
+    ],
+)
+def test_each_browser_cleanup_step_preserves_original_traceback(step):
+    cleanup_errors = []
+    try:
+        raise KeyError("parent_pid")
+    except KeyError as exc:
+        _record_cleanup_failure(cleanup_errors, step, exc)
+
+    with pytest.raises(RuntimeError) as raised:
+        _raise_browser_test_errors(None, cleanup_errors)
+
+    message = str(raised.value)
+    assert f"cleanup step={step} failed" in message
+    assert "KeyError" in message
+    assert "parent_pid" in message
+    assert "test_each_browser_cleanup_step_preserves_original_traceback" in message
 
 
 def test_preflight_contract_rejects_cached_or_missing_max_age():
@@ -2828,7 +3750,7 @@ def _load_legacy_process_evidence():
 
 
 def _frontend_process_graph():
-    if os.name != "nt":
+    if _PLATFORM.name != "nt":
         return {
             pid: {
                 "pid": pid,
@@ -2958,7 +3880,7 @@ def _frontend_enrichment_pids(graph, explicit_pids, protected_pids, expected_cwd
 
 
 def _frontend_current_argv(command):
-    return _windows_command_line_argv(command) if os.name == "nt" else command.split()
+    return _windows_command_line_argv(command) if _PLATFORM.name == "nt" else command.split()
 
 
 def _frontend_selection_identity(record, current):
@@ -3255,7 +4177,7 @@ def _frontend_current_ancestry(pid, graph, parent_observations):
                 raise RuntimeError(
                     f"frontend dependency parent proof is incomplete: pid={pid} parent={current} fields={missing}"
                 )
-            parsed = _windows_command_line_argv(metadata["command"]) if os.name == "nt" else metadata["command"].split()
+            parsed = _windows_command_line_argv(metadata["command"]) if _PLATFORM.name == "nt" else metadata["command"].split()
             if (
                 metadata["creation"] != str(observation["creation"])
                 or metadata["parent_pid"] != int(observation["parent_pid"])
@@ -3538,7 +4460,7 @@ def test_frontend_current_ancestry_rejects_a_real_cycle(monkeypatch):
 
 
 def _frontend_loaded_modules(pid):
-    if os.name != "nt":
+    if _PLATFORM.name != "nt":
         maps = Path("/proc") / str(pid) / "maps"
         try:
             return [line.rsplit(maxsplit=1)[-1] for line in maps.read_text(encoding="utf-8").splitlines() if "/" in line]
@@ -3578,7 +4500,7 @@ def _frontend_candidate_tree(candidate, graph, expected_cwd):
         raise RuntimeError(f"frontend dependency ownership proof is outside frontend worktree: pid={candidate['pid']}")
     current_argv = (
         _windows_command_line_argv(current["command"])
-        if os.name == "nt"
+        if _PLATFORM.name == "nt"
         else current["command"].split()
     )
     if current_argv != [str(item) for item in current_record["argv"]]:
@@ -3628,7 +4550,7 @@ def _frontend_additional_tree(record, graph, expected_cwd):
         raise RuntimeError(f"frontend dependency additional identity is outside frontend worktree: pid={record['pid']}")
     if _canonical_path_identity(current["executable"]) != _canonical_path_identity(record["executable"]):
         raise RuntimeError(f"frontend dependency ownership proof changed additional executable: pid={record['pid']}")
-    parsed = _windows_command_line_argv(current["command"]) if os.name == "nt" else current["command"].split()
+    parsed = _windows_command_line_argv(current["command"]) if _PLATFORM.name == "nt" else current["command"].split()
     if parsed != [str(item) for item in record["argv"]]:
         raise RuntimeError(f"frontend dependency ownership proof changed additional argv: pid={record['pid']}")
     if hashlib.sha256("\0".join(parsed).encode("utf-8")).hexdigest() != str(record["argv_sha256"]):
@@ -3642,19 +4564,41 @@ def _frontend_additional_tree(record, graph, expected_cwd):
     return tree
 
 
-def _assert_recorded_process_identities_stopped(recorded, label):
-    for pid, creation in recorded.items():
+def _assert_recorded_process_identities_stopped(
+    recorded, label, *, allow_pid_reuse_after_stop=frozenset()
+):
+    if isinstance(recorded, dict):
+        expected = recorded.items()
+    else:
+        expected = ((item["pid"], item["creation"]) for item in recorded)
+    terminal_states = []
+    for pid, creation in expected:
         try:
             current = _process_metadata(pid)
-        except RuntimeError as exc:
-            if "rc=3 stdout= stderr=" in str(exc) or "No such file or directory" in str(exc):
-                continue
+        except ProcessIdentityAbsent:
+            terminal_states.append({"pid": pid, "state": "verified_absent", "creation": creation})
+            continue
+        except ProcessIdentityReadError as exc:
             raise RuntimeError(f"{label} cannot prove stopped identity: pid={pid} error={exc}") from exc
         if current["creation"] == creation:
             raise RuntimeError(f"{label} retained an active recorded identity: pid={pid} creation={creation}")
-        raise RuntimeError(
-            f"{label} found PID reuse after stop: pid={pid} recorded_creation={creation} current={current}"
+        if pid not in allow_pid_reuse_after_stop:
+            raise RuntimeError(
+                f"{label} found PID reuse before stop: pid={pid} recorded_creation={creation} current={current}"
+            )
+        terminal_states.append(
+            {
+                "pid": pid,
+                "state": "pid_reused_after_exit",
+                "creation": creation,
+                "current_creation": current["creation"],
+                "current_identity": {
+                    field: current.get(field)
+                    for field in ("pid", "creation", "executable", "command", "cwd", "parent_pid")
+                },
+            }
         )
+    return terminal_states
 
 
 def _native_resource_error(path, label, error):
@@ -3826,7 +4770,7 @@ def _write_browser_dependency_fixture(frontend_root):
     (frontend_root / "package-lock.json").write_text(
         json.dumps({"lockfileVersion": 3, "packages": lock_packages}), encoding="utf-8"
     )
-    next_bin = frontend_root / "node_modules" / ".bin" / ("next.cmd" if os.name == "nt" else "next")
+    next_bin = frontend_root / "node_modules" / ".bin" / ("next.cmd" if _PLATFORM.name == "nt" else "next")
     next_bin.parent.mkdir(parents=True, exist_ok=True)
     next_bin.write_text("next", encoding="utf-8")
 
@@ -3834,10 +4778,10 @@ def _write_browser_dependency_fixture(frontend_root):
 def test_frontend_dependency_readiness_rejects_missing_project_next_executable(tmp_path):
     frontend_root = tmp_path / "frontend"
     _write_browser_dependency_fixture(frontend_root)
-    next_bin = frontend_root / "node_modules" / ".bin" / ("next.cmd" if os.name == "nt" else "next")
+    next_bin = frontend_root / "node_modules" / ".bin" / ("next.cmd" if _PLATFORM.name == "nt" else "next")
     next_bin.unlink()
 
-    findings = _frontend_browser_dependency_findings(frontend_root)
+    findings = release._browser_dependency_findings(frontend_root)
 
     assert any("project-scoped Next executable is missing" in finding for finding in findings)
 
@@ -3850,15 +4794,19 @@ def test_frontend_dependency_readiness_rejects_stale_or_incomplete_locked_state(
     )
     (frontend_root / "node_modules" / "@playwright" / "test" / "package.json").unlink()
 
-    findings = _frontend_browser_dependency_findings(frontend_root)
+    findings = release._browser_dependency_findings(frontend_root)
 
     assert any("next installed version does not match" in finding for finding in findings)
     assert any("@playwright/test installed package metadata is missing" in finding for finding in findings)
 
 
-def test_frontend_dependency_install_uses_real_npm_and_frontend_cwd(tmp_path, monkeypatch):
+def test_frontend_dependency_readiness_does_not_install_or_mutate(tmp_path, monkeypatch):
     frontend_root = (tmp_path / "frontend").resolve()
-    frontend_root.mkdir()
+    _write_browser_dependency_fixture(frontend_root)
+    next_executable = frontend_root / "node_modules" / ".bin" / (
+        "next.cmd" if _PLATFORM.name == "nt" else "next"
+    )
+    next_executable.unlink()
     calls = []
 
     class Result:
@@ -3867,30 +4815,17 @@ def test_frontend_dependency_install_uses_real_npm_and_frontend_cwd(tmp_path, mo
         stderr = ""
 
     monkeypatch.setattr(
-        shutil,
-        "which",
-        lambda name: "C:/Program Files/nodejs/npm.cmd" if name == "npm.cmd" else None,
-    )
-    monkeypatch.setattr(
         subprocess,
         "run",
-        lambda argv, **kwargs: calls.append((argv, kwargs)) or Result(),
+        lambda *args, **kwargs: calls.append((args, kwargs)) or Result(),
     )
 
-    _install_frontend_dependencies_for_browser(frontend_root)
+    before = (frontend_root / "package.json").read_bytes()
+    findings = release._browser_dependency_findings(frontend_root)
 
-    assert calls == [
-        (
-            [str(Path("C:/Program Files/nodejs/npm.cmd").resolve()), "ci", "--ignore-scripts"],
-            {
-                "cwd": frontend_root,
-                "capture_output": True,
-                "text": True,
-                "timeout": 300,
-                "check": False,
-            },
-        )
-    ]
+    assert findings
+    assert calls == []
+    assert (frontend_root / "package.json").read_bytes() == before
 
 
 def test_frontend_dependency_preparation_fails_before_browser_launch_when_install_is_incomplete(
@@ -3899,321 +4834,52 @@ def test_frontend_dependency_preparation_fails_before_browser_launch_when_instal
     frontend_root = tmp_path / "frontend"
     _write_browser_dependency_fixture(frontend_root)
     monkeypatch.setattr(
-        sys.modules[__name__],
-        "_install_frontend_dependencies_for_browser",
-        lambda _frontend_root: None,
+        release,
+        "_validate_host_process_evidence",
+        lambda: {"native_resource": "present"},
     )
-    (frontend_root / "node_modules" / ".bin" / ("next.cmd" if os.name == "nt" else "next")).unlink()
+    (frontend_root / "node_modules" / ".bin" / ("next.cmd" if _PLATFORM.name == "nt" else "next")).unlink()
 
-    with pytest.raises(RuntimeError, match="did not establish a verified project-scoped installation"):
-        _prepare_frontend_dependencies_for_browser(frontend_root)
+    with pytest.raises(RuntimeError, match="browser dependency readiness failed"):
+        release._validate_browser_dependency_readiness(frontend_root)
 
 
 _BROWSER_FRONTEND_REQUIRED_PACKAGES = ("next", "react", "react-dom", "@playwright/test")
 
 
-def _frontend_browser_dependency_findings(frontend_root):
-    package_path = frontend_root / "package.json"
-    lock_path = frontend_root / "package-lock.json"
-    if not package_path.is_file() or not lock_path.is_file():
-        return [
-            "frontend/package.json and frontend/package-lock.json are required "
-            f"for browser startup: package={package_path} lock={lock_path}"
-        ]
-    try:
-        package = json.loads(package_path.read_text(encoding="utf-8"))
-        lock = json.loads(lock_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return [
-            "frontend dependency contract cannot be read before browser startup: "
-            f"package={package_path} lock={lock_path} error={exc}"
-        ]
-    if not isinstance(package, dict) or not isinstance(lock, dict):
-        return ["frontend dependency contract must contain JSON objects"]
-    lock_packages = lock.get("packages")
-    if not isinstance(lock_packages, dict):
-        return ["frontend/package-lock.json has no valid packages map"]
-    findings = []
-    declared = {
-        **(package.get("dependencies") or {}),
-        **(package.get("devDependencies") or {}),
-    }
-    lock_root = lock_packages.get("")
-    if not isinstance(lock_root, dict):
-        findings.append("frontend/package-lock.json has no valid root package entry")
-        lock_root = {}
-    for name in _BROWSER_FRONTEND_REQUIRED_PACKAGES:
-        declaration = declared.get(name)
-        lock_declaration = (
-            (lock_root.get("dependencies") or {}).get(name)
-            or (lock_root.get("devDependencies") or {}).get(name)
-        )
-        lock_entry = lock_packages.get(f"node_modules/{name}")
-        installed_path = frontend_root / "node_modules" / Path(name) / "package.json"
-        if declaration is None:
-            findings.append(f"{name} is not declared in frontend/package.json")
-        if lock_declaration != declaration:
-            findings.append(
-                f"{name} package declaration differs between package.json and package-lock.json: "
-                f"package={declaration!r} lock={lock_declaration!r}"
-            )
-        if not isinstance(lock_entry, dict) or not lock_entry.get("version"):
-            findings.append(f"{name} has no locked package entry")
-            continue
-        if not installed_path.is_file():
-            findings.append(f"{name} installed package metadata is missing: {installed_path}")
-            continue
-        try:
-            installed = json.loads(installed_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            findings.append(f"{name} installed package metadata is unreadable: {installed_path}: {exc}")
-            continue
-        if installed.get("version") != lock_entry["version"]:
-            findings.append(
-                f"{name} installed version does not match package-lock.json: "
-                f"installed={installed.get('version')!r} locked={lock_entry['version']!r}"
-            )
-    next_executable = frontend_root / "node_modules" / ".bin" / ("next.cmd" if os.name == "nt" else "next")
-    if not next_executable.is_file():
-        findings.append(f"project-scoped Next executable is missing: {next_executable}")
-    return findings
-
-
-def _install_frontend_dependencies_for_browser(frontend_root):
-    npm = shutil.which("npm.cmd") or shutil.which("npm")
-    if not npm:
-        raise RuntimeError("frontend dependency setup requires the real npm executable")
-    npm_path = Path(npm).resolve()
-    working_directory = frontend_root.resolve()
-    result = subprocess.run(
-        [str(npm_path), "ci", "--ignore-scripts"],
-        cwd=working_directory,
-        capture_output=True,
-        text=True,
-        timeout=300,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            "frontend dependency setup failed before browser startup: "
-            f"returncode={result.returncode} cwd={working_directory} argv={[str(npm_path), 'ci', '--ignore-scripts']} "
-            f"stdout={result.stdout[-4000:]} stderr={result.stderr[-4000:]}"
-        )
-
-
-def _prepare_frontend_dependencies_for_browser(frontend_root):
-    initial_findings = _frontend_browser_dependency_findings(frontend_root)
-    if not initial_findings:
-        return
-    _install_frontend_dependencies_for_browser(frontend_root)
-    final_findings = _frontend_browser_dependency_findings(frontend_root)
-    if final_findings:
-        raise RuntimeError(
-            "frontend dependency preparation did not establish a verified project-scoped installation: "
-            f"frontend_root={frontend_root.resolve()} initial_findings={initial_findings} "
-            f"final_findings={final_findings}"
-        )
-
-
 def _ensure_frontend_dependencies_for_browser():
-    frontend_root = ROOT / "frontend"
-    initial_findings = _frontend_browser_dependency_findings(frontend_root)
-    if not initial_findings:
-        return
-    (
-        evidence_root,
-        candidates,
-        additional_records,
-        family_records,
-        protected_records,
-        unrelated_records,
-        presence,
-        approval_records,
-    ) = _load_legacy_process_evidence()
-    process_graph = _frontend_process_graph()
-    protected = {os.getpid()}
-    current = os.getpid()
-    while current in process_graph and process_graph[current]["parent_pid"] not in protected:
-        current = process_graph[current]["parent_pid"]
-        protected.add(current)
-    pending = [os.getpid()]
-    while pending:
-        parent_pid = pending.pop()
-        for item in process_graph.values():
-            if item["parent_pid"] == parent_pid and item["pid"] not in protected:
-                protected.add(item["pid"])
-                pending.append(item["pid"])
-    expected = _canonical_path_identity(frontend_root.resolve())
-    process_graph = _frontend_process_graph()
-    candidate_pids = {candidate["pid"] for candidate in candidates if candidate["pid"] in process_graph}
-    additional_pids = {record["pid"] for record in additional_records if record["pid"] in process_graph}
-    enriched_pids = _frontend_enrichment_pids(
-        process_graph,
-        candidate_pids | additional_pids,
-        protected,
-        expected,
+    return release._validate_browser_dependency_readiness(
+        ROOT / "frontend", process={"state": "contract_fixture"}
     )
-    _frontend_enrich_process_graph(process_graph, enriched_pids)
-    active_candidates, candidate_states = _classify_frontend_records(
-        candidates,
-        process_graph,
-        presence,
-        approval_records,
+
+
+def test_browser_fixture_uses_completed_dependencies_without_running_an_installer(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        release,
+        "_validate_browser_dependency_readiness",
+        lambda frontend_root, *, process: calls.append((frontend_root, process))
+        or {"dependency_findings": []},
     )
-    active_additional, additional_states = _classify_frontend_records(
-        additional_records,
-        process_graph,
-        presence,
-        approval_records,
+    monkeypatch.setattr(
+        release,
+        "_prepare_host",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("browser fixture must not prepare or install dependencies")
+        ),
     )
-    reused_pids = {
-        pid for pid, state in {**candidate_states, **additional_states}.items() if state == "reused"
-    }
-    candidate_pids = {candidate["pid"] for candidate in active_candidates}
-    additional_by_pid = {record["pid"]: record for record in active_additional}
-    selected_pids = candidate_pids | set(additional_by_pid)
-    protected_input = {item["pid"] for item in protected_records}
-    unrelated_input = {item["pid"] for item in unrelated_records}
-    if not protected_input <= protected:
-        raise RuntimeError(
-            f"frontend dependency protected census is not live: pids={sorted(protected_input - protected)}"
-        )
-    if unrelated_input & selected_pids:
-        raise RuntimeError(
-            f"frontend dependency cleanup denied unrelated selected identity: pids={sorted(unrelated_input & selected_pids)}"
-        )
-    if not unrelated_input <= set(process_graph):
-        raise RuntimeError(
-            f"frontend dependency exclusion input is not live: pids={sorted(unrelated_input - set(process_graph))}"
-        )
-    for pid in unrelated_input:
-        if pid in protected or pid in selected_pids:
-            raise RuntimeError(f"frontend dependency unrelated identity was selected: pid={pid}")
-        if _frontend_lightweight_relevance(process_graph[pid], expected):
-            raise RuntimeError(
-                f"frontend dependency cleanup cannot exclude a potentially relevant identity: pid={pid}"
-            )
-    unrelated_exclusions = []
-    for pid, item in process_graph.items():
-        if pid in protected or pid in selected_pids:
-            continue
-        if pid in reused_pids:
-            unrelated_exclusions.append(
-                {"pid": pid, "reason": "fresh identity classified as reused and left unselected"}
-            )
-            continue
-        if item.get("enriched") and _canonical_path_identity(item["cwd"]) == expected:
-            raise RuntimeError(
-                f"frontend dependency cleanup found an unrecorded relevant product-cwd identity: pid={pid}"
-            )
-        reason = (
-            "measured outside product cwd and not selected"
-            if item.get("enriched")
-            else _frontend_lightweight_exclusion_for_expected(item, expected)
-        )
-        if not reason:
-            raise RuntimeError(
-                f"frontend dependency process type remained unclassified: pid={pid}"
-            )
-        unrelated_exclusions.append({"pid": pid, "reason": reason})
-    if not active_candidates:
-        _assert_cleanup_postcondition_already_satisfied(evidence_root)
-    for candidate in active_candidates:
-        if candidate["pid"] in protected:
-            raise RuntimeError(f"frontend dependency cleanup denied current gate/test ownership: pid={candidate['pid']}")
-    candidates_by_pid = {candidate["pid"]: candidate for candidate in active_candidates}
-    selected_records = {
-        **candidates_by_pid,
-        **additional_by_pid,
-    }
-    for candidate in active_candidates:
-        observations = candidate["parent_observations"]
-        if not isinstance(observations, list) or not observations:
-            raise RuntimeError(f"frontend dependency ancestry proof is missing parent observations: pid={candidate['pid']}")
-        for observation in observations:
-            state = observation.get("state") if isinstance(observation, dict) else None
-            if state not in {
-                "readable_current_parent",
-                "verified_absent_historical_parent",
-                "unreadable_parent",
-                "reused_parent",
-                "historical_parent_exited_pid_reused",
-            }:
-                raise RuntimeError(f"frontend dependency ancestry proof has invalid parent state: pid={candidate['pid']} observation={observation}")
-            if state in {"unreadable_parent", "reused_parent"}:
-                raise RuntimeError(f"frontend dependency ancestry proof is not clean: pid={candidate['pid']} observation={observation}")
-        _frontend_candidate_tree(candidate, process_graph, expected)
-    roots = [record for record in selected_records.values() if record["parent_pid"] not in selected_records]
-    if active_candidates and not roots:
-        raise RuntimeError("frontend dependency evidence has no selected legacy tree root")
-    selected_trees = []
-    for candidate in roots:
-        if candidate["pid"] in protected:
-            raise RuntimeError(f"frontend dependency cleanup denied current gate/test ownership: pid={candidate['pid']}")
-        if candidate["pid"] not in process_graph:
-            raise RuntimeError(f"frontend dependency cleanup missing current candidate: pid={candidate['pid']}")
-        if candidate["pid"] in candidates_by_pid:
-            selected_trees.append(_frontend_candidate_tree(candidate, process_graph, expected))
-        else:
-            selected_trees.append(_frontend_additional_tree(candidate, process_graph, expected))
-    recorded = {}
-    for tree in selected_trees:
-        for item in tree:
-            historical = candidates_by_pid.get(item["pid"])
-            additional = additional_by_pid.get(item["pid"])
-            recorded_source = historical or additional
-            if recorded_source is None:
-                raise RuntimeError(f"frontend dependency ownership proof found unrecorded descendant: pid={item['pid']}")
-            if item["creation"] != str(recorded_source["creation"]):
-                raise RuntimeError(f"frontend dependency ownership proof changed descendant identity: pid={item['pid']}")
-            if _canonical_path_identity(item["cwd"]) != _canonical_path_identity(recorded_source["cwd"]):
-                raise RuntimeError(f"frontend dependency ownership proof changed descendant cwd: pid={item['pid']}")
-            if not item["executable"] or not item["command"]:
-                raise RuntimeError(f"frontend dependency ownership proof missing descendant identity: pid={item['pid']}")
-            observation = historical if historical else additional
-            parsed = _windows_command_line_argv(item["command"]) if os.name == "nt" else item["command"].split()
-            if (
-                item["parent_pid"] != int(observation["parent_pid"])
-                or _canonical_path_identity(item["executable"]) != _canonical_path_identity(observation["executable"])
-                or parsed != [str(value) for value in observation["argv"]]
-                or hashlib.sha256("\0".join(parsed).encode("utf-8")).hexdigest() != str(observation["argv_sha256"])
-                or hashlib.sha256(item["command"].encode("utf-8")).hexdigest() != str(observation["native_command_sha256"])
-            ):
-                raise RuntimeError(
-                    f"frontend dependency ownership proof changed descendant command identity: pid={item['pid']}"
-                )
-            recorded[item["pid"]] = item["creation"]
-    if selected_trees:
-        process_graph = _frontend_process_graph()
-        if any(candidate["pid"] not in process_graph for candidate in active_candidates):
-            raise RuntimeError("frontend dependency cleanup lost a selected candidate before stop proof")
-        for candidate in roots:
-            tree = (
-                _frontend_candidate_tree(candidate, process_graph, expected)
-                if candidate["pid"] in candidates_by_pid
-                else _frontend_additional_tree(candidate, process_graph, expected)
-            )
-            if any(item["pid"] in protected for item in tree):
-                raise RuntimeError(f"frontend dependency cleanup denied current gate/test descendant: pid={candidate['pid']}")
-        for candidate in roots:
-            result = subprocess.run(
-                ["taskkill", "/PID", str(candidate["pid"]), "/T", "/F"],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"frontend dependency cleanup failed: pid={candidate['pid']} rc={result.returncode} "
-                    f"stdout={result.stdout[-2000:]} stderr={result.stderr[-2000:]} evidence_root={evidence_root}"
-                )
-        _assert_recorded_process_identities_stopped(recorded, "frontend dependency cleanup")
-        _assert_frontend_files_released(active_candidates, evidence_root)
-        for candidate in active_candidates:
-            for port in candidate.get("ports", []):
-                _assert_port_closed(int(port), "frontend dependency cleanup")
-    _prepare_frontend_dependencies_for_browser(frontend_root)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("browser fixture must not invoke a subprocess installer")
+        ),
+    )
+
+    result = _ensure_frontend_dependencies_for_browser()
+
+    assert result == {"dependency_findings": []}
+    assert calls == [(ROOT / "frontend", {"state": "contract_fixture"})]
 
 
 def test_upload_validation_real_browser_is_fail_closed_and_file_scoped():
@@ -4687,21 +5353,21 @@ def test_upload_validation_real_browser_is_fail_closed_and_file_scoped():
             try:
                 _detach_dialog_handler(page, handle_dialog)
             except Exception as exc:
-                cleanup_errors.append(f"dialog handler detachment failed: {exc!r}")
+                _record_cleanup_failure(cleanup_errors, "dialog-detach", exc)
         cleanup_errors.extend(state["callback_errors"])
         try:
             _close_browser_resources(page, context, browser, "focused browser check")
         except Exception as exc:
-            cleanup_errors.append(str(exc))
+            _record_cleanup_failure(cleanup_errors, "browser-resource-close", exc)
         try:
             if playwright is not None:
                 playwright.stop()
         except Exception as exc:
-            cleanup_errors.append(f"Playwright cleanup failed: {exc}")
+            _record_cleanup_failure(cleanup_errors, "playwright-stop", exc)
         try:
             _terminate_process_tree(frontend, "frontend", owned_port=frontend_port)
         except Exception as exc:
-            cleanup_errors.append(str(exc))
+            _record_cleanup_failure(cleanup_errors, "process-tree-termination", exc)
         try:
             api_server.shutdown()
             api_server.server_close()
@@ -4709,11 +5375,15 @@ def test_upload_validation_real_browser_is_fail_closed_and_file_scoped():
             if api_thread.is_alive():
                 cleanup_errors.append("controlled API server thread remains alive")
         except Exception as exc:
-            cleanup_errors.append(f"controlled API server cleanup failed: {exc}")
+            _record_cleanup_failure(cleanup_errors, "api-server-cleanup", exc)
         try:
             _assert_port_closed(frontend_port, "frontend")
         except Exception as exc:
-            cleanup_errors.append(str(exc))
+            _record_cleanup_failure(cleanup_errors, "port-proof", exc)
+        try:
+            _assert_frontend_resources_released(frontend_port, "focused browser check")
+        except Exception as exc:
+            _record_cleanup_failure(cleanup_errors, "frontend-resource-proof", exc)
         _raise_browser_test_errors(primary_error, cleanup_errors)
 
 
@@ -4742,36 +5412,169 @@ def _wait_for_http(url, process):
     raise RuntimeError(f"frontend did not become ready at {url}")
 
 
-def test_process_tree_cleanup_terminates_descendant_and_releases_file(tmp_path):
-    held_path = tmp_path / "held-by-child.txt"
-    ready_path = tmp_path / "child-ready.txt"
-    child_code = (
-        "import pathlib, sys, time; "
-        "handle = open(sys.argv[1], 'w'); "
-        "pathlib.Path(sys.argv[2]).write_text('ready', encoding='utf-8'); "
-        "time.sleep(600)"
+def test_process_tree_cleanup_uses_controlled_terminal_identity_state(monkeypatch):
+    root = {"pid": 10, "creation": "root", "executable": "node.exe", "command": "node", "cwd": "C:/work"}
+    child = {"pid": 11, "creation": "child", "executable": "node.exe", "command": "node child", "cwd": "C:/work"}
+    process = SimpleNamespace(
+        pid=10,
+        args=["node"],
+        _citespan_owner={"creation_identity": root},
+        poll=lambda: 0,
+        wait=lambda timeout: None,
     )
-    parent_code = (
-        "import subprocess, sys; "
-        f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}, sys.argv[1], sys.argv[2]]); "
-        "child.wait()"
+    trees = [[root, child], [root]]
+    stopped = []
+
+    def owned_tree(_process):
+        if trees:
+            return trees.pop(0)
+        raise ProcessIdentityAbsent("root already exited")
+
+    def stop(identities, _label, _timeout, **_kwargs):
+        stopped.extend(item["pid"] for item in identities)
+        return [{"pid": item["pid"], "state": "already_exited"} for item in identities]
+
+    monkeypatch.setattr(sys.modules[__name__], "_assert_owned_process_tree", owned_tree)
+    monkeypatch.setattr(sys.modules[__name__], "_stop_verified_process_identities", stop)
+    monkeypatch.setattr(sys.modules[__name__], "_assert_recorded_process_identities_stopped", lambda *_args: [])
+    monkeypatch.setattr(sys.modules[__name__], "_read_process_output", lambda *_args, **_kwargs: "")
+
+    _terminate_process_tree(process, "controlled process-tree fixture")
+
+    assert stopped == [11, 10]
+
+
+def test_process_tree_cleanup_drains_a_late_owned_descendant(monkeypatch):
+    root = {"pid": 10, "creation": "root"}
+    first_child = {"pid": 11, "creation": "first"}
+    late_child = {"pid": 12, "creation": "late"}
+    trees = [[root, first_child], [root, late_child], [root]]
+    stopped = []
+    waited = {"value": False}
+
+    class Process:
+        pid = 10
+        _citespan_owner = {"creation_identity": root}
+
+        def poll(self):
+            return 0 if waited["value"] else None
+
+        def wait(self, timeout):
+            waited["value"] = True
+
+    monkeypatch.setattr(sys.modules[__name__], "_assert_owned_process_tree", lambda _process: trees.pop(0))
+
+    def stop(identities, _label, _timeout, **_kwargs):
+        stopped.extend(item["pid"] for item in identities)
+        if any(item["pid"] == 10 for item in identities):
+            waited["value"] = True
+        return [{"pid": item["pid"], "state": "stopped"} for item in identities]
+
+    monkeypatch.setattr(sys.modules[__name__], "_stop_verified_process_identities", stop)
+    monkeypatch.setattr(sys.modules[__name__], "_assert_recorded_process_identities_stopped", lambda *_args: [])
+    monkeypatch.setattr(sys.modules[__name__], "_read_process_output", lambda *_args, **_kwargs: "")
+
+    _terminate_process_tree(Process(), "late descendant fixture")
+
+    assert stopped == [11, 12, 10]
+
+
+def test_process_tree_cleanup_stops_a_seven_level_chain_leaf_first(monkeypatch):
+    identities = [
+        {
+            "pid": pid,
+            "creation": f"creation-{pid}",
+            "executable": "node.exe",
+            "command": f"node level-{pid}",
+            "cwd": "C:/work",
+            "parent_pid": pid - 1 if pid > 10 else 1,
+        }
+        for pid in range(10, 18)
+    ]
+    trees = [identities, [identities[0]]]
+    stopped = []
+    waited = {"value": False}
+
+    class Process:
+        pid = 10
+        _citespan_owner = {"creation_identity": identities[0]}
+
+        def poll(self):
+            return 0 if waited["value"] else None
+
+        def wait(self, timeout):
+            waited["value"] = True
+
+    monkeypatch.setattr(sys.modules[__name__], "_assert_owned_process_tree", lambda _process: trees.pop(0))
+
+    def metadata(pid):
+        return dict(identities[pid - 10])
+
+    def stop(item, _label, _timeout):
+        stopped.append(item["pid"])
+        if item["pid"] == 10:
+            waited["value"] = True
+
+    monkeypatch.setattr(sys.modules[__name__], "_process_metadata", metadata)
+    monkeypatch.setattr(sys.modules[__name__], "_terminate_verified_windows_identity", stop)
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_poll_process_terminal_state",
+        lambda item, _label: {"pid": item["pid"], "state": "verified_exited", "creation": item["creation"]},
     )
-    process = _launch_process_tree([sys.executable, "-c", parent_code, str(held_path), str(ready_path)])
-    try:
-        if os.name == "nt":
-            effective_argv = process._citespan_owner["effective_argv"]
-            assert effective_argv[1] == "-c"
-            assert effective_argv[3] == os.environ.get("COMSPEC", "cmd.exe")
-            assert effective_argv[3] != "-c"
-        deadline = time.monotonic() + 10
-        while not ready_path.exists() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert ready_path.exists(), _read_process_output(process)
-    finally:
-        _terminate_process_tree(process, "process-tree fixture")
-    assert process.poll() is not None
-    held_path.unlink()
-    assert not held_path.exists()
+    monkeypatch.setattr(sys.modules[__name__], "_read_process_output", lambda *_args, **_kwargs: "")
+
+    _terminate_process_tree(Process(), "seven-level fixture")
+
+    assert stopped == [17, 16, 15, 14, 13, 12, 11, 10]
+
+
+def test_process_tree_cleanup_reports_deadline_exhaustion_from_census_cost(monkeypatch):
+    root = {"pid": 10, "creation": "root"}
+    child = {"pid": 11, "creation": "child"}
+
+    def slow_census(_process):
+        return [root, child]
+
+    monkeypatch.setattr(sys.modules[__name__], "_assert_owned_process_tree", slow_census)
+    monkeypatch.setattr(sys.modules[__name__], "_read_process_output", lambda *_args, **_kwargs: "")
+    monotonic_values = iter((0.0, 0.0, 2.0, 2.0))
+    monkeypatch.setattr(time, "monotonic", lambda: next(monotonic_values))
+    process = SimpleNamespace(
+        pid=10,
+        _citespan_owner={"creation_identity": root},
+        poll=lambda: None,
+    )
+
+    with pytest.raises(RuntimeError, match=r"deadline exhausted.*phase_times=.*census"):
+        _terminate_process_tree(process, "census deadline fixture", timeout=0.001)
+
+
+def test_frontend_resource_postcondition_rejects_a_native_holder(monkeypatch):
+    native = (release.SCRIPT_ROOT / release.HOST_NATIVE_MODULE).resolve().as_posix()
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [],
+            "holders": [{"pid": 12, "module_paths": [native]}],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="native module holder"):
+        _assert_frontend_resources_released(43123, "resource fixture")
+
+
+def test_frontend_resource_postcondition_accepts_empty_scoped_census(monkeypatch):
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {"processes": [], "holders": [], "ports": [], "read_errors": []},
+    )
+
+    _assert_frontend_resources_released(43123, "resource fixture")
 
 
 def _installed_browser_executable():

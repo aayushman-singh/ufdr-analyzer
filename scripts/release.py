@@ -11,9 +11,11 @@ import argparse
 import ast
 import base64
 import codecs
+import ctypes
 import errno
 import hashlib
 import json
+import ntpath
 import os
 import re
 import shlex
@@ -23,7 +25,10 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import time
 import traceback
+import uuid
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +71,11 @@ AUTHENTIC_REGISTRY_METADATA = {
 }
 SSH_KEY = Path.home() / ".ssh" / "everything"
 SSH_TIMEOUT_SECONDS = 1800
+PLAYWRIGHT_PROVISION_TIMEOUT_SECONDS = 900
+LIVE_VERIFIER_TIMEOUT_SECONDS = 900
+SUBPROCESS_DIAGNOSTIC_LIMIT = 4096
+HOST_INSTALLER_CLEANUP_TIMEOUT_SECONDS = 30
+LEGACY_FAMILY_SOURCE_SHA256 = "3baead04ca0457c12b7ab0aebb8b0afc834d5f371aab3cb5c12c844489548cf5"
 DEPLOY_HOST = "root@169.58.64.150"
 DEPLOY_PATH = "/opt/citespan"
 DEPLOY_REPOSITORY = "https://github.com/aayushman-singh/ufdr-analyzer.git"
@@ -95,7 +105,11 @@ HOST_NATIVE_MODULE = Path(
 )
 HOST_PARENT_STATES = {
     "readable_current_parent",
+    "verified_absent_parent",
     "verified_absent_historical_parent",
+    "verified_exited_parent",
+    "parent_exited_during_observation",
+    "windows_system_parent",
     "unreadable_parent",
     "reused_parent",
     "historical_parent_exited_pid_reused",
@@ -130,10 +144,51 @@ IMMUTABLE_MINIO_IMAGES = {
 }
 
 
-def _host_path_identity(value: object) -> str:
+def _is_positive_pid(value: object) -> bool:
+    return type(value) is int and value > 0
+
+
+def _is_process_pid(value: object) -> bool:
+    """Accept only positive integer PIDs and the two Windows sentinels."""
+    return type(value) is int and (value > 0 or value in (0, 4))
+
+
+def _is_parent_pid(value: object) -> bool:
+    """Accept a measured positive parent PID or a Windows system sentinel."""
+    return _is_process_pid(value)
+
+
+def _canonical_windows_path_identity(value: object) -> str:
     if not isinstance(value, (str, Path)):
         raise RuntimeError("release blocked: host process evidence contains an invalid path")
-    return os.path.normcase(os.path.normpath(str(value))).replace("\\", "/")
+    path = ntpath.normpath(str(value).replace("/", "\\"))
+    if path.startswith("\\\\"):
+        prefix = "//"
+        path = path[2:]
+    else:
+        prefix = ""
+    normalized = path.replace("\\", "/")
+    return f"{prefix}{normalized}".casefold().rstrip("/")
+
+
+def _host_path_identity(value: object) -> str:
+    return _canonical_windows_path_identity(value)
+
+
+def _path_is_within(path: object, root: object) -> bool:
+    candidate = _canonical_windows_path_identity(path)
+    boundary = _canonical_windows_path_identity(root)
+    return candidate == boundary or candidate.startswith(f"{boundary}/")
+
+
+def _command_contains_path(command: str, target: object) -> bool:
+    target_identity = _canonical_windows_path_identity(target)
+    for token in re.findall(r'"([^"]+)"|([^\s]+)', command):
+        value = next(part for part in token if part)
+        value = value.rstrip(",;")
+        if _canonical_windows_path_identity(value) == target_identity:
+            return True
+    return False
 
 
 def _read_host_evidence(root: Path, filename: str) -> Any:
@@ -223,6 +278,23 @@ def _prove_host_native_release() -> dict[str, str]:
     return {"state": "restored"}
 
 
+def _observe_host_native_resource() -> dict[str, Any]:
+    """Read the native resource state without changing the host."""
+    path = (SCRIPT_ROOT / HOST_NATIVE_MODULE).absolute()
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError as exc:
+        if exc.errno == errno.ENOENT:
+            return {"state": "absent"}
+        raise RuntimeError("release blocked: native resource state is ambiguous") from exc
+    except OSError as exc:
+        raise RuntimeError("release blocked: native resource state cannot be read") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError("release blocked: native resource is not a regular file")
+    fingerprint, digest = _native_snapshot(path)
+    return {"state": "present", "fingerprint": fingerprint, "sha256": digest}
+
+
 def _legacy_evidence_records(value, label):
     safe_label = Path(str(label)).name
     if not isinstance(value, list) or not value:
@@ -237,7 +309,7 @@ def _legacy_evidence_records(value, label):
             raise _historical_evidence_error(safe_label, "identity object is required")
         pid = identity.get("pid")
         creation = identity.get("creation_token")
-        if not isinstance(pid, int) or pid <= 0:
+        if not _is_positive_pid(pid):
             raise _historical_evidence_error(safe_label, "identity.pid is required")
         if not isinstance(creation, str) or not creation:
             raise _historical_evidence_error(
@@ -254,7 +326,7 @@ def _legacy_evidence_records(value, label):
             parent_pid = parent.get("pid")
         else:
             parent_pid = parent
-        if label == _LEGACY_LOCK_INVENTORY and (not isinstance(parent_pid, int) or parent_pid <= 0):
+        if label == _LEGACY_LOCK_INVENTORY and not _is_positive_pid(parent_pid):
             raise _historical_evidence_error(
                 safe_label, f"parent is required: pid={pid} field=parent"
             )
@@ -266,7 +338,7 @@ def _legacy_evidence_records(value, label):
                 "historical_parent": parent,
             }
         )
-        if isinstance(parent_pid, int) and parent_pid > 0:
+        if _is_positive_pid(parent_pid):
             normalized[-1]["parent_pid"] = parent_pid
     return normalized
 
@@ -286,7 +358,7 @@ def _current_observation_records(value, label):
     if _host_path_identity(value.get("product_worktree", "")) != _host_path_identity(str(SCRIPT_ROOT)):
         raise RuntimeError(f"current evidence contract approval has the wrong product worktree: {label}")
     observed_ids = value.get("observed_identity_pids")
-    if not isinstance(observed_ids, list) or any(not isinstance(pid, int) or pid <= 0 for pid in observed_ids):
+    if not isinstance(observed_ids, list) or any(not _is_positive_pid(pid) for pid in observed_ids):
         raise RuntimeError(f"current evidence contract approval needs observed_identity_pids: {label}")
     approved_actions = value.get("approved_actions")
     if not isinstance(approved_actions, list) or not approved_actions or not all(
@@ -302,7 +374,7 @@ def _current_observation_records(value, label):
         for exclusion in value[field]:
             if (
                 not isinstance(exclusion, dict)
-                or not isinstance(exclusion.get("pid"), int)
+                or not _is_positive_pid(exclusion.get("pid"))
                 or not isinstance(exclusion.get("reason"), str)
                 or not exclusion["reason"].strip()
             ):
@@ -335,7 +407,7 @@ def _current_observation_records(value, label):
     normalized = []
     seen_pids = set()
     for record in records:
-        if not isinstance(record, dict) or not isinstance(record.get("pid"), int) or record["pid"] <= 0:
+        if not isinstance(record, dict) or not _is_positive_pid(record.get("pid")):
             raise RuntimeError(f"current evidence contract invalid {label}: each observation needs a positive pid")
         if record["pid"] in seen_pids:
             raise RuntimeError(f"current evidence contract duplicates observation: pid={record['pid']}")
@@ -420,7 +492,7 @@ def _current_observation_records(value, label):
         normalized.append({**record, "current_modules": record["module_paths"]})
     return normalized
 
-def _current_family_records(value, label):
+def _current_family_records(value, label, raw_value=None):
     if not isinstance(value, dict) or value.get("schema") != "citespan.node-family-current.v1":
         raise RuntimeError(
             f"current family evidence contract invalid {label}: expected schema=citespan.node-family-current.v1"
@@ -439,10 +511,24 @@ def _current_family_records(value, label):
         raise RuntimeError(
             f"current family evidence must contain all 145 measured identities: {label}"
         )
+    raw_by_identity = None
+    if raw_value is not None:
+        raw_records = _legacy_family_observation_records(raw_value, "legacy-family-current-996.json")
+        raw_by_identity = {}
+        for raw_record in raw_records:
+            raw_identity = (
+                _legacy_identity_value(raw_record, "pid", ("pid",), required=True),
+                _legacy_identity_value(raw_record, "creation", ("creation", "creation_token"), required=True),
+            )
+            if raw_identity in raw_by_identity:
+                raise RuntimeError(
+                    f"current family evidence duplicates raw identity: pid={raw_identity[0]}"
+                )
+            raw_by_identity[raw_identity] = raw_record
     normalized = []
     seen = set()
     for record in records:
-        if not isinstance(record, dict) or not isinstance(record.get("pid"), int) or record["pid"] <= 0:
+        if not isinstance(record, dict) or not _is_positive_pid(record.get("pid")):
             raise RuntimeError(f"current family evidence has an invalid identity: {label}")
         if record["pid"] in seen:
             raise RuntimeError(f"current family evidence duplicates identity: pid={record['pid']}")
@@ -465,6 +551,24 @@ def _current_family_records(value, label):
             isinstance(item, str) for item in record["argv"]
         ):
             raise RuntimeError(f"current family evidence has invalid argv: pid={record['pid']}")
+        expected_argv_hash = hashlib.sha256("\0".join(record["argv"]).encode("utf-8")).hexdigest()
+        if record["argv_sha256"] != expected_argv_hash:
+            raise RuntimeError(
+                f"current family evidence hash mismatch: pid={record['pid']} field=argv_sha256"
+            )
+        if not isinstance(record["native_command_sha256"], str) or re.fullmatch(
+            r"[0-9a-f]{64}", record["native_command_sha256"]
+        ) is None:
+            raise RuntimeError(
+                f"current family evidence has invalid native command hash: pid={record['pid']}"
+            )
+        if not _is_parent_pid(record["parent_pid"]):
+            raise RuntimeError(f"current family evidence has invalid parent pid: pid={record['pid']}")
+        if any(
+            not isinstance(port, int) or isinstance(port, bool) or port <= 0
+            for port in record["ports"]
+        ):
+            raise RuntimeError(f"current family evidence has invalid ports: pid={record['pid']}")
         for field in ("files", "ports"):
             if not isinstance(record[field], list):
                 raise RuntimeError(f"current family evidence has invalid {field}: pid={record['pid']}")
@@ -472,6 +576,36 @@ def _current_family_records(value, label):
             raise RuntimeError(
                 f"current family evidence has incomplete parent observations: pid={record['pid']}"
             )
+        if raw_by_identity is not None:
+            raw = raw_by_identity.get((record["pid"], record["creation"]))
+            if raw is None:
+                raise RuntimeError(
+                    f"current family evidence has no immutable raw counterpart: pid={record['pid']}"
+                )
+            raw_canonical = _legacy_family_record_canonical(raw, record)
+            _assert_legacy_family_matches_normalized(raw, record)
+            for field in (
+                "pid", "creation", "parent_pid", "cwd", "executable", "argv", "argv_sha256",
+                "native_command_sha256", "module_paths", "files", "ports",
+            ):
+                actual = record[field]
+                if field in {"module_paths", "files"}:
+                    actual = _canonical_path_values(actual, field, record["pid"])
+                if field == "ports":
+                    actual = sorted(actual)
+                if actual != raw_canonical[field]:
+                    raise RuntimeError(
+                        f"current family evidence disagrees with immutable raw observation: "
+                        f"pid={record['pid']} field={field}"
+                    )
+            if record["role"] != raw_canonical["role"]:
+                raise RuntimeError(
+                    f"current family evidence disagrees with immutable raw observation: pid={record['pid']} field=role"
+                )
+            if record["family_relation"] != raw_canonical["family_relation"]:
+                raise RuntimeError(
+                    f"current family evidence disagrees with immutable raw observation: pid={record['pid']} field=family_relation"
+                )
         normalized.append(record)
     if sum(record.get("role") == "lightningcss_loader" for record in normalized) != 29:
         raise RuntimeError("current family evidence must contain 29 lightningcss loaders")
@@ -549,7 +683,7 @@ def _legacy_family_observation_records(value, label):
             f"legacy family evidence must contain all 145 measured identities: {label}"
         )
     for record in records:
-        if not isinstance(record, dict) or not isinstance(record.get("pid"), int) or record["pid"] <= 0:
+        if not isinstance(record, dict) or not _is_positive_pid(record.get("pid")):
             raise RuntimeError(f"legacy family evidence has an invalid identity: {label}")
     return records
 
@@ -616,7 +750,7 @@ def _canonical_parent_observation(observation, pid):
     observed_pid = observation.get("pid", identity.get("pid"))
     if "pid" in observation and "pid" in identity and observation["pid"] != identity["pid"]:
         raise RuntimeError(f"legacy family evidence has conflicting parent values: pid={pid} field=pid")
-    if not isinstance(observed_pid, int) or observed_pid <= 0:
+    if not _is_positive_pid(observed_pid):
         raise RuntimeError(f"legacy family evidence has invalid parent identity: pid={pid}")
     result["pid"] = observed_pid
     if "creation" in observation and "creation_token" in identity and observation["creation"] != identity["creation_token"]:
@@ -682,7 +816,7 @@ def _legacy_family_record_canonical(record, normalized_record):
             f"normalized current family evidence changed immutable observation: pid={pid} field=identity"
         )
     parent_pid = _legacy_alias(record, "parent_pid", ("parent_pid",), required=True)
-    if not isinstance(parent_pid, int) or parent_pid <= 0:
+    if not _is_parent_pid(parent_pid):
         raise RuntimeError(f"legacy family evidence has invalid parent_pid: pid={pid}")
     aliases = {
         "cwd": ("cwd",),
@@ -788,21 +922,60 @@ def _assert_legacy_family_matches_normalized(legacy_record, normalized_record):
         )
 
 def _assert_family_source_provenance(legacy_document, normalized_document):
+    expected = LEGACY_FAMILY_SOURCE_SHA256
+    if "source_sha256" not in legacy_document:
+        raise RuntimeError(
+            "normalized current family evidence requires the immutable legacy source hash: "
+            f"field=source_sha256 expected={expected}"
+        )
+    legacy_digests = {
+        field: legacy_document[field]
+        for field in ("source_hash", "sha256", "original_source_sha256", "source_sha256")
+        if field in legacy_document
+    }
+    for field, value in legacy_digests.items():
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None or value != expected:
+            raise RuntimeError(
+                "legacy family evidence has an invalid immutable source digest: "
+                f"field={field} expected={expected}"
+            )
     normalized_provenance = normalized_document.get("source_provenance")
     if not isinstance(normalized_provenance, dict) or not normalized_provenance:
         raise RuntimeError("normalized current family evidence has no source provenance")
-    legacy_provenance = legacy_document.get("source_provenance")
-    if isinstance(legacy_provenance, dict):
-        for field, value in legacy_provenance.items():
-            if field in normalized_provenance and normalized_provenance[field] != value:
-                raise RuntimeError(
-                    f"normalized current family evidence changed source provenance: field={field}"
-                )
-    for field in ("source_hash", "sha256", "original_source_sha256"):
-        if field in legacy_document and normalized_provenance.get(field) != legacy_document[field]:
+    if normalized_provenance.get("source_sha256") != expected:
+        raise RuntimeError(
+            "normalized current family evidence requires the immutable legacy source hash in provenance: "
+            f"field=source_sha256 expected={expected}"
+        )
+    for field, value in legacy_digests.items():
+        if normalized_provenance.get(field) != value:
             raise RuntimeError(
                 f"normalized current family evidence changed source provenance: field={field}"
             )
+    legacy_provenance = legacy_document.get("source_provenance")
+    if legacy_provenance is not None and (
+        not isinstance(legacy_provenance, dict)
+        or legacy_provenance.get("source_sha256") != expected
+    ):
+        raise RuntimeError("legacy family evidence source provenance has an invalid source_sha256")
+    if isinstance(legacy_provenance, dict):
+        for field, value in legacy_provenance.items():
+            if field not in normalized_provenance or normalized_provenance[field] != value:
+                raise RuntimeError(
+                    f"normalized current family evidence changed source provenance: field={field}"
+                )
+
+
+def _assert_legacy_current_observation(value: object) -> None:
+    if not isinstance(value, dict):
+        raise RuntimeError("release blocked: legacy current evidence must remain observation-only")
+    for field in ("ownership_approved", "cleanup_approved"):
+        if type(value.get(field)) is not bool or value[field] is not False:
+            raise RuntimeError(
+                "release blocked: legacy current evidence must contain explicit false "
+                f"{field} approval"
+            )
+
 
 def _validate_additional_descendants(value, label):
     records = value.get("additional_descendants")
@@ -825,7 +998,7 @@ def _validate_additional_descendants(value, label):
                 f"current evidence contract missing additional descendant fields: "
                 f"pid={record.get('pid')} fields={missing}"
             )
-        if not isinstance(record["pid"], int) or record["pid"] <= 0:
+        if not _is_positive_pid(record["pid"]):
             raise RuntimeError("current evidence contract invalid additional descendant pid")
         if record["pid"] in seen_pids:
             raise RuntimeError(f"current evidence contract duplicates additional descendant: pid={record['pid']}")
@@ -860,7 +1033,136 @@ def _validate_additional_descendants(value, label):
         normalized.append(record)
     return normalized
 
-def _current_cleanup_observation(value, label):
+_CURRENT_IDENTITY_FIELDS = (
+    "pid",
+    "creation",
+    "executable",
+    "argv",
+    "argv_sha256",
+    "native_command",
+    "native_command_sha256",
+    "cwd",
+    "parent_pid",
+    "parent_observations",
+    "role",
+    "family_relation",
+    "read_errors",
+    "listening_ports",
+    "source_provenance",
+)
+
+
+def _validate_current_identity(record, label, prefix=""):
+    """Validate one measured identity, including its parent and provenance."""
+    missing = [f"{prefix}{field}" for field in _CURRENT_IDENTITY_FIELDS if f"{prefix}{field}" not in record]
+    if missing:
+        raise RuntimeError(f"current identity evidence incomplete {label}: fields={missing}")
+    pid = record[f"{prefix}pid"]
+    if not _is_positive_pid(pid):
+        raise RuntimeError(f"current identity evidence invalid {label}: pid is required")
+    creation = record[f"{prefix}creation"]
+    if not isinstance(creation, str) or not creation.strip():
+        raise RuntimeError(f"current identity evidence invalid {label}: creation is required")
+    for field in ("executable", "cwd", "native_command", "role", "family_relation"):
+        value = record[f"{prefix}{field}"]
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"current identity evidence invalid {label}: field={prefix}{field}")
+    argv = record[f"{prefix}argv"]
+    if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
+        raise RuntimeError(f"current identity evidence invalid {label}: field={prefix}argv")
+    expected_argv_hash = hashlib.sha256("\0".join(argv).encode("utf-8")).hexdigest()
+    if record[f"{prefix}argv_sha256"] != expected_argv_hash:
+        raise RuntimeError(f"current identity evidence hash mismatch {label}: field={prefix}argv_sha256")
+    native_command = record[f"{prefix}native_command"]
+    expected_command_hash = hashlib.sha256(native_command.encode("utf-8")).hexdigest()
+    if record[f"{prefix}native_command_sha256"] != expected_command_hash:
+        raise RuntimeError(
+            f"current identity evidence hash mismatch {label}: field={prefix}native_command_sha256"
+        )
+    for field in ("argv_sha256", "native_command_sha256"):
+        value = record[f"{prefix}{field}"]
+        if not isinstance(value, str) or len(value) != 64 or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise RuntimeError(f"current identity evidence invalid {label}: field={prefix}{field}")
+    parent_pid = record[f"{prefix}parent_pid"]
+    if not _is_positive_pid(parent_pid):
+        raise RuntimeError(f"current identity evidence invalid {label}: field={prefix}parent_pid")
+    parent_observations = record[f"{prefix}parent_observations"]
+    if not isinstance(parent_observations, list) or not parent_observations:
+        raise RuntimeError(f"current identity evidence invalid {label}: field={prefix}parent_observations")
+    for observation in parent_observations:
+        if not isinstance(observation, dict) or observation.get("state") not in HOST_PARENT_STATES:
+            raise RuntimeError(f"current identity evidence invalid {label}: parent relation")
+        if observation.get("state") == "readable_current_parent":
+            for field in (
+                "pid", "creation", "parent_pid", "cwd", "executable", "argv", "argv_sha256",
+                "native_command", "native_command_sha256", "relation",
+            ):
+                if field not in observation:
+                    raise RuntimeError(
+                        f"current identity evidence incomplete {label}: parent field={field}"
+                    )
+        if observation.get("state") == "historical_parent_exited_pid_reused":
+            for field in ("current_creation", "child_creation", "current_parent_pid"):
+                if field not in observation:
+                    raise RuntimeError(
+                        f"current identity evidence incomplete {label}: reused parent field={field}"
+                    )
+    read_errors = record[f"{prefix}read_errors"]
+    if not isinstance(read_errors, list) or any(not isinstance(error, str) or not error.strip() for error in read_errors):
+        raise RuntimeError(f"current identity evidence invalid {label}: field={prefix}read_errors")
+    if read_errors:
+        raise RuntimeError(f"current identity evidence has read errors {label}: {read_errors}")
+    ports = record[f"{prefix}listening_ports"]
+    if not isinstance(ports, list) or any(isinstance(port, bool) or not isinstance(port, int) or port <= 0 for port in ports):
+        raise RuntimeError(f"current identity evidence invalid {label}: field={prefix}listening_ports")
+    provenance = record[f"{prefix}source_provenance"]
+    if not isinstance(provenance, dict) or not provenance:
+        raise RuntimeError(f"current identity evidence invalid {label}: field={prefix}source_provenance")
+    return {
+        field: record[f"{prefix}{field}"]
+        for field in _CURRENT_IDENTITY_FIELDS
+    }
+
+
+def _validate_cleanup_identity(record, label, prefix):
+    identity = _validate_current_identity(record, label, prefix)
+    files = record.get(f"{prefix}files")
+    module_paths = record.get(f"{prefix}module_paths")
+    if not isinstance(files, list) or not isinstance(module_paths, list):
+        raise RuntimeError(f"current identity evidence incomplete {label}: files and module_paths are required")
+    identity["files"] = files
+    identity["module_paths"] = module_paths
+    return identity
+
+
+_VERIFIED_ABSENT_NATIVE_ERROR = 87
+
+
+def _validate_absence_proof(record, expected_creation, label):
+    proof = record.get("absence_proof")
+    if not isinstance(proof, dict):
+        raise RuntimeError(f"current cleanup evidence lacks absence proof: {label}")
+    if proof.get("state") != "verified_absent":
+        raise RuntimeError(f"current cleanup evidence has invalid absence proof state: {label}")
+    if proof.get("pid") != record["pid"]:
+        raise RuntimeError(f"current cleanup evidence absence proof PID mismatch: {label}")
+    proof_creation = proof.get("expected_creation", proof.get("expected_token"))
+    if proof_creation != expected_creation:
+        raise RuntimeError(f"current cleanup evidence absence proof creation mismatch: {label}")
+    native_error = proof.get("native_error")
+    if native_error != _VERIFIED_ABSENT_NATIVE_ERROR:
+        raise RuntimeError(
+            f"current cleanup evidence absence proof has invalid native error: {label}"
+        )
+    return {
+        "state": proof["state"],
+        "pid": proof["pid"],
+        "expected_creation": expected_creation,
+        "native_error": native_error,
+    }
+
+
+def _current_cleanup_observation(value, label, family_records=None):
     if not isinstance(value, dict):
         raise RuntimeError(f"current cleanup evidence invalid {label}: expected an object")
     records = value.get("observations")
@@ -868,12 +1170,21 @@ def _current_cleanup_observation(value, label):
         raise RuntimeError(f"current cleanup evidence invalid {label}: observations are required")
     normalized = {}
     for record in records:
-        if not isinstance(record, dict) or not isinstance(record.get("pid"), int) or record["pid"] <= 0:
+        if not isinstance(record, dict) or not _is_positive_pid(record.get("pid")):
             raise RuntimeError(f"current cleanup evidence invalid {label}: each observation needs a positive pid")
         pid = record["pid"]
         if pid in normalized:
             raise RuntimeError(f"current cleanup evidence duplicates pid={pid}: {label}")
+        family = None
+        if family_records is not None:
+            family = next((item for item in family_records if item["pid"] == record["pid"]), None)
+            if family is None:
+                raise RuntimeError(f"current cleanup evidence has no measured family identity: {label} pid={pid}")
         expected = record.get("expected_creation", record.get("expected_token"))
+        if family is not None:
+            expected = family["creation"]
+            if record.get("expected_creation") != expected:
+                raise RuntimeError(f"current cleanup evidence disagrees with measured family: {label} pid={pid}")
         current = record.get("current_creation", record.get("current_token"))
         state = record.get("state", record.get("status"))
         if not isinstance(expected, str) or not expected:
@@ -886,7 +1197,26 @@ def _current_cleanup_observation(value, label):
             raise RuntimeError(f"current cleanup evidence does not prove PID reuse: {label} pid={pid}")
         if state in {"live", "present"} and current != expected:
             raise RuntimeError(f"current cleanup evidence does not prove the exact live identity: {label} pid={pid}")
-        normalized[pid] = {**record, "expected_creation": expected, "current_creation": current, "state": state}
+        if family is None:
+            _validate_cleanup_identity(record, f"{label} pid={pid}", "expected_")
+        if state == "absent":
+            absence_proof = _validate_absence_proof(
+                record, expected, f"{label} pid={pid}"
+            )
+        else:
+            absence_proof = None
+            if family is None:
+                _validate_cleanup_identity(record, f"{label} pid={pid}", "current_")
+                if record["current_creation"] != current:
+                    raise RuntimeError(f"current cleanup evidence disagrees with current identity: {label} pid={pid}")
+        normalized[pid] = {
+            **record,
+            **({"expected_identity": family} if family is not None else {}),
+            "expected_creation": expected,
+            "current_creation": current,
+            "state": state,
+            "absence_proof": absence_proof,
+        }
     return normalized
 
 def _current_frontend_observation(value, label):
@@ -919,10 +1249,66 @@ def _current_frontend_observation(value, label):
         raise RuntimeError(
             f"current frontend evidence invalid {label}: listening_ports must be a list of positive integers"
         )
-    for item in [*processes, *holders]:
-        if not isinstance(item, dict) or not isinstance(item.get("pid"), int) or item["pid"] <= 0:
-            raise RuntimeError(f"current frontend evidence has an invalid identity: {label}")
-    return {"processes": processes, "holders": holders, "ports": ports}
+    normalized_processes = []
+    normalized_holders = []
+    for collection, target, name in (
+        (processes, normalized_processes, "product_frontend_processes"),
+        (holders, normalized_holders, "native_module_holders"),
+    ):
+        for item in collection:
+            if not isinstance(item, dict) or not _is_positive_pid(item.get("pid")):
+                raise RuntimeError(
+                    f"current frontend evidence has an invalid pid: evidence={label} collection={name}"
+                )
+            identity = _validate_current_identity(item, f"{label} field={name} pid={item['pid']}")
+            files = item.get("files")
+            module_paths = item.get("module_paths")
+            if not isinstance(files, list) or not isinstance(module_paths, list):
+                raise RuntimeError(
+                    f"current frontend evidence incomplete {label}: field={name} pid={item['pid']} files/module_paths"
+                )
+            if sorted(identity["listening_ports"]) != sorted(ports):
+                raise RuntimeError(
+                    f"current frontend evidence disagrees with measured listening_ports: pid={item['pid']}"
+                )
+            if name == "native_module_holders":
+                native_path = (SCRIPT_ROOT / HOST_NATIVE_MODULE).resolve()
+                native_values = [
+                    candidate
+                    for candidate in files + module_paths
+                    if isinstance(candidate, str)
+                    and (
+                        (not Path(candidate).is_absolute() and Path(candidate).as_posix() == HOST_NATIVE_MODULE.as_posix())
+                        or (Path(candidate).is_absolute() and _host_path_identity(candidate) == _host_path_identity(native_path))
+                    )
+                ]
+                if len(native_values) != 2:
+                    raise RuntimeError(
+                        f"current frontend evidence holder lacks exact native path/module evidence: pid={item['pid']}"
+                    )
+            identity["files"] = list(files)
+            identity["module_paths"] = list(module_paths)
+            target.append({**item, "current_identity": identity})
+    return {"processes": normalized_processes, "holders": normalized_holders, "ports": ports}
+
+
+def _assert_current_identity_matches_family(item, family, label):
+    """Require raw current evidence to match its normalized family record."""
+    for field in (
+        "creation", "cwd", "executable", "argv", "argv_sha256",
+        "native_command", "native_command_sha256", "parent_pid", "role", "family_relation",
+        "module_paths", "files", "parent_observations", "source_provenance",
+    ):
+        if item[field] != family[field]:
+            raise RuntimeError(
+                f"release blocked: current frontend identity disagrees with normalized family: "
+                f"{label} field={field}"
+            )
+    if sorted(item["listening_ports"]) != sorted(family["ports"]):
+        raise RuntimeError(
+            f"release blocked: current frontend identity disagrees with normalized family: "
+            f"{label} field=listening_ports"
+        )
 
 
 def _derive_historical_roles(node_records, lock_records, family_records):
@@ -1024,19 +1410,35 @@ def _load_host_process_contract() -> dict[str, Any]:
     node_records = _legacy_evidence_records(documents[_LEGACY_NODE_INVENTORY], _LEGACY_NODE_INVENTORY)
     lock_records = _legacy_evidence_records(documents[_LEGACY_LOCK_INVENTORY], _LEGACY_LOCK_INVENTORY)
     legacy_current = documents[HOST_PROCESS_EVIDENCE_FILES[2]]
-    if not isinstance(legacy_current, dict) or legacy_current.get("ownership_approved") is not False:
-        raise RuntimeError("release blocked: legacy current evidence must remain observation-only")
+    _assert_legacy_current_observation(legacy_current)
     legacy_document = documents[HOST_PROCESS_EVIDENCE_FILES[3]]
     normalized_document = documents[HOST_PROCESS_EVIDENCE_FILES[4]]
     legacy_family = _legacy_family_observation_records(legacy_document, HOST_PROCESS_EVIDENCE_FILES[3])
-    family_records = _current_family_records(normalized_document, HOST_PROCESS_EVIDENCE_FILES[4])
+    family_records = _current_family_records(
+        normalized_document,
+        HOST_PROCESS_EVIDENCE_FILES[4],
+        legacy_document,
+    )
     _assert_family_source_provenance(legacy_document, normalized_document)
-    presence = _current_cleanup_observation(documents[HOST_PROCESS_EVIDENCE_FILES[5]], HOST_PROCESS_EVIDENCE_FILES[5])
+    presence = _current_cleanup_observation(
+        documents[HOST_PROCESS_EVIDENCE_FILES[5]],
+        HOST_PROCESS_EVIDENCE_FILES[5],
+        family_records,
+    )
     frontend = _current_frontend_observation(
         documents[HOST_PROCESS_EVIDENCE_FILES[6]],
         str(root / HOST_PROCESS_EVIDENCE_FILES[6]),
     )
     family_by_pid = {record["pid"]: record for record in family_records}
+    for collection_name in ("processes", "holders"):
+        for item in frontend[collection_name]:
+            pid = item["pid"]
+            family = family_by_pid.get(pid)
+            if family is None:
+                raise RuntimeError(
+                    f"release blocked: current frontend identity is absent from normalized family: pid={pid}"
+                )
+            _assert_current_identity_matches_family(item, family, f"pid={pid}")
     legacy_by_pid = {record["pid"]: record for record in legacy_family}
     if set(legacy_by_pid) != set(family_by_pid):
         raise RuntimeError("release blocked: normalized family identity set does not match immutable observation")
@@ -1076,14 +1478,1876 @@ def _load_host_process_contract() -> dict[str, Any]:
     )
     return {"root": root, "documents": documents, "node_records": bound_node_records, "lock_records": list(lock_by_pid.values()), "historical_pids": set(node_by_pid), "family_records": family_records, "presence": presence, "frontend": frontend, "live_exact": live_exact, "approval": approval_document, "approval_records": approval_records, "additional_records": additional_records}
 
+
+class _FreshProcessAbsent(RuntimeError):
+    """The native reader proved that a PID does not exist now."""
+
+
+class _FreshProcessUnreadable(RuntimeError):
+    """The native reader could not prove the state of a PID."""
+
+
+@dataclass(frozen=True)
+class _NativeReadState:
+    """State for one native identity read.
+
+    Callers provide this state for each read. The reader does not use shared
+    mutable state to infer the expected identity or the required access level.
+    """
+
+    expected_creation: str | None = None
+    limited_only: bool = False
+
+
+_FRESH_STATE_TRANSITIONS = {
+    "absent": frozenset({"absent", "reused", "live"}),
+    "reused": frozenset({"absent", "reused", "live"}),
+    "live": frozenset({"absent", "reused", "live"}),
+    "present": frozenset({"absent", "reused", "live"}),
+}
+
+
+def _validate_fresh_replacement_identity(
+    current: dict[str, Any], expected_creation: str, pid: int
+) -> None:
+    """Require the limited measured identity needed to prove PID reuse."""
+    required = (
+        "pid",
+        "creation",
+        "executable",
+        "source_provenance",
+    )
+    missing = [field for field in required if field not in current]
+    if missing:
+        raise RuntimeError(
+            f"release blocked: fresh replacement identity is incomplete: pid={pid} fields={missing}"
+        )
+    if current["pid"] != pid or current["creation"] == expected_creation:
+        raise RuntimeError(
+            f"release blocked: fresh replacement identity is not a different PID identity: pid={pid}"
+        )
+    if not isinstance(current["executable"], str) or not current["executable"].strip():
+        raise RuntimeError(f"release blocked: fresh replacement identity has invalid executable: pid={pid}")
+    if not isinstance(current["source_provenance"], dict) or not current["source_provenance"]:
+        raise RuntimeError(f"release blocked: fresh replacement identity has invalid provenance: pid={pid}")
+
+
+def _assert_exact_live_identity_matches_family(
+    current: dict[str, Any], family: dict[str, Any], pid: int
+) -> None:
+    """Require the fresh exact identity to match all comparable historical fields."""
+    for field in (
+        "creation",
+        "executable",
+        "argv",
+        "argv_sha256",
+        "native_command",
+        "native_command_sha256",
+        "cwd",
+        "parent_pid",
+        "parent_observations",
+    ):
+        if current[field] != family[field]:
+            raise RuntimeError(
+                f"release blocked: fresh exact identity disagrees with normalized family: "
+                f"pid={pid} field={field}"
+            )
+
+
+def _read_fresh_native_process_identity(
+    pid: int,
+    read_state: _NativeReadState,
+    _ancestry: set[int] | None = None,
+    _read_parent_observation: bool = True,
+) -> dict[str, Any]:
+    """Read one complete current Windows identity from one process handle."""
+    if os.name != "nt":
+        raise _FreshProcessUnreadable(
+            f"native Windows process census is unsupported on host os={os.name!r}"
+        )
+    if not isinstance(read_state, _NativeReadState):
+        raise _FreshProcessUnreadable(
+            f"native process census received invalid read state for pid={pid}: {read_state!r}"
+        )
+    if not _is_positive_pid(pid):
+        raise _FreshProcessUnreadable(f"native process census received invalid pid={pid!r}")
+
+    import ctypes
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+    class UnicodeString(ctypes.Structure):
+        _fields_ = [
+            ("length", ctypes.c_ushort),
+            ("maximum_length", ctypes.c_ushort),
+            ("buffer", ctypes.c_void_p),
+        ]
+
+    class ProcessBasicInformation(ctypes.Structure):
+        _fields_ = [
+            ("exit_status", ctypes.c_void_p),
+            ("peb", ctypes.c_void_p),
+            ("affinity", ctypes.c_void_p),
+            ("base_priority", ctypes.c_long),
+            ("process_id", ctypes.c_void_p),
+            ("parent_process_id", ctypes.c_void_p),
+        ]
+
+    ancestry = set() if _ancestry is None else set(_ancestry)
+    if pid in ancestry:
+        raise _FreshProcessUnreadable(f"pid={pid} native ancestry cycle detected")
+    ancestry.add(pid)
+    pointer_size = ctypes.sizeof(ctypes.c_void_p)
+    if pointer_size not in (4, 8):
+        raise _FreshProcessUnreadable(
+            f"pid={pid} native identity unsupported pointer size={pointer_size}"
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.GetProcessTimes.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+    ]
+    kernel32.GetProcessTimes.restype = ctypes.c_int
+    kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_wchar_p,
+        ctypes.POINTER(ctypes.c_uint32),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
+    if not hasattr(kernel32, "IsWow64Process2"):
+        raise _FreshProcessUnreadable(
+            f"pid={pid} native architecture contract is unsupported: IsWow64Process2 is unavailable"
+        )
+    kernel32.IsWow64Process2.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ushort),
+        ctypes.POINTER(ctypes.c_ushort),
+    ]
+    kernel32.IsWow64Process2.restype = ctypes.c_int
+    kernel32.ReadProcessMemory.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    kernel32.ReadProcessMemory.restype = ctypes.c_int
+    ntdll.NtQueryInformationProcess.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
+    ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+
+    def read_creation_token(handle: int) -> str:
+        creation = FileTime()
+        exit_time = FileTime()
+        kernel_time = FileTime()
+        user_time = FileTime()
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        ):
+            raise _FreshProcessUnreadable(
+                f"pid={pid} native creation read failed: WinError {ctypes.get_last_error()}"
+            )
+        return str((creation.high << 32) | creation.low)
+
+    def read_executable_path(handle: int) -> str:
+        executable_buffer = ctypes.create_unicode_buffer(32768)
+        executable_length = ctypes.c_uint32(len(executable_buffer))
+        if not kernel32.QueryFullProcessImageNameW(
+            handle, 0, executable_buffer, ctypes.byref(executable_length)
+        ) or not executable_length.value:
+            raise _FreshProcessUnreadable(
+                f"pid={pid} native executable read failed: WinError {ctypes.get_last_error()}"
+            )
+        executable = os.path.normcase(os.path.normpath(executable_buffer.value))
+        if not executable:
+            raise _FreshProcessUnreadable(f"pid={pid} native executable path is empty")
+        return executable
+
+    def read_exit_code(handle: int) -> int:
+        status = ctypes.c_uint32()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(status)):
+            raise _FreshProcessUnreadable(
+                f"pid={pid} native exit-state read failed: WinError {ctypes.get_last_error()}"
+            )
+        return int(status.value)
+
+    def read_parent_identity(handle: int) -> tuple[int, int]:
+        basic = ProcessBasicInformation()
+        returned = ctypes.c_ulong()
+        status = ntdll.NtQueryInformationProcess(
+            handle,
+            0,
+            ctypes.byref(basic),
+            ctypes.sizeof(basic),
+            ctypes.byref(returned),
+        )
+        process_id = int(basic.process_id or 0)
+        parent_pid = int(basic.parent_process_id or 0)
+        if status != 0 or process_id != pid or not _is_parent_pid(parent_pid):
+            raise _FreshProcessUnreadable(
+                f"pid={pid} native parent identity read failed: "
+                f"status={status} returned_pid={process_id} parent_pid={parent_pid!r}"
+            )
+        return process_id, parent_pid
+
+    def require_running(handle: int) -> None:
+        status = read_exit_code(handle)
+        if status != 259:
+            raise _FreshProcessUnreadable(
+                f"pid={pid} exited during native identity read: status={status}"
+            )
+
+    def read_win32_process_row_state() -> str:
+        command = (
+            "$rows = @(Get-CimInstance Win32_Process -Filter 'ProcessId = "
+            f"{pid}'); if ($rows.Count -eq 0) {{ exit 3 }}; "
+            "if ($rows.Count -gt 1) { exit 4 }; exit 0"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise _FreshProcessUnreadable(
+                f"pid={pid} authoritative Win32_Process state read failed: {exc}"
+            ) from exc
+        if result.returncode == 3:
+            return "absent"
+        if result.returncode != 0:
+            raise _FreshProcessUnreadable(
+                f"pid={pid} authoritative Win32_Process state read failed: "
+                f"rc={result.returncode} stderr={result.stderr[-1000:]}"
+            )
+        return "present"
+
+    expected_creation = read_state.expected_creation
+    limited_only = read_state.limited_only
+    limited_handle = kernel32.OpenProcess(0x1000, 0, pid)
+    if not limited_handle:
+        error = ctypes.get_last_error()
+        if error in (6, 87, 1168):
+            raise _FreshProcessAbsent(f"pid={pid} is absent")
+        raise _FreshProcessUnreadable(
+            f"pid={pid} limited native identity open failed: WinError {error}"
+        )
+    try:
+        limited_creation = read_creation_token(limited_handle)
+        limited_status = read_exit_code(limited_handle)
+        if limited_status != 259:
+            process_row_state = read_win32_process_row_state()
+            if process_row_state != "absent":
+                raise _FreshProcessUnreadable(
+                    f"pid={pid} exited handle contradicts authoritative Win32_Process row"
+                )
+            recheck_handle = kernel32.OpenProcess(0x1000, 0, pid)
+            if recheck_handle:
+                try:
+                    recheck_creation = read_creation_token(recheck_handle)
+                    recheck_status = read_exit_code(recheck_handle)
+                    if recheck_status == 259:
+                        if recheck_creation == expected_creation:
+                            raise _FreshProcessUnreadable(
+                                f"pid={pid} exited handle recheck returned the exact historical identity as live"
+                            )
+                        return {
+                            "pid": pid,
+                            "creation": recheck_creation,
+                            "executable": read_executable_path(recheck_handle),
+                            "source_provenance": {
+                                "reader": "native limited process handle",
+                                "classification": "exited handle followed by live PID reuse",
+                            },
+                        }
+                    if recheck_creation != limited_creation:
+                        raise _FreshProcessUnreadable(
+                            f"pid={pid} exited handle recheck changed creation token while remaining exited"
+                        )
+                finally:
+                    if not kernel32.CloseHandle(recheck_handle):
+                        raise _FreshProcessUnreadable(
+                            f"pid={pid} recheck process handle close failed: WinError {ctypes.get_last_error()}"
+                        )
+            return {
+                "pid": pid,
+                "creation": limited_creation,
+                "state": "exited",
+                "exit_code": limited_status,
+                "expected_creation": expected_creation,
+                "exit_proof": {
+                    "handle_state": "exited",
+                    "authoritative_win32_process": "absent",
+                    "creation": limited_creation,
+                },
+                "source_provenance": {
+                    "reader": "native limited process handle",
+                    "classification": "exited terminal object",
+                    "authoritative_win32_process": "absent",
+                },
+            }
+        limited_executable = read_executable_path(limited_handle)
+        if limited_only or (expected_creation is not None and limited_creation != expected_creation):
+            limited_process_id, limited_parent_pid = read_parent_identity(limited_handle)
+            return {
+                "pid": limited_process_id,
+                "creation": limited_creation,
+                "executable": limited_executable,
+                "parent_pid": limited_parent_pid,
+                "command": None,
+                "source_provenance": {"reader": "native limited process handle"},
+            }
+    finally:
+        if not kernel32.CloseHandle(limited_handle):
+            raise _FreshProcessUnreadable(
+                f"pid={pid} limited native process handle close failed: WinError {ctypes.get_last_error()}"
+            )
+
+    # Only an exact creation-token match reaches this full read. No write or
+    # terminate rights are used.
+    rights = 0x0400 | 0x1000 | 0x0010 | 0x0040
+    handle = kernel32.OpenProcess(rights, 0, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error in (6, 87, 1168):
+            raise _FreshProcessAbsent(f"pid={pid} is absent")
+        raise _FreshProcessUnreadable(
+            f"pid={pid} full native identity open failed: WinError {error}"
+        )
+
+    def validate_native_architecture() -> None:
+        process_machine = ctypes.c_ushort()
+        native_machine = ctypes.c_ushort()
+        if not kernel32.IsWow64Process2(
+            handle, ctypes.byref(process_machine), ctypes.byref(native_machine)
+        ):
+            raise _FreshProcessUnreadable(
+                f"pid={pid} native architecture read failed: WinError {ctypes.get_last_error()}"
+            )
+        if process_machine.value != 0:
+            raise _FreshProcessUnreadable(
+                f"pid={pid} native architecture is unsupported: wow64_machine=0x{process_machine.value:04x}"
+            )
+        supported_native = {0x014C} if pointer_size == 4 else {0x8664, 0xAA64}
+        if native_machine.value not in supported_native:
+            raise _FreshProcessUnreadable(
+                f"pid={pid} native architecture is unsupported: native_machine=0x{native_machine.value:04x}"
+            )
+    def creation_token() -> str:
+        return read_creation_token(handle)
+
+    def read_remote(address: int, size: int) -> bytes:
+        if not isinstance(address, int) or address <= 0 or size <= 0 or size > 131072:
+            raise _FreshProcessUnreadable(
+                f"pid={pid} native memory contract is invalid: address={address!r} size={size!r}"
+            )
+        buffer = (ctypes.c_ubyte * size)()
+        count = ctypes.c_size_t()
+        if not kernel32.ReadProcessMemory(
+            handle,
+            ctypes.c_void_p(address),
+            ctypes.byref(buffer),
+            size,
+            ctypes.byref(count),
+        ) or count.value != size:
+            raise _FreshProcessUnreadable(
+                f"pid={pid} native memory read failed: address=0x{address:x} requested={size} read={count.value}"
+            )
+        return bytes(buffer)
+
+    def read_struct(address: int, struct_type):
+        raw = read_remote(address, ctypes.sizeof(struct_type))
+        return struct_type.from_buffer_copy(raw)
+
+    def read_unicode(address: int, label: str) -> str:
+        value = read_struct(address, UnicodeString)
+        if value.length == 0 or value.length % 2 or value.length > 32768:
+            raise _FreshProcessUnreadable(
+                f"pid={pid} native {label} UNICODE_STRING is malformed: length={value.length}"
+            )
+        if not value.buffer or value.maximum_length < value.length:
+            raise _FreshProcessUnreadable(
+                f"pid={pid} native {label} UNICODE_STRING is malformed"
+            )
+        try:
+            return read_remote(int(value.buffer), value.length).decode("utf-16-le")
+        except UnicodeDecodeError as exc:
+            raise _FreshProcessUnreadable(
+                f"pid={pid} native {label} text is malformed"
+            ) from exc
+
+    try:
+        validate_native_architecture()
+        require_running(handle)
+        initial_creation = creation_token()
+        basic = ProcessBasicInformation()
+        returned = ctypes.c_ulong()
+        status = ntdll.NtQueryInformationProcess(
+            handle,
+            0,
+            ctypes.byref(basic),
+            ctypes.sizeof(basic),
+            ctypes.byref(returned),
+        )
+        if status != 0 or not basic.peb:
+            raise _FreshProcessUnreadable(
+                f"pid={pid} native basic information failed: status={status}"
+            )
+        if int(basic.process_id or 0) != pid:
+            raise _FreshProcessUnreadable(
+                f"pid={pid} native identity changed during read: returned_pid={basic.process_id}"
+            )
+        parent_pid = int(basic.parent_process_id or 0)
+        if not _is_parent_pid(parent_pid):
+            raise _FreshProcessUnreadable(f"pid={pid} native parent PID is invalid")
+
+        parameters_address = int.from_bytes(
+            read_remote(int(basic.peb) + (0x20 if pointer_size == 8 else 0x10), pointer_size),
+            "little",
+        )
+        if not parameters_address:
+            raise _FreshProcessUnreadable(f"pid={pid} native process parameters are unavailable")
+        command_line = read_unicode(
+            parameters_address + (0x70 if pointer_size == 8 else 0x40), "command line"
+        )
+        cwd = read_unicode(
+            parameters_address + (0x38 if pointer_size == 8 else 0x24), "current directory"
+        )
+        argv = _windows_command_line_argv_native(command_line)
+        if not argv:
+            raise _FreshProcessUnreadable(f"pid={pid} native command line parsed to empty argv")
+
+        executable = read_executable_path(handle)
+
+        require_running(handle)
+        final_creation = creation_token()
+        if final_creation != initial_creation:
+            raise _FreshProcessUnreadable(
+                f"pid={pid} native identity changed during read: creation token changed"
+            )
+        return {
+            "pid": pid,
+            "creation": final_creation,
+            "executable": executable,
+            "native_command": command_line,
+            "native_command_sha256": hashlib.sha256(command_line.encode("utf-8")).hexdigest(),
+            "argv": argv,
+            "argv_sha256": hashlib.sha256("\0".join(argv).encode("utf-8")).hexdigest(),
+            "cwd": os.path.normcase(os.path.normpath(cwd)),
+            "parent_pid": parent_pid,
+            "parent_observations": (
+                _read_fresh_parent_observation(pid, final_creation, parent_pid, ancestry)
+                if _read_parent_observation
+                else []
+            ),
+            "role": "measured current native process",
+            "family_relation": "measured current native process identity",
+            "module_paths": [],
+            "files": [],
+            "ports": [],
+            "read_errors": [],
+            "listening_ports": [],
+            "source_provenance": {"reader": "native process handle"},
+        }
+    finally:
+        if not kernel32.CloseHandle(handle):
+            raise _FreshProcessUnreadable(
+                f"pid={pid} native process handle close failed: WinError {ctypes.get_last_error()}"
+            )
+
+
+def _windows_command_line_argv_native(command_line: str) -> list[str]:
+    """Parse native command text without changing the serialized command."""
+    if not isinstance(command_line, str) or not command_line:
+        raise _FreshProcessUnreadable("native command line is empty")
+    import ctypes
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32.CommandLineToArgvW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    count = ctypes.c_int()
+    values = shell32.CommandLineToArgvW(command_line, ctypes.byref(count))
+    if not values or count.value <= 0:
+        raise _FreshProcessUnreadable(
+            f"native command line parsing failed: WinError {ctypes.get_last_error()}"
+        )
+    try:
+        return [values[index] for index in range(count.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(values)
+
+
+def _read_fresh_parent_observation(
+    child_pid: int, child_creation: str, parent_pid: int, ancestry: set[int]
+) -> list[dict[str, Any]]:
+    """Bind two parent reads before using any live-only parent fields."""
+
+    def validate_exit_proof(result: dict[str, Any], read_stage: str, creation: str) -> None:
+        proof = result.get("exit_proof")
+        provenance = result.get("source_provenance")
+        if not isinstance(result.get("exit_code"), int) or isinstance(result.get("exit_code"), bool):
+            raise _FreshProcessUnreadable(
+                f"child_pid={child_pid} parent_pid={parent_pid} read_stage={read_stage} "
+                f"exited parent lacks authoritative exit code: exit_code={result.get('exit_code')!r}"
+            )
+        if result["exit_code"] == 259:
+            raise _FreshProcessUnreadable(
+                f"child_pid={child_pid} parent_pid={parent_pid} read_stage={read_stage} "
+                "exited parent has contradictory active status: "
+                f"exit_code=259 evidence={result!r}"
+            )
+        if not isinstance(proof, dict) or proof.get("handle_state") != "exited":
+            raise _FreshProcessUnreadable(
+                f"child_pid={child_pid} parent_pid={parent_pid} read_stage={read_stage} "
+                f"exited parent lacks authoritative exit proof: proof={proof!r}"
+            )
+        if proof.get("authoritative_win32_process") != "absent" or proof.get("creation") != creation:
+            raise _FreshProcessUnreadable(
+                f"child_pid={child_pid} parent_pid={parent_pid} read_stage={read_stage} "
+                f"exited parent proof is incomplete or contradictory: proof={proof!r}"
+            )
+        if not isinstance(provenance, dict) or provenance.get("authoritative_win32_process") != "absent":
+            raise _FreshProcessUnreadable(
+                f"child_pid={child_pid} parent_pid={parent_pid} read_stage={read_stage} "
+                f"exited parent provenance is incomplete or contradictory: provenance={provenance!r}"
+            )
+
+    def classify(result: object, read_stage: str) -> tuple[str, str]:
+        if not isinstance(result, dict):
+            raise _FreshProcessUnreadable(
+                f"child_pid={child_pid} parent_pid={parent_pid} read_stage={read_stage} "
+                f"native parent result is not an object: {result!r}"
+            )
+        observed_pid = result.get("pid")
+        creation = result.get("creation")
+        if type(observed_pid) is not int or observed_pid != parent_pid:
+            raise _FreshProcessUnreadable(
+                f"child_pid={child_pid} parent_pid={parent_pid} read_stage={read_stage} "
+                f"native parent PID is invalid: observed_pid={observed_pid!r}"
+            )
+        if not isinstance(creation, str) or not creation:
+            raise _FreshProcessUnreadable(
+                f"child_pid={child_pid} parent_pid={parent_pid} read_stage={read_stage} "
+                f"native parent creation token is invalid: creation={creation!r}"
+            )
+        state = result.get("state")
+        if state == "exited":
+            validate_exit_proof(result, read_stage, creation)
+            live_fields = {
+                "parent_pid", "cwd", "executable", "argv", "argv_sha256",
+                "native_command", "native_command_sha256",
+            }
+            contradictory = sorted(field for field in live_fields if field in result)
+            if contradictory:
+                raise _FreshProcessUnreadable(
+                    f"child_pid={child_pid} parent_pid={parent_pid} read_stage={read_stage} "
+                    f"exited parent contains live fields: {contradictory}"
+                )
+            return "exited", creation
+        if state is not None:
+            raise _FreshProcessUnreadable(
+                f"child_pid={child_pid} parent_pid={parent_pid} read_stage={read_stage} "
+                f"native parent state is invalid: state={state!r}"
+            )
+        return "live", creation
+
+    def raise_read_failure(read_stage: str, exc: BaseException) -> None:
+        raise _FreshProcessUnreadable(
+            f"child_pid={child_pid} parent_pid={parent_pid} read_stage={read_stage} "
+            f"native parent relation read failed: {exc}"
+        ) from exc
+
+    def reused_observation(creation: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "pid": parent_pid,
+                "state": "historical_parent_exited_pid_reused",
+                "current_creation": creation,
+                "child_creation": child_creation,
+                "current_parent_pid": parent_pid,
+            }
+        ]
+
+    if not _is_parent_pid(parent_pid):
+        raise _FreshProcessUnreadable(
+            f"child_pid={child_pid} parent_pid={parent_pid!r} read_stage=before-read "
+            "native parent PID is invalid"
+        )
+    if parent_pid in (0, 4):
+        return [{"pid": parent_pid, "state": "windows_system_parent"}]
+    if parent_pid in ancestry or parent_pid == child_pid:
+        raise _FreshProcessUnreadable(
+            f"child_pid={child_pid} parent_pid={parent_pid} read_stage=before-read "
+            "native ancestry cycle detected"
+        )
+    try:
+        first = _read_fresh_native_process_identity(
+            parent_pid,
+            _NativeReadState(limited_only=True),
+            ancestry,
+            _read_parent_observation=False,
+        )
+    except _FreshProcessAbsent:
+        return [{"pid": parent_pid, "state": "verified_absent_parent"}]
+    except _FreshProcessUnreadable as exc:
+        raise_read_failure("first-read", exc)
+
+    first_kind, first_creation = classify(first, "first-read")
+    if first_kind == "exited":
+        return [{"pid": parent_pid, "state": "verified_exited_parent", "creation": first_creation}]
+
+    try:
+        second = _read_fresh_native_process_identity(
+            parent_pid,
+            _NativeReadState(),
+            ancestry,
+            _read_parent_observation=False,
+        )
+    except _FreshProcessAbsent:
+        return [
+            {
+                "pid": parent_pid,
+                "state": "parent_exited_during_observation",
+                "creation": first_creation,
+            }
+        ]
+    except _FreshProcessUnreadable as exc:
+        raise_read_failure("second-read", exc)
+
+    second_kind, second_creation = classify(second, "second-read")
+    if second_creation != first_creation:
+        return reused_observation(second_creation)
+    if second_kind == "exited":
+        return [{"pid": parent_pid, "state": "verified_exited_parent", "creation": second_creation}]
+    try:
+        if int(second_creation) > int(child_creation):
+            return reused_observation(second_creation)
+    except (TypeError, ValueError) as exc:
+        raise _FreshProcessUnreadable(
+            f"child_pid={child_pid} parent_pid={parent_pid} read_stage=creation-order "
+            f"native creation token is not numeric: child={child_creation!r} parent={second_creation!r}"
+        ) from exc
+
+    required_live_fields = (
+        "parent_pid", "cwd", "executable", "argv", "argv_sha256",
+        "native_command", "native_command_sha256",
+    )
+    missing = [field for field in required_live_fields if field not in second]
+    if missing:
+        raise _FreshProcessUnreadable(
+            f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
+            f"stable live parent evidence is incomplete: fields={missing}"
+        )
+    if not _is_parent_pid(second["parent_pid"]):
+        raise _FreshProcessUnreadable(
+            f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
+            f"native parent-of-parent PID is invalid: parent_pid={second['parent_pid']!r}"
+        )
+    if not isinstance(second["cwd"], str) or not second["cwd"]:
+        raise _FreshProcessUnreadable(
+            f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
+            "native parent cwd is invalid"
+        )
+    if not isinstance(second["executable"], str) or not second["executable"]:
+        raise _FreshProcessUnreadable(
+            f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
+            "native parent executable is invalid"
+        )
+    if not isinstance(second["argv"], list) or not second["argv"] or not all(
+        isinstance(argument, str) for argument in second["argv"]
+    ):
+        raise _FreshProcessUnreadable(
+            f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
+            "native parent argv is invalid"
+        )
+    if not isinstance(second["native_command"], str) or not second["native_command"]:
+        raise _FreshProcessUnreadable(
+            f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
+            "native parent command is invalid"
+        )
+    if second["argv_sha256"] != hashlib.sha256("\0".join(second["argv"]).encode("utf-8")).hexdigest():
+        raise _FreshProcessUnreadable(
+            f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
+            "native parent argv hash does not match argv"
+        )
+    if second["native_command_sha256"] != hashlib.sha256(second["native_command"].encode("utf-8")).hexdigest():
+        raise _FreshProcessUnreadable(
+            f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
+            "native parent command hash does not match command"
+        )
+    if second["parent_pid"] == child_pid:
+        raise _FreshProcessUnreadable(
+            f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
+            "native ancestry cycle detected"
+        )
+    return [
+        {
+            "pid": parent_pid,
+            "state": "readable_current_parent",
+            "creation": second_creation,
+            "parent_pid": second["parent_pid"],
+            "cwd": second["cwd"],
+            "executable": second["executable"],
+            "argv": second["argv"],
+            "argv_sha256": second["argv_sha256"],
+            "native_command": second["native_command"],
+            "native_command_sha256": second["native_command_sha256"],
+            "relation": "current parent of exact child identity",
+        }
+    ]
+
+
+def _enumerate_fresh_frontend_resources() -> dict[str, Any]:
+    """Measure host process and socket facts for later scoped classification."""
+    if os.name != "nt":
+        raise RuntimeError(
+            f"release blocked: fresh Windows resource census is unsupported on host os={os.name!r}"
+        )
+    product_root = str(ROOT.resolve()).replace("'", "''")
+    command = r'''
+$errors = @()
+$processes = @()
+$holders = @()
+$productRoot = '__PRODUCT_ROOT__'
+$service = Get-CimInstance Win32_Service -Filter "Name = 'JarvisBrowserService'" -ErrorAction Stop
+$serviceRoot = $null
+if ($service -and [int]$service.ProcessId -gt 0) {
+$serviceRoot = [pscustomobject]@{pid=[int]$service.ProcessId; name='JarvisBrowserService'; path_name=[string]$service.PathName; source_provenance=@{reader='Win32_Service'}}
+}
+foreach ($p in @(Get-CimInstance Win32_Process)) {
+  try {
+    $processes += [pscustomobject]@{
+      pid = [int]$p.ProcessId
+      name = [string]$p.Name
+      executable = [string]$p.ExecutablePath
+      command = [string]$p.CommandLine
+      parent_pid = [int]$p.ParentProcessId
+      protected_or_unrelated_state = $null
+      source_provenance = @{reader='Win32_Process'}
+    }
+  } catch {
+    $errors += "pid=$($p.ProcessId) process-read=$($_.Exception.Message)"
+  }
+}
+$scopedCandidates = @($processes | Where-Object {
+  $_.command -and ($_.command -like "*$productRoot*" -or $_.executable -like "*$productRoot*")
+})
+foreach ($candidate in $scopedCandidates) {
+  try {
+    $modules = @(Get-Process -Id $candidate.pid -Module -ErrorAction Stop | ForEach-Object {$_.FileName})
+    $holders += [pscustomobject]@{pid=[int]$candidate.pid; module_paths=$modules; source_provenance=@{reader='Process.Modules'; scope='exact product root'}}
+  } catch {
+    $errors += "pid=$($candidate.pid) module-read=$($_.Exception.Message)"
+  }
+}
+$ports = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | ForEach-Object {[pscustomobject]@{port=[int]$_.LocalPort; pid=[int]$_.OwningProcess}})
+[pscustomobject]@{processes=$processes; holders=$holders; ports=$ports; protected_service=$serviceRoot; read_errors=$errors} | ConvertTo-Json -Compress -Depth 8
+'''
+    command = command.replace("__PRODUCT_ROOT__", product_root)
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"release blocked: fresh resource census failed: {exc}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            "release blocked: fresh resource census failed: "
+            f"rc={result.returncode} stderr={result.stderr[-1000:]}"
+        )
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("release blocked: fresh resource census returned malformed JSON") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError("release blocked: fresh resource census returned a non-object")
+    return value
+
+
+def _configured_product_ports() -> set[int]:
+    """Return only historical and current CiteSpan service ports."""
+    ports = {3000, 8000}
+    for name in ("CITESPAN_FRONTEND_PORT", "CITESPAN_BACKEND_PORT"):
+        value = os.environ.get(name)
+        if value is not None:
+            try:
+                port = int(value)
+            except ValueError as exc:
+                raise RuntimeError(f"release blocked: configured product port is invalid: {name}") from exc
+            if not 1 <= port <= 65535:
+                raise RuntimeError(f"release blocked: configured product port is out of range: {name}")
+            ports.add(port)
+    return ports
+
+
+def _resource_process_is_relevant(
+    item: dict[str, Any],
+    product_root: str,
+    *,
+    identity: dict[str, Any] | None = None,
+) -> bool:
+    """Classify one process from one complete fresh identity and row."""
+    if not isinstance(item, dict):
+        raise RuntimeError(
+            "release blocked: fresh process relevance is unreadable: row is not an object"
+        )
+    pid = item.get("pid")
+    if type(pid) is int and pid in (0, 4):
+        return False
+    if not _is_positive_pid(pid):
+        raise RuntimeError(
+            "release blocked: fresh process relevance is unreadable: "
+            f"pid={pid!r} has an invalid non-system PID"
+        )
+    nested_identity = item.get("current_identity")
+    if nested_identity is not None:
+        if not isinstance(nested_identity, dict):
+            raise RuntimeError(
+                "release blocked: fresh process relevance is unreadable: "
+                f"pid={pid} current_identity is not an object"
+            )
+        if not _is_positive_pid(nested_identity.get("pid")) or nested_identity.get("pid") != pid:
+            raise RuntimeError(
+                "release blocked: fresh process relevance has conflicting PIDs: "
+                f"row_pid={pid} identity_pid={nested_identity.get('pid')!r}"
+            )
+        if identity is None:
+            identity = nested_identity
+    if not isinstance(identity, dict):
+        raise RuntimeError(
+            "release blocked: fresh process relevance is unreadable: "
+            f"pid={pid} current identity is missing"
+        )
+    required_identity_fields = (
+        "pid",
+        "creation",
+        "parent_pid",
+        "cwd",
+        "executable",
+        "native_command",
+        "argv",
+        "argv_sha256",
+        "native_command_sha256",
+        "parent_observations",
+        "module_paths",
+        "files",
+        "ports",
+    )
+    missing = [field for field in required_identity_fields if field not in identity]
+    if missing:
+        raise RuntimeError(
+            "release blocked: fresh process relevance is unreadable: "
+            f"pid={pid} identity fields={missing}"
+        )
+    if not _is_positive_pid(identity.get("pid")) or identity.get("pid") != pid or not identity.get("creation"):
+        raise RuntimeError(
+            "release blocked: fresh process relevance identity does not match the census row: "
+            f"pid={pid} identity_pid={identity.get('pid')!r}"
+        )
+    if not isinstance(identity["argv"], list) or not identity["argv"] or not all(
+        isinstance(value, str) and value for value in identity["argv"]
+    ):
+        raise RuntimeError(
+            "release blocked: fresh process relevance has an invalid parsed argv: "
+            f"pid={pid}"
+        )
+    if not isinstance(identity.get("native_command"), str) or not identity["native_command"]:
+        raise RuntimeError(
+            "release blocked: fresh process relevance has an invalid native command: "
+            f"pid={pid}"
+        )
+    if identity["argv_sha256"] != hashlib.sha256("\0".join(identity["argv"]).encode("utf-8")).hexdigest():
+        raise RuntimeError(
+            "release blocked: fresh process relevance parsed argv hash does not match: "
+            f"pid={pid}"
+        )
+    if identity["native_command_sha256"] != hashlib.sha256(identity["native_command"].encode("utf-8")).hexdigest():
+        raise RuntimeError(
+            "release blocked: fresh process relevance native command hash does not match: "
+            f"pid={pid}"
+        )
+    if not isinstance(identity["parent_observations"], list) or not identity["parent_observations"]:
+        raise RuntimeError(
+            "release blocked: fresh process relevance has incomplete ancestry evidence: "
+            f"pid={pid}"
+        )
+    for field in ("module_paths", "files", "ports"):
+        if not isinstance(identity[field], list):
+            raise RuntimeError(
+                "release blocked: fresh process relevance has invalid resource evidence: "
+                f"pid={pid} field={field}"
+            )
+    if not _is_parent_pid(identity.get("parent_pid")):
+        raise RuntimeError(
+            "release blocked: fresh process relevance has an invalid parent identity: "
+            f"pid={pid}"
+        )
+    identity_executable = Path(str(identity["executable"])).name.casefold()
+    identity_cwd = str(identity["cwd"])
+    identity_argv = [str(value) for value in identity["argv"]]
+    name = Path(str(item.get("name") or identity_executable)).name.casefold()
+    if item.get("protected_or_unrelated_state") in {"protected", "unrelated"}:
+        return False
+    if _identity_is_protected(identity, product_root):
+        return False
+    if name in {"system", "system idle process", "registry"}:
+        return False
+    frontend = _canonical_windows_path_identity(Path(product_root) / "frontend")
+    process_types = {
+        "node", "node.exe", "cmd", "cmd.exe", "npm", "npm.cmd", "npm-cli.js",
+        "next", "next.cmd", "postcss", "postcss.js", "python", "python.exe",
+    }
+    known_type = name in process_types or identity_executable in process_types
+    native_module = _host_path_identity((SCRIPT_ROOT / HOST_NATIVE_MODULE).resolve())
+    module_paths = [*item.get("module_paths", []), *identity["module_paths"]]
+    exact_native_module = any(
+        isinstance(path, str) and _host_path_identity(path) == native_module
+        for path in module_paths
+    )
+    if exact_native_module:
+        return True
+    frontend_roles = (
+        Path(product_root) / "frontend" / "server.js",
+        Path(product_root) / "frontend" / "node_modules" / ".bin" / "next.cmd",
+        Path(product_root) / "frontend" / "node_modules" / "next" / "dist" / "bin" / "next",
+    )
+    has_frontend_role = any(
+        _canonical_windows_path_identity(argument) == _canonical_windows_path_identity(role)
+        or _command_contains_path(argument, role)
+        for argument in identity_argv
+        for role in frontend_roles
+    )
+    has_frontend_cwd = _path_is_within(identity_cwd, frontend)
+    has_checked_wrapper_relation = any(
+        isinstance(observation, dict)
+        and observation.get("state") == "readable_current_parent"
+        and observation.get("relation") == "current parent of exact child identity"
+        and (
+            _path_is_within(observation.get("cwd", ""), frontend)
+            or any(
+                _command_contains_path(str(argument), role)
+                for argument in observation.get("argv", [])
+                for role in frontend_roles
+            )
+        )
+        for observation in identity["parent_observations"]
+    )
+    has_scoped_port = any(
+        isinstance(port, int) and port in _configured_product_ports()
+        for port in identity["ports"]
+    ) or any(
+        isinstance(port, dict)
+        and port.get("port") in _configured_product_ports()
+        for port in item.get("ports", [])
+    )
+    if known_type and not name.startswith("python") and (
+        (has_frontend_role and has_frontend_cwd) or has_checked_wrapper_relation or has_scoped_port
+    ):
+        return True
+    if known_type and name.startswith("python"):
+        if _path_is_within(identity_cwd, product_root) or any(
+            _path_is_within(argument, product_root) for argument in identity_argv[1:]
+        ):
+            raise RuntimeError(
+                "release blocked: unprotected product-root process remains: "
+                f"pid={pid} executable={identity['executable']!r} cwd={identity_cwd!r}"
+            )
+        return False
+    if known_type:
+        return False
+    if _path_is_within(identity_cwd, product_root) or _path_is_within(identity["executable"], product_root):
+        raise RuntimeError(
+            "release blocked: unprotected product-root process remains: "
+            f"pid={pid} executable={identity['executable']!r} cwd={identity_cwd!r}"
+        )
+    return False
+
+
+def _identity_is_protected(identity: dict[str, Any], product_root: str) -> bool:
+    """Recognize the current gate and observation process family from identity data."""
+    executable = Path(str(identity.get("executable") or "")).name.casefold()
+    command = str(identity.get("native_command") or "").casefold()
+    argv = " ".join(str(value) for value in identity.get("argv", [])).casefold()
+    cwd = identity.get("cwd")
+    if not cwd or not _path_is_within(cwd, product_root):
+        return False
+    if executable not in {"python", "python.exe", "cmd", "cmd.exe", "node", "node.exe"}:
+        return False
+    protected_markers = (
+        "pytest",
+        "runpy",
+        "scripts/release.py",
+        "scripts/verify_live.py",
+        "scripts/tests/",
+        "backend/tests/",
+        "controller",
+        "observation",
+        "acceptance",
+    )
+    if any(marker in command or marker in argv for marker in protected_markers):
+        return True
+    for observation in identity.get("parent_observations", []):
+        if isinstance(observation, dict) and any(
+            marker in str(observation.get(field) or "").casefold()
+            for field in ("native_command", "cwd", "executable")
+            for marker in protected_markers
+        ):
+            return True
+    return False
+
+
+def _fresh_process_row_needs_identity(
+    item: dict[str, Any],
+    *,
+    native_holder_pids: set[int],
+    scoped_port_owner_pids: set[int],
+    protected_pids: set[int],
+) -> tuple[bool, str]:
+    """Select rows for full identity reads from measured current evidence."""
+    pid = item.get("pid")
+    if type(pid) is int and pid in (0, 4):
+        return False, "Windows system sentinel"
+    if not _is_positive_pid(pid):
+        raise RuntimeError("release blocked: fresh process relevance has an invalid PID")
+    parent_pid = item.get("parent_pid")
+    if not _is_parent_pid(parent_pid):
+        raise RuntimeError(
+            "release blocked: fresh process relevance has an invalid or missing parent PID: "
+            f"pid={pid} parent_pid={parent_pid!r}"
+        )
+    if pid in native_holder_pids:
+        return True, "exact native-module holder"
+    if pid in scoped_port_owner_pids:
+        return True, "scoped listening-port owner"
+    if pid in protected_pids:
+        return False, "verified protected ancestry"
+    if item.get("protected_or_unrelated_state") in {"protected", "unrelated"}:
+        return False, "explicit row classification"
+    if item.get("parent_pid") in protected_pids:
+        return True, "protected ancestry"
+
+    name = Path(str(item.get("name") or "")).name.casefold()
+    executable = Path(str(item.get("executable") or "")).name.casefold()
+    supported_family = {
+        "node", "node.exe", "cmd", "cmd.exe", "npm", "npm.cmd", "npm-cli.js",
+        "next", "next.cmd", "postcss", "postcss.js",
+    }
+    if name not in supported_family and executable not in supported_family:
+        return False, "outside measured frontend process family"
+
+    return True, "measured frontend-family candidate"
+
+
+def _resource_port_records(value: list[Any]) -> list[tuple[int, int | None]]:
+    """Normalize scoped socket rows while preserving owner identity."""
+    normalized = []
+    for item in value:
+        if isinstance(item, bool):
+            raise RuntimeError("release blocked: fresh listening port measurement is invalid")
+        if isinstance(item, int):
+            if item <= 0:
+                raise RuntimeError("release blocked: fresh listening port measurement is invalid")
+            normalized.append((item, None))
+            continue
+        if not isinstance(item, dict) or type(item.get("port")) is not int or item["port"] <= 0:
+            raise RuntimeError("release blocked: fresh listening port ownership is unreadable")
+        owner = item.get("pid")
+        if type(owner) is not int or owner <= 0:
+            raise RuntimeError(
+                f"release blocked: fresh listening port owner is unreadable: port={item.get('port')}"
+            )
+        normalized.append((item["port"], owner))
+    return normalized
+
+
+def _read_current_protected_process_metadata(pid: int) -> dict[str, Any]:
+    """Read the current process row used to bind protected ancestry."""
+    if type(pid) is not int or pid <= 0:
+        raise RuntimeError(f"release blocked: protected service metadata received invalid PID: pid={pid!r}")
+    command = (
+        "$rows = @(Get-CimInstance Win32_Process -Filter 'ProcessId = "
+        f"{pid}'); if ($rows.Count -ne 1) {{ exit 3 }}; "
+        "$row = $rows[0]; [pscustomobject]@{"
+        "pid=[int]$row.ProcessId; parent_pid=[int]$row.ParentProcessId; "
+        "executable=[string]$row.ExecutablePath; command=[string]$row.CommandLine"
+        "} | ConvertTo-Json -Compress"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"protected service metadata read failed: pid={pid}: {exc}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            "protected service metadata read failed: "
+            f"pid={pid} rc={result.returncode} stderr={result.stderr[-1000:]}"
+        )
+    try:
+        metadata = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"protected service metadata is not valid JSON: pid={pid}") from exc
+    if not isinstance(metadata, dict):
+        raise RuntimeError(f"protected service metadata is not an object: pid={pid}")
+    required = ("pid", "parent_pid", "executable", "command")
+    missing = [field for field in required if field not in metadata]
+    if missing:
+        raise RuntimeError(f"protected service metadata is incomplete: pid={pid} fields={missing}")
+    if metadata["pid"] != pid or not _is_parent_pid(metadata["parent_pid"]):
+        raise RuntimeError(
+            "protected service metadata has invalid identity: "
+            f"pid={pid} returned_pid={metadata['pid']!r} parent_pid={metadata['parent_pid']!r}"
+        )
+    if not isinstance(metadata["executable"], str) or not metadata["executable"].strip():
+        raise RuntimeError(f"protected service metadata has no executable: pid={pid}")
+    if not isinstance(metadata["command"], str) or not metadata["command"].strip():
+        raise RuntimeError(f"protected service metadata has no command: pid={pid}")
+    return metadata
+
+
+def _read_current_protected_service_metadata() -> dict[str, Any]:
+    """Read the current protected service name and PID from the service manager."""
+    command = (
+        "$service = Get-CimInstance Win32_Service -Filter \"Name = 'JarvisBrowserService'\"; "
+        "if (-not $service) { exit 3 }; "
+        "[pscustomobject]@{name=[string]$service.Name; pid=[int]$service.ProcessId; "
+        "path_name=[string]$service.PathName} | ConvertTo-Json -Compress"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"protected service metadata read failed: {exc}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            "protected service metadata read failed: "
+            f"rc={result.returncode} stderr={result.stderr[-1000:]}"
+        )
+    try:
+        metadata = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("protected service metadata is not valid JSON") from exc
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("name") != "JarvisBrowserService"
+        or not _is_positive_pid(metadata.get("pid"))
+    ):
+        raise RuntimeError(f"protected service metadata is invalid: {metadata!r}")
+    return metadata
+
+
+def _protected_service_path_diagnostic(value: object) -> str:
+    """Return a bounded path identity for a protected-service error."""
+    if not isinstance(value, str) or not value.strip():
+        return "<missing>"
+    identity = _canonical_windows_path_identity(value)
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    return f"<redacted:{digest}>"
+
+
+def _bind_verified_protected_service(
+    resources: dict[str, Any],
+    process_rows_by_pid: dict[int, dict[str, Any]],
+    identities: dict[int, dict[str, Any]],
+) -> set[int]:
+    """Bind service protection to current identities and measured parent relations."""
+    service = resources.get("protected_service")
+    if service is None:
+        return set()
+    if not isinstance(service, dict) or service.get("name") != "JarvisBrowserService":
+        raise RuntimeError("release blocked: protected service evidence is invalid")
+    root_pid = service.get("pid")
+    if not _is_positive_pid(root_pid):
+        raise RuntimeError("release blocked: protected service evidence has an invalid root PID")
+    root_row = process_rows_by_pid.get(root_pid)
+    if root_row is None:
+        raise RuntimeError(
+            f"release blocked: protected service root is absent from the current process census: pid={root_pid}"
+        )
+
+    def bind(pid: int, label: str) -> dict[str, Any]:
+        row = process_rows_by_pid.get(pid)
+        if row is None:
+            raise RuntimeError(f"release blocked: protected service relation is missing: {label} pid={pid}")
+        service_metadata = None
+        try:
+            read_state = _NativeReadState(limited_only=True)
+            first = _read_fresh_native_process_identity(pid, read_state)
+            metadata = _read_current_protected_process_metadata(pid)
+            missing_metadata = [
+                field for field in ("pid", "parent_pid", "executable", "command")
+                if field not in metadata
+            ]
+            if missing_metadata:
+                raise RuntimeError(
+                    "release blocked: protected service metadata is incomplete: "
+                    f"step={label} pid={pid} fields={missing_metadata}"
+                )
+            if metadata["pid"] != pid or not _is_parent_pid(metadata["parent_pid"]):
+                raise RuntimeError(
+                    "release blocked: protected service metadata has invalid identity: "
+                    f"step={label} pid={pid} returned_pid={metadata.get('pid')!r} "
+                    f"parent_pid={metadata.get('parent_pid')!r}"
+                )
+            if label == "root":
+                service_metadata = _read_current_protected_service_metadata()
+                if service_metadata["pid"] != pid:
+                    raise RuntimeError(
+                        "release blocked: protected service root changed during binding: "
+                        f"expected_pid={pid} actual_pid={service_metadata['pid']}"
+                    )
+            second = _read_fresh_native_process_identity(pid, read_state)
+        except (_FreshProcessAbsent, _FreshProcessUnreadable, RuntimeError) as exc:
+            raise RuntimeError(
+                f"release blocked: protected service identity is unreadable: {label} pid={pid}: {exc}"
+            ) from exc
+        if not isinstance(first, dict) or not isinstance(second, dict):
+            raise RuntimeError(f"release blocked: protected service identity is unreadable: {label} pid={pid}")
+        if first.get("pid") != pid or second.get("pid") != pid:
+            raise RuntimeError(f"release blocked: protected service identity does not match: {label} pid={pid}")
+        if first.get("creation") != second.get("creation"):
+            raise RuntimeError(
+                f"release blocked: protected service identity changed during binding: {label} pid={pid}"
+            )
+        row_parent_pid = metadata["parent_pid"]
+        for read_number, identity in (("before", first), ("after", second)):
+            native_executable = identity.get("executable")
+            process_executable = metadata.get("executable")
+            if not isinstance(native_executable, str) or not native_executable.strip():
+                raise RuntimeError(
+                    "release blocked: protected service native executable is unreadable: "
+                    f"step={label} read={read_number} pid={pid} "
+                    f"native_executable={_protected_service_path_diagnostic(native_executable)} "
+                    f"process_executable={_protected_service_path_diagnostic(process_executable)} "
+                    f"service_path_name={_protected_service_path_diagnostic((service_metadata or {}).get('path_name'))}"
+                )
+            if not isinstance(process_executable, str) or not process_executable.strip():
+                raise RuntimeError(
+                    "release blocked: protected service process executable is unreadable: "
+                    f"step={label} read={read_number} pid={pid} "
+                    f"native_executable={_protected_service_path_diagnostic(native_executable)} "
+                    f"process_executable={_protected_service_path_diagnostic(process_executable)} "
+                    f"service_path_name={_protected_service_path_diagnostic((service_metadata or {}).get('path_name'))}"
+                )
+            if _canonical_windows_path_identity(native_executable) != _canonical_windows_path_identity(process_executable):
+                raise RuntimeError(
+                    "release blocked: protected service executable changed during binding: "
+                    f"step={label} read={read_number} pid={pid} "
+                    f"native_executable={_protected_service_path_diagnostic(native_executable)} "
+                    f"process_executable={_protected_service_path_diagnostic(process_executable)} "
+                    f"service_path_name={_protected_service_path_diagnostic((service_metadata or {}).get('path_name'))}"
+                )
+            identity_parent_pid = identity.get("parent_pid")
+            if not _is_parent_pid(identity_parent_pid):
+                raise RuntimeError(
+                    "release blocked: protected service identity has invalid parent evidence: "
+                    f"step={label} read={read_number} pid={pid} parent_pid={identity_parent_pid!r}"
+                )
+            if identity_parent_pid != row_parent_pid:
+                raise RuntimeError(
+                    "release blocked: protected service parent relation changed: "
+                    f"step={label} read={read_number} child_pid={pid} "
+                    f"expected_parent_pid={row_parent_pid} actual_parent_pid={identity_parent_pid!r}"
+                )
+            identity["command"] = metadata["command"]
+        current = first
+        if not isinstance(current, dict) or current.get("pid") != pid:
+            raise RuntimeError(f"release blocked: protected service identity does not match: {label} pid={pid}")
+        if not isinstance(current.get("creation"), str) or not current["creation"]:
+            raise RuntimeError(f"release blocked: protected service identity lacks creation token: pid={pid}")
+        executable = first["executable"]
+        command = metadata["command"]
+        bound = {
+            "pid": pid,
+            "creation": current["creation"],
+            "executable": executable,
+            "command": command,
+            "native_command": command,
+            "parent_pid": row_parent_pid,
+            "source_provenance": {
+                "reader": "native limited process handle plus current CIM process row",
+                "binding": label,
+                "native_executable": first["executable"],
+                "process_executable": metadata["executable"],
+                "service_path_name": (service_metadata or {}).get("path_name"),
+            },
+        }
+        identities[pid] = bound
+        return bound
+
+    root_identity = bind(root_pid, "root")
+    protected = {root_pid}
+    pending = [root_pid]
+    while pending:
+        parent_pid = pending.pop()
+        parent_identity = identities[parent_pid]
+        for pid, row in process_rows_by_pid.items():
+            if pid in protected or row.get("parent_pid") != parent_pid:
+                continue
+            child = bind(pid, "descendant")
+            if child.get("parent_pid") != parent_pid:
+                raise RuntimeError(
+                    "release blocked: protected service parent relation changed: "
+                    f"child_pid={pid} expected_parent_pid={parent_pid} actual_parent_pid={child.get('parent_pid')!r}"
+                )
+            if not child.get("creation") or not parent_identity.get("creation"):
+                raise RuntimeError(
+                    "release blocked: protected service parent creation identity is not bound: "
+                    f"child_pid={pid} parent_pid={parent_pid}"
+                )
+            child["parent_observations"] = [{
+                "pid": parent_pid,
+                "state": "readable_current_parent",
+                "creation": parent_identity["creation"],
+                "relation": "current CIM parent of exact protected service identity",
+            }]
+            identities[pid] = child
+            protected.add(pid)
+            pending.append(pid)
+    return protected
+
+
+def _fresh_resource_scope(
+    resources: dict[str, Any],
+    product_root: str,
+    *,
+    scoped_ports: set[int],
+    preloaded_identities: dict[int, dict[str, Any]] | None = None,
+    protected_pids: set[int] | None = None,
+) -> dict[str, Any]:
+    """Bind current resource rows to identities after one strict candidate pass."""
+    for field in ("processes", "holders", "ports", "read_errors"):
+        if not isinstance(resources.get(field), list):
+            raise RuntimeError(f"release blocked: fresh resource census is incomplete: field={field}")
+    if resources["read_errors"]:
+        raise RuntimeError(
+            f"release blocked: fresh resource census has read errors: {resources['read_errors']}"
+        )
+    if any(isinstance(port, bool) or type(port) is not int or port <= 0 for port in scoped_ports):
+        raise RuntimeError("release blocked: scoped listening ports are invalid")
+
+    process_rows_by_pid: dict[int, dict[str, Any]] = {}
+    all_process_pids: set[int] = set()
+    protected = set(protected_pids or ())
+    for item in resources["processes"]:
+        if not isinstance(item, dict):
+            raise RuntimeError("release blocked: fresh process census contains a non-object row")
+        pid = item.get("pid")
+        if type(pid) is int and pid in (0, 4):
+            continue
+        if not _is_positive_pid(pid):
+            raise RuntimeError(f"release blocked: fresh process relevance has an invalid PID: pid={pid!r}")
+        nested = item.get("current_identity")
+        if nested is not None and (
+            not isinstance(nested, dict)
+            or not _is_positive_pid(nested.get("pid"))
+            or nested.get("pid") != pid
+        ):
+            raise RuntimeError(
+                "release blocked: fresh process relevance has conflicting PIDs: "
+                f"row_pid={pid} identity_pid={nested.get('pid') if isinstance(nested, dict) else nested!r}"
+            )
+        process_rows_by_pid[pid] = item
+        all_process_pids.add(pid)
+        parent_pid = item.get("parent_pid")
+        if not _is_parent_pid(parent_pid):
+            raise RuntimeError(
+                f"release blocked: fresh process relevance has an invalid or missing parent PID: pid={pid} parent_pid={parent_pid!r}"
+            )
+
+    native_path = _host_path_identity((SCRIPT_ROOT / HOST_NATIVE_MODULE).resolve())
+    native_holder_pids = set()
+    for item in resources["holders"]:
+        if not isinstance(item, dict) or not _is_positive_pid(item.get("pid")):
+            raise RuntimeError("release blocked: fresh native holder identity is unreadable")
+        module_paths = item.get("module_paths")
+        if not isinstance(module_paths, list):
+            raise RuntimeError(
+                "release blocked: fresh resource census is unstable or unreadable; "
+                f"native holder modules are unreadable: pid={item.get('pid')}"
+            )
+        if any(isinstance(path, str) and _host_path_identity(path) == native_path for path in module_paths):
+            native_holder_pids.add(item["pid"])
+    port_records = _resource_port_records(resources["ports"])
+    scoped_port_owner_pids = {
+        owner for port, owner in port_records if port in scoped_ports and owner is not None
+    }
+    identities = dict(preloaded_identities or {})
+    try:
+        protected.update(
+            _bind_verified_protected_service(resources, process_rows_by_pid, identities)
+        )
+    except KeyError as exc:
+        field = exc.args[0] if exc.args else "<unknown>"
+        raise RuntimeError(
+            "release blocked: protected service binding failed: "
+            f"step=_bind_verified_protected_service field={field!r} "
+            f"pids={sorted(process_rows_by_pid)}"
+        ) from exc
+    candidate_pids = native_holder_pids | scoped_port_owner_pids
+    unrelated_exclusions = []
+    for item in resources["processes"]:
+        pid = item.get("pid")
+        if type(pid) is int and pid in (0, 4):
+            unrelated_exclusions.append({"pid": pid, "reason": "Windows system sentinel"})
+            continue
+        if not _is_positive_pid(pid):
+            raise RuntimeError(f"release blocked: fresh process relevance has an invalid PID: pid={pid!r}")
+        needs_identity, reason = _fresh_process_row_needs_identity(
+            item,
+            native_holder_pids=native_holder_pids,
+            scoped_port_owner_pids=scoped_port_owner_pids,
+            protected_pids=protected,
+        )
+        if not needs_identity:
+            unrelated_exclusions.append({"pid": pid, "reason": reason})
+            continue
+        candidate_pids.add(pid)
+
+    for pid in sorted(candidate_pids):
+        if pid not in process_rows_by_pid:
+            if pid in native_holder_pids:
+                raise RuntimeError(
+                    "release blocked: fresh resource census is unstable or unreadable; "
+                    "fresh native module holder identity is unreadable: "
+                    f"pid={pid}"
+                )
+            raise RuntimeError(
+                "release blocked: fresh resource census is unstable or unreadable; "
+                f"selected resource owner is absent from process census: pid={pid}"
+            )
+        if pid in identities and pid not in (native_holder_pids | scoped_port_owner_pids):
+            identity = identities[pid]
+        else:
+            try:
+                identity = process_rows_by_pid[pid].get("current_identity") or _read_fresh_native_process_identity(
+                    pid, _NativeReadState()
+                )
+            except (_FreshProcessAbsent, _FreshProcessUnreadable) as exc:
+                raise RuntimeError(
+                    "release blocked: fresh resource census is unstable or unreadable; "
+                    f"potentially relevant process identity failed: pid={pid}: {exc}"
+                ) from exc
+            identities[pid] = identity
+        if not isinstance(identity, dict) or identity.get("pid") != pid:
+            raise RuntimeError(
+                "release blocked: fresh process relevance has conflicting PIDs: "
+                f"row_pid={pid} identity_pid={identity.get('pid') if isinstance(identity, dict) else identity!r}"
+            )
+        if identity.get("parent_pid") != process_rows_by_pid[pid].get("parent_pid"):
+            raise RuntimeError(
+                "release blocked: fresh process relevance has conflicting parent PIDs: "
+                f"pid={pid} row_parent_pid={process_rows_by_pid[pid].get('parent_pid')!r} "
+                f"identity_parent_pid={identity.get('parent_pid')!r}"
+            )
+
+    relevant_processes = []
+    for pid, identity in identities.items():
+        item = process_rows_by_pid.get(pid)
+        if item is None:
+            continue
+        if pid in protected and pid not in (native_holder_pids | scoped_port_owner_pids):
+            protected.add(pid)
+            continue
+        if _resource_process_is_relevant(item, product_root, identity=identity):
+            relevant_processes.append({"row": item, "identity": identity})
+
+    holder_pids = set()
+    for item in resources["holders"]:
+        if not isinstance(item, dict) or not _is_positive_pid(item.get("pid")):
+            raise RuntimeError("release blocked: fresh native holder identity is unreadable")
+        pid = item["pid"]
+        if pid in native_holder_pids:
+            holder_pids.add(pid)
+
+    port_owner_identities = {
+        owner: identities[owner]
+        for port, owner in port_records
+        if port in scoped_ports and owner is not None and owner in identities
+    }
+    for port, owner in port_records:
+        if port in scoped_ports:
+            if owner is None or owner not in all_process_pids:
+                raise RuntimeError(
+                    "release blocked: fresh resource census is unstable or unreadable; "
+                    f"scoped listening port owner disappeared before identity binding: port={port} pid={owner}"
+                )
+            if owner not in port_owner_identities:
+                raise RuntimeError(
+                    "release blocked: fresh resource census is unstable or unreadable; "
+                    f"scoped listening port owner identity is missing: port={port} pid={owner}"
+                )
+
+    return {
+        "process_rows_by_pid": process_rows_by_pid,
+        "identities": identities,
+        "relevant_processes": relevant_processes,
+        "holder_pids": holder_pids,
+        "native_holder_pids": native_holder_pids,
+        "port_records": port_records,
+        "port_owner_identities": port_owner_identities,
+        "protected_pids": protected,
+        "unrelated_exclusions": unrelated_exclusions,
+        "all_process_pids": all_process_pids,
+    }
+
+
+def _assert_fresh_host_process_census(contract: dict[str, Any]) -> dict[str, Any]:
+    """Recheck every historical identity and current release resource before work."""
+    family_by_pid = {record["pid"]: record for record in contract["family_records"]}
+    presence = contract["presence"]
+    identities = {}
+    states = {}
+    replacements = {}
+    terminal_states = {}
+    transition_diagnostics = {}
+    for pid, family in family_by_pid.items():
+        saved_observation = presence[pid]
+        if saved_observation.get("expected_creation") != family["creation"]:
+            raise RuntimeError(
+                f"release blocked: saved presence expected_creation disagrees with normalized family: pid={pid}"
+            )
+        try:
+            current = _read_fresh_native_process_identity(
+                pid, _NativeReadState(expected_creation=family["creation"])
+            )
+        except _FreshProcessAbsent:
+            state = "absent"
+        except _FreshProcessUnreadable as exc:
+            raise RuntimeError(
+                f"release blocked: fresh native identity census failed: pid={pid} error={exc}"
+            ) from exc
+        else:
+            if current.get("state") == "exited":
+                state = "absent"
+                terminal_states[pid] = current
+                if current.get("creation") == family["creation"]:
+                    terminal_classification = "exited_exact_historical_object"
+                else:
+                    terminal_classification = "exited_replacement_object"
+                transition_diagnostics[pid] = {
+                    "saved_state": presence[pid]["state"],
+                    "fresh_state": state,
+                    "terminal_classification": terminal_classification,
+                    "terminal_creation": current.get("creation"),
+                    "historical_creation": family["creation"],
+                }
+            elif current["creation"] != family["creation"]:
+                state = "reused"
+                _validate_fresh_replacement_identity(current, family["creation"], pid)
+                replacements[pid] = current
+            else:
+                state = "live"
+                identities[pid] = current
+                _assert_exact_live_identity_matches_family(current, family, pid)
+        states[pid] = state
+        saved_state = presence[pid]["state"]
+        allowed_states = _FRESH_STATE_TRANSITIONS.get(saved_state)
+        if allowed_states is None or state not in allowed_states:
+            raise RuntimeError(
+                f"release blocked: invalid saved-to-fresh presence transition: pid={pid} "
+                f"saved={saved_state} fresh={state}"
+            )
+        if pid not in transition_diagnostics:
+            transition_diagnostics[pid] = {"saved_state": saved_state, "fresh_state": state}
+        if state == "live" and not contract.get("approval"):
+            raise RuntimeError(
+                f"release blocked: exact-live historical identity is unapproved: pid={pid}"
+            )
+    resources = _enumerate_fresh_frontend_resources()
+    if not isinstance(resources, dict):
+        raise RuntimeError("release blocked: fresh resource census returned an invalid object")
+    replacement_pids = set(replacements)
+    approved_live_pids = set(identities)
+    approved_live_ports = {
+        port
+        for pid in approved_live_pids
+        for port in family_by_pid[pid]["ports"]
+    }
+    product_root = _canonical_windows_path_identity(ROOT.resolve())
+    scoped_ports = _configured_product_ports() | {
+        port for family in family_by_pid.values() for port in family["ports"]
+    }
+    resource_scope = _fresh_resource_scope(
+        resources,
+        product_root,
+        scoped_ports=scoped_ports,
+        preloaded_identities={**replacements, **identities},
+    )
+    relevant_processes = [entry["row"] for entry in resource_scope["relevant_processes"]]
+    protected_pids = resource_scope["protected_pids"]
+    unrelated_exclusions = resource_scope["unrelated_exclusions"]
+    all_process_pids = resource_scope["all_process_pids"]
+    holder_pids = resource_scope["holder_pids"]
+    port_records = resource_scope["port_records"]
+    port_owner_identities = resource_scope["port_owner_identities"]
+    measured_holder_pids = {
+        item["pid"] for item in resources["holders"] if isinstance(item, dict) and _is_positive_pid(item.get("pid"))
+    }
+    measured_ports = {port for port, _owner in port_records if port in scoped_ports}
+    for pid, identity in identities.items():
+        family = family_by_pid[pid]
+        if pid not in all_process_pids:
+            raise RuntimeError(
+                f"release blocked: exact-live identity is absent from fresh resource census: pid={pid}"
+            )
+        if not set(family["ports"]).issubset(measured_ports):
+            raise RuntimeError(
+                f"release blocked: exact-live identity resource ports disagree: pid={pid}"
+            )
+        if (family["files"] or family["module_paths"]) and pid not in measured_holder_pids:
+            raise RuntimeError(
+                f"release blocked: exact-live native module resource is absent: pid={pid}"
+            )
+    selected_processes = [
+        item
+        for item in relevant_processes
+        if item["pid"] not in replacement_pids
+        and item["pid"] not in protected_pids
+        and item["pid"] not in approved_live_pids
+    ]
+    selected_holders = [
+        item for item in resources["holders"]
+        if isinstance(item, dict)
+        and item.get("pid") in holder_pids
+        and item.get("pid") not in replacement_pids
+        and item.get("pid") not in approved_live_pids
+    ]
+    selected_ports = [
+        {"port": port, "pid": owner}
+        for port, owner in port_records
+        if port in scoped_ports
+        and port not in approved_live_ports
+    ]
+    if selected_processes or selected_holders or selected_ports:
+        raise RuntimeError(
+            "release blocked: fresh relevant frontend process, native holder, or listening port remains; "
+            f"processes={selected_processes} holders={selected_holders} ports={selected_ports}"
+        )
+    return {
+        "states": states,
+        "identities": identities,
+        "replacements": replacements,
+        "replacement_pids": sorted(replacement_pids),
+        "terminal_states": terminal_states,
+        "transition_diagnostics": transition_diagnostics,
+        "resources": resources,
+        "port_owner_identities": port_owner_identities,
+        "unrelated_exclusions": unrelated_exclusions,
+    }
+
 def _validate_host_process_evidence() -> dict[str, Any]:
     """Validate measured host evidence without changing host state."""
     contract = _load_host_process_contract()
-    frontend = contract["frontend"]
-    if frontend["processes"] or frontend["holders"] or frontend["ports"]:
-        raise RuntimeError("release blocked: current relevant frontend processes, native holders, or ports remain")
-    native = _prove_host_native_release()
-    return {"root": str(contract["root"]), "historical_identities": len(contract["family_records"]), "native_resource": native["state"]}
+    fresh = _assert_fresh_host_process_census(contract)
+    native = _observe_host_native_resource()
+    return {
+        "root": str(contract["root"]),
+        "historical_identities": len(contract["family_records"]),
+        "native_resource": native["state"],
+        "native_fingerprint": native.get("fingerprint"),
+        "native_sha256": native.get("sha256"),
+        "fresh_census": fresh,
+    }
+
+
+def _proof_reference() -> dict[str, Any]:
+    return {
+        "type": "private host process evidence",
+        "files": list(HOST_PROCESS_EVIDENCE_FILES),
+    }
+
+
+def _value_count(value: object) -> int | None:
+    if isinstance(value, (list, tuple, dict)):
+        return len(value)
+    return None
+
+
+def _summarize_process_evidence(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RuntimeError("release blocked: host process evidence summary is invalid")
+    census = value.get("fresh_census")
+    if not isinstance(census, dict):
+        raise RuntimeError("release blocked: host process census summary is invalid")
+    resources = census.get("resources")
+    resource_summary = {}
+    if isinstance(resources, dict):
+        for name in ("processes", "holders", "ports", "read_errors"):
+            count = _value_count(resources.get(name))
+            if count is not None:
+                resource_summary[f"{name}_count"] = count
+    return {
+        "historical_identity_count": value.get("historical_identities"),
+        "native_resource": value.get("native_resource"),
+        "native_fingerprint": value.get("native_fingerprint"),
+        "native_sha256": value.get("native_sha256"),
+        "fresh_census": {
+            "state_count": _value_count(census.get("states")),
+            "identity_count": _value_count(census.get("identities")),
+            "replacement_count": _value_count(census.get("replacements")),
+            "terminal_state_count": _value_count(census.get("terminal_states")),
+            "transition_diagnostic_count": _value_count(census.get("transition_diagnostics")),
+            "port_owner_identity_count": _value_count(census.get("port_owner_identities")),
+            "resources": resource_summary,
+        },
+        "proof_reference": _proof_reference(),
+    }
+
+
+def _summarize_host_preparation(value: dict[str, Any]) -> dict[str, Any]:
+    readiness = value.get("readiness")
+    if not isinstance(readiness, dict):
+        raise RuntimeError("release blocked: browser readiness result is invalid")
+    dependency_findings = readiness.get("dependency_findings")
+    if not isinstance(dependency_findings, list):
+        raise RuntimeError("release blocked: browser dependency result is invalid")
+    return {
+        "process_before": _summarize_process_evidence(value["process_before"]),
+        "native_release": value["native_release"],
+        "dependencies": value["dependencies"],
+        "process_after": _summarize_process_evidence(value["process_after"]),
+        "readiness": {
+            "process": _summarize_process_evidence(readiness["process"]),
+            "dependency_findings": dependency_findings,
+        },
+        "proof_reference": _proof_reference(),
+    }
+
+
+_BROWSER_FRONTEND_REQUIRED_PACKAGES = ("next", "react", "react-dom", "@playwright/test")
+
+
+def _browser_dependency_findings(frontend_root: Path | None = None) -> list[str]:
+    """Check the existing project dependency state without installing packages."""
+    frontend_root = (ROOT / "frontend") if frontend_root is None else Path(frontend_root)
+    package_path = frontend_root / "package.json"
+    lock_path = frontend_root / "package-lock.json"
+    if not package_path.is_file() or not lock_path.is_file():
+        return [
+            "frontend/package.json and frontend/package-lock.json are required "
+            f"for browser startup: package={package_path} lock={lock_path}"
+        ]
+    try:
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return [
+            "frontend dependency contract cannot be read before browser startup: "
+            f"package={package_path} lock={lock_path} error={exc}"
+        ]
+    if not isinstance(package, dict) or not isinstance(lock, dict):
+        return ["frontend dependency contract must contain JSON objects"]
+    lock_packages = lock.get("packages")
+    if not isinstance(lock_packages, dict):
+        return ["frontend/package-lock.json has no valid packages map"]
+    findings = []
+    declared = {
+        **(package.get("dependencies") or {}),
+        **(package.get("devDependencies") or {}),
+    }
+    lock_root = lock_packages.get("")
+    if not isinstance(lock_root, dict):
+        findings.append("frontend/package-lock.json has no valid root package entry")
+        lock_root = {}
+    for name in _BROWSER_FRONTEND_REQUIRED_PACKAGES:
+        declaration = declared.get(name)
+        lock_declaration = (
+            (lock_root.get("dependencies") or {}).get(name)
+            or (lock_root.get("devDependencies") or {}).get(name)
+        )
+        lock_entry = lock_packages.get(f"node_modules/{name}")
+        installed_path = frontend_root / "node_modules" / Path(name) / "package.json"
+        if declaration is None:
+            findings.append(f"{name} is not declared in frontend/package.json")
+        if lock_declaration != declaration:
+            findings.append(
+                f"{name} package declaration differs between package.json and package-lock.json: "
+                f"package={declaration!r} lock={lock_declaration!r}"
+            )
+        if not isinstance(lock_entry, dict) or not lock_entry.get("version"):
+            findings.append(f"{name} has no locked package entry")
+            continue
+        if not installed_path.is_file():
+            findings.append(f"{name} installed package metadata is missing: {installed_path}")
+            continue
+        try:
+            installed = json.loads(installed_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            findings.append(f"{name} installed package metadata is unreadable: {installed_path}: {exc}")
+            continue
+        if installed.get("version") != lock_entry["version"]:
+            findings.append(
+                f"{name} installed version does not match package-lock.json: "
+                f"installed={installed.get('version')!r} locked={lock_entry['version']!r}"
+            )
+    next_executable = frontend_root / "node_modules" / ".bin" / (
+        "next.cmd" if os.name == "nt" else "next"
+    )
+    if not next_executable.is_file():
+        findings.append(f"project-scoped Next executable is missing: {next_executable}")
+    return findings
+
+
+def _validate_browser_dependency_readiness(
+    frontend_root: Path | None = None,
+    *,
+    process: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate process ownership and installed browser dependencies without mutation."""
+    if process is None:
+        process = _validate_host_process_evidence()
+    findings = _browser_dependency_findings(frontend_root)
+    if findings:
+        raise RuntimeError(
+            "release blocked: browser dependency readiness failed before browser startup: "
+            f"findings={findings}"
+        )
+    return {"process": process, "dependency_findings": findings}
 
 
 def _validate_immutable_source_commits(
@@ -1801,14 +4065,32 @@ def _live_verifier_is_usable() -> bool:
         "path=Path(p.chromium.executable_path); "
         "assert path.is_file(), path; p.stop()"
     )
-    result = subprocess.run(
-        [_project_python(), "-c", probe],
-        cwd=ROOT,
-        env=_playwright_environment(),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    command = [_project_python(), "-c", probe]
+    started_at = _monotonic_now()
+    try:
+        result = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=_playwright_environment(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=PLAYWRIGHT_PROVISION_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        evidence_path = _record_private_subprocess_timeout(
+            step="playwright usability probe",
+            argv_category="project Python Playwright probe",
+            command=command,
+            timeout=exc,
+            timeout_seconds=PLAYWRIGHT_PROVISION_TIMEOUT_SECONDS,
+            elapsed_seconds=_measured_elapsed_seconds(started_at),
+        )
+        raise RuntimeError(
+            "release blocked: Playwright usability probe timed out; "
+            f"private evidence: {evidence_path}"
+        ) from exc
     return result.returncode == 0
 
 
@@ -1835,6 +4117,137 @@ def _record_private_provisioning_failure(
             },
             sort_keys=True,
         ),
+        encoding="utf-8",
+    )
+    return evidence_path
+
+
+def _bounded_subprocess_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    safe = _sanitize_failure_text(str(value))
+    if len(safe) > SUBPROCESS_DIAGNOSTIC_LIMIT:
+        return safe[:SUBPROCESS_DIAGNOSTIC_LIMIT] + "<TRUNCATED>"
+    return safe
+
+
+_SENSITIVE_ARGUMENT_NAMES = {
+    "--api-key",
+    "--password",
+    "--secret",
+    "--token",
+    "--authorization",
+    "--header",
+}
+
+
+def _redacted_subprocess_argv(command: list[str]) -> list[str]:
+    redacted: list[str] = []
+    redact_next = False
+    for argument in command:
+        value = str(argument)
+        if redact_next:
+            redacted.append("<REDACTED>")
+            redact_next = False
+            continue
+        if value.casefold() in _SENSITIVE_ARGUMENT_NAMES or any(
+            value.casefold().startswith(f"{name}=") for name in _SENSITIVE_ARGUMENT_NAMES
+        ):
+            if "=" in value:
+                redacted.append(value.split("=", 1)[0] + "=<REDACTED>")
+            else:
+                redacted.append(value)
+                redact_next = True
+            continue
+        redacted.append(_sanitize_failure_text(value))
+    return redacted
+
+
+def _monotonic_now() -> float | None:
+    try:
+        return time.monotonic()
+    except (OSError, RuntimeError):
+        return None
+
+
+def _measured_elapsed_seconds(started_at: float | None) -> float | None:
+    if started_at is None:
+        return None
+    finished_at = _monotonic_now()
+    if finished_at is None or finished_at < started_at:
+        return None
+    return finished_at - started_at
+
+
+def _timeout_cleanup_evidence(
+    descendant_census: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if descendant_census is None:
+        return {
+            "status": "failed closed because descendant ownership census is unverified",
+            "descendant_state": "unverified",
+        }
+    if not isinstance(descendant_census, dict):
+        raise TypeError("descendant census must be a JSON object")
+    census_status = descendant_census.get("status")
+    if census_status == "read_failed":
+        read_failure = descendant_census.get("read_failure")
+        if not isinstance(read_failure, str) or not read_failure:
+            raise ValueError("failed descendant census must include read_failure")
+        return {
+            "status": "failed closed because descendant ownership census read failed",
+            "descendant_state": "unreadable",
+            "read_failure": _bounded_subprocess_text(read_failure),
+        }
+    if census_status == "measured":
+        descendant_state = descendant_census.get("descendant_state")
+        if not isinstance(descendant_state, str) or not descendant_state:
+            raise ValueError("measured descendant census must include descendant_state")
+        return {
+            "status": "failed closed pending measured descendant ownership handling",
+            "descendant_state": descendant_state,
+        }
+    raise ValueError("descendant census status must be measured or read_failed")
+
+
+def _record_private_subprocess_timeout(
+    *,
+    step: str,
+    argv_category: str,
+    command: list[str],
+    timeout: subprocess.TimeoutExpired,
+    timeout_seconds: int,
+    elapsed_seconds: float | None = None,
+    descendant_census: dict[str, Any] | None = None,
+    cleanup_failure: str | None = None,
+) -> Path:
+    """Store bounded timeout evidence without writing diagnostics to hook stdout."""
+    EXTERNAL_PROOF_ROOT.mkdir(parents=True, exist_ok=True)
+    evidence_dir = Path(tempfile.mkdtemp(prefix="subprocess-timeout-", dir=EXTERNAL_PROOF_ROOT))
+    evidence_path = evidence_dir / "timeout.json"
+    traceback_text = _sanitize_failure_text(traceback.format_exc())
+    evidence = {
+        "step": step,
+        "argv_category": argv_category,
+        "cwd": ROOT.as_posix(),
+        "timeout_seconds": timeout_seconds,
+        "command": _redacted_subprocess_argv(command),
+        "argument_count": len(command),
+        "exception_type": type(timeout).__name__,
+        "exception_message": _bounded_subprocess_text(str(timeout)),
+        "traceback": _bounded_subprocess_text(traceback_text),
+        "stdout": _bounded_subprocess_text(timeout.stdout),
+        "stderr": _bounded_subprocess_text(timeout.stderr),
+        "cleanup": _timeout_cleanup_evidence(descendant_census),
+    }
+    if cleanup_failure:
+        evidence["cleanup_failure"] = _bounded_subprocess_text(cleanup_failure)
+    if elapsed_seconds is not None:
+        evidence["elapsed_seconds"] = elapsed_seconds
+    evidence_path.write_text(
+        json.dumps(evidence, sort_keys=True),
         encoding="utf-8",
     )
     return evidence_path
@@ -1929,6 +4342,44 @@ def _sanitize_failure_text(value: str) -> str:
     return value
 
 
+_PUBLIC_REDACTED_KEYS = {
+    "argv",
+    "command",
+    "cmdline",
+    "environment",
+    "env",
+    "processes",
+    "identities",
+    "holders",
+    "ports",
+    "read_errors",
+    "replacements",
+    "transition_diagnostics",
+    "port_owner_identities",
+}
+_PUBLIC_SECRET_KEY = re.compile(
+    r"(?:api[_-]?key|authorization|credential|password|secret|token)", re.IGNORECASE
+)
+
+
+def _sanitize_public_success(value: object, *, key: str | None = None) -> object:
+    """Keep provider success JSON bounded and free of private process evidence."""
+    if key is not None and (
+        key.casefold() in _PUBLIC_REDACTED_KEYS or _PUBLIC_SECRET_KEY.search(key)
+    ):
+        return "<REDACTED>"
+    if isinstance(value, dict):
+        return {
+            str(item_key): _sanitize_public_success(item_value, key=str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_public_success(item) for item in value]
+    if isinstance(value, str):
+        return _sanitize_failure_text(value)
+    return value
+
+
 def _provision_live_verifier() -> None:
     """Install the verified Python Playwright wheel and its Chromium binary."""
     _validate_python_playwright_contract()
@@ -1951,14 +4402,31 @@ def _provision_live_verifier() -> None:
         [python, "-m", "playwright", "install", "chromium"],
     ]
     for command in commands:
-        result = subprocess.run(
-            command,
-            cwd=ROOT,
-            env=_playwright_environment(),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        started_at = _monotonic_now()
+        try:
+            result = subprocess.run(
+                command,
+                cwd=ROOT,
+                env=_playwright_environment(),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=PLAYWRIGHT_PROVISION_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            evidence_path = _record_private_subprocess_timeout(
+                step="Playwright provisioning",
+                argv_category="project Python Playwright installer",
+                command=command,
+                timeout=exc,
+                timeout_seconds=PLAYWRIGHT_PROVISION_TIMEOUT_SECONDS,
+                elapsed_seconds=_measured_elapsed_seconds(started_at),
+            )
+            raise RuntimeError(
+                "release blocked: live verifier provisioning timed out; "
+                f"private evidence: {evidence_path}"
+            ) from exc
         if type(result.returncode) is not int or result.returncode != 0:
             evidence_path = _record_private_provisioning_failure(command, result)
             raise RuntimeError(
@@ -1967,6 +4435,597 @@ def _provision_live_verifier() -> None:
             )
     if not _live_verifier_is_usable():
         raise RuntimeError("release blocked: pinned Playwright package or Chromium browser is unusable")
+
+
+def _file_identity(path: Path) -> dict[str, Any]:
+    """Capture the immutable identity required for one launch contract."""
+    try:
+        metadata = path.stat()
+    except OSError as exc:
+        raise RuntimeError(f"release blocked: installer identity cannot be read: {path}") from exc
+    if not path.is_file() or path.is_symlink():
+        raise RuntimeError(f"release blocked: installer identity is not a regular file: {path}")
+    return {
+        "path": _canonical_windows_path_identity(path),
+        "size": metadata.st_size,
+        "mtime_ns": metadata.st_mtime_ns,
+        "ctime_ns": metadata.st_ctime_ns,
+    }
+
+
+def _host_installer_contract(frontend_root: Path) -> dict[str, Any]:
+    """Resolve the installed Node runtime and npm CLI without a command wrapper."""
+    node = shutil.which("node.exe") or shutil.which("node")
+    if not node:
+        raise RuntimeError("release blocked: installed node.exe is required for locked frontend dependency preparation")
+    node_path = Path(node).resolve()
+    npm_cli = node_path.parent / "node_modules" / "npm" / "bin" / "npm-cli.js"
+    if not npm_cli.is_file():
+        raise RuntimeError(f"release blocked: installed npm-cli.js is missing beside node.exe: {npm_cli}")
+    marker = f"citespan-host-install-{uuid.uuid4()}"
+    return {
+        "marker": marker,
+        "node": _file_identity(node_path),
+        "npm_cli": _file_identity(npm_cli.resolve()),
+        "frontend": _canonical_windows_path_identity(frontend_root.resolve()),
+        "argv": [
+            str(node_path),
+            str(npm_cli.resolve()),
+            "--prefix",
+            str(frontend_root.resolve()),
+            "ci",
+            "--ignore-scripts",
+        ],
+    }
+
+
+def _assert_installer_contract(contract: dict[str, Any]) -> None:
+    argv = contract.get("argv")
+    if not isinstance(argv, list) or len(argv) != 6:
+        raise RuntimeError("release blocked: host installer launch contract is incomplete")
+    node = Path(argv[0])
+    npm_cli = Path(argv[1])
+    if node.name.casefold() != "node.exe" or npm_cli.name.casefold() != "npm-cli.js":
+        raise RuntimeError("release blocked: host preparation rejects npm.cmd and cmd.exe wrappers")
+    if any(Path(value).name.casefold() in {"npm.cmd", "cmd.exe", "cmd"} for value in argv):
+        raise RuntimeError("release blocked: host preparation rejects npm.cmd and cmd.exe wrappers")
+    if argv[2:] != ["--prefix", argv[3], "ci", "--ignore-scripts"]:
+        raise RuntimeError("release blocked: host installer argv is not the reviewed npm ci contract")
+    if not isinstance(contract.get("marker"), str) or not contract["marker"].startswith("citespan-host-install-"):
+        raise RuntimeError("release blocked: host installer ownership marker is missing")
+    if _file_identity(node) != contract.get("node") or _file_identity(npm_cli) != contract.get("npm_cli"):
+        raise RuntimeError("release blocked: installed node/npm identities changed before launch")
+
+
+def _wait_for_host_installer(
+    contract: dict[str, Any], *, frontend_root: Path, timeout: int
+) -> subprocess.CompletedProcess[str]:
+    """Wait for the exact direct installer and retain its primary output."""
+    _assert_installer_contract(contract)
+    lock_name = hashlib.sha256(
+        _canonical_windows_path_identity(frontend_root).encode("utf-8")
+    ).hexdigest()
+    lock_path = Path(tempfile.gettempdir()) / f"citespan-frontend-install-{lock_name}.lock"
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise RuntimeError(
+            "release blocked: another owned frontend installer is active or its lock is stale: "
+            f"frontend={_canonical_windows_path_identity(frontend_root)}"
+        ) from exc
+    try:
+        with os.fdopen(lock_fd, "w", encoding="utf-8") as lock_file:
+            lock_file.write(contract["marker"])
+        return _wait_for_host_installer_locked(contract, frontend_root=frontend_root, timeout=timeout)
+    finally:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _host_installer_descendants(root_pid: int) -> list[int]:
+    """Read the current process census and return all descendants of the installer."""
+    resources = _enumerate_fresh_frontend_resources()
+    rows = resources.get("processes") if isinstance(resources, dict) else None
+    if not isinstance(rows, list):
+        raise RuntimeError("release blocked: installer descendant census is incomplete")
+    children: dict[int, list[int]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("release blocked: installer descendant census contains an invalid row")
+        pid = row.get("pid")
+        parent_pid = row.get("parent_pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid < 0:
+            raise RuntimeError("release blocked: installer descendant census has an invalid PID")
+        if pid == 0:
+            continue
+        if isinstance(parent_pid, bool) or not isinstance(parent_pid, int) or parent_pid <= 0:
+            raise RuntimeError(f"release blocked: installer descendant census has an invalid parent: pid={pid}")
+        children.setdefault(parent_pid, []).append(pid)
+    pending = list(children.get(root_pid, []))
+    descendants: list[int] = []
+    while pending:
+        pid = pending.pop()
+        if pid in descendants:
+            continue
+        descendants.append(pid)
+        pending.extend(children.get(pid, []))
+    return sorted(descendants)
+
+
+def _host_installer_descendant_records(
+    root_pid: int, contract: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Capture exact descendant identities in leaf-first order."""
+    resources = _enumerate_fresh_frontend_resources()
+    rows = resources.get("processes") if isinstance(resources, dict) else None
+    read_errors = resources.get("read_errors") if isinstance(resources, dict) else None
+    if not isinstance(rows, list) or not isinstance(read_errors, list):
+        raise RuntimeError("release blocked: installer descendant census is incomplete")
+    if read_errors:
+        raise RuntimeError(f"release blocked: installer descendant census is unreadable: {read_errors}")
+    children: dict[int, list[int]] = {}
+    row_by_pid: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("release blocked: installer descendant census contains an invalid row")
+        pid = row.get("pid")
+        parent_pid = row.get("parent_pid")
+        if not _is_positive_pid(pid):
+            continue
+        if not _is_positive_pid(parent_pid):
+            raise RuntimeError(f"release blocked: installer descendant census has an invalid parent: pid={pid}")
+        row_by_pid[pid] = row
+        children.setdefault(parent_pid, []).append(pid)
+
+    ordered: list[int] = []
+    active: set[int] = set()
+
+    def visit(pid: int) -> None:
+        if pid in active:
+            raise RuntimeError(f"release blocked: installer descendant census contains a cycle: pid={pid}")
+        active.add(pid)
+        for child in children.get(pid, []):
+            visit(child)
+        active.remove(pid)
+        if pid != root_pid:
+            ordered.append(pid)
+
+    visit(root_pid)
+    records = []
+    for pid in ordered:
+        identity = _read_fresh_native_process_identity(pid, _NativeReadState())
+        if identity.get("pid") != pid or not identity.get("creation"):
+            raise RuntimeError(f"release blocked: installer descendant identity is incomplete: pid={pid}")
+        row = row_by_pid[pid]
+        command = str(identity.get("native_command") or row.get("command") or "")
+        if not command or not _host_installer_command_matches_contract(command, contract):
+            raise RuntimeError(
+                "release blocked: installer descendant is not bound to the exact launch contract: "
+                f"pid={pid}"
+            )
+        records.append(identity)
+    return records
+
+
+def _host_installer_command_matches_contract(command: str, contract: dict[str, Any]) -> bool:
+    normalized = command.replace("\\", "/").casefold()
+    return all(
+        _host_path_identity(str(part)) in normalized
+        for part in (contract["argv"][1], contract["argv"][3])
+    ) and "ci" in normalized and "ignore-scripts" in normalized
+
+
+def _terminate_host_installer_process(identity: dict[str, Any]) -> None:
+    """Terminate one already validated Windows process identity."""
+    if os.name != "nt":
+        raise RuntimeError("release blocked: native installer cleanup requires Windows")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.TerminateProcess.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.OpenProcess(0x0001 | 0x1000 | 0x00100000, 0, identity["pid"])
+    if not handle:
+        error = ctypes.get_last_error()
+        if error in (6, 87, 1168):
+            raise _FreshProcessAbsent(f"pid={identity['pid']} is absent before stop")
+        raise _FreshProcessUnreadable(f"pid={identity['pid']} stop handle open failed: WinError {error}")
+    try:
+        if not kernel32.TerminateProcess(handle, 1):
+            raise RuntimeError(
+                f"release blocked: installer process stop failed: pid={identity['pid']} "
+                f"WinError {ctypes.get_last_error()}"
+            )
+    finally:
+        if not kernel32.CloseHandle(handle):
+            raise _FreshProcessUnreadable(
+                f"pid={identity['pid']} stop handle close failed: WinError {ctypes.get_last_error()}"
+            )
+
+
+def _verify_host_installer_cleanup(
+    identities: list[dict[str, Any]], *, frontend_root: Path
+) -> dict[str, Any]:
+    """Prove exact installer identities and owned resources are released."""
+    states = {}
+    for identity in identities:
+        pid = identity["pid"]
+        try:
+            current = _read_fresh_native_process_identity(pid, _NativeReadState())
+        except _FreshProcessAbsent:
+            states[str(pid)] = "absent"
+            continue
+        except _FreshProcessUnreadable as exc:
+            raise RuntimeError(f"release blocked: installer cleanup identity is unreadable: pid={pid}") from exc
+        if current.get("creation") == identity["creation"]:
+            raise RuntimeError(f"release blocked: exact installer identity remained live: pid={pid}")
+        _validate_fresh_replacement_identity(current, identity["creation"], pid)
+        states[str(pid)] = "reused"
+    resources = _enumerate_fresh_frontend_resources()
+    if resources.get("read_errors"):
+        raise RuntimeError(f"release blocked: installer cleanup resource census is unreadable: {resources['read_errors']}")
+    owned_pids = {identity["pid"] for identity in identities}
+    for row in resources.get("processes", []):
+        if isinstance(row, dict) and row.get("pid") in owned_pids:
+            raise RuntimeError(f"release blocked: owned installer process remains in resource census: pid={row['pid']}")
+    native_path = _host_path_identity((SCRIPT_ROOT / HOST_NATIVE_MODULE).resolve())
+    for row in resources.get("holders", []):
+        if not isinstance(row, dict) or row.get("pid") not in owned_pids:
+            continue
+        if any(_host_path_identity(str(path)) == native_path for path in row.get("module_paths", [])):
+            raise RuntimeError(f"release blocked: owned installer native holder remains: pid={row['pid']}")
+    scoped_ports = _configured_product_ports()
+    for port, owner in _resource_port_records(resources.get("ports", [])):
+        if port in scoped_ports and owner in owned_pids:
+            raise RuntimeError(f"release blocked: owned installer listening port remains: port={port} pid={owner}")
+    return {"identities": states, "resources": "released", "frontend": str(frontend_root.resolve())}
+
+
+def _cleanup_host_installer_resources(
+    process: Any,
+    contract: dict[str, Any],
+    *,
+    frontend_root: Path,
+    initial_root_identity: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], str, str]:
+    """Drain exact installer identities and owned resources before the deadline."""
+    started_at = _monotonic_now()
+    if started_at is None:
+        raise RuntimeError("release blocked: installer cleanup clock is unavailable")
+    deadline = started_at + HOST_INSTALLER_CLEANUP_TIMEOUT_SECONDS
+    phase_times: dict[str, float] = {}
+    identities: dict[tuple[int, str], dict[str, Any]] = {}
+    terminal: dict[int, str] = {}
+    stopped_pids: set[int] = set()
+    initially_validated_pids: set[int] = set()
+
+    def elapsed() -> float:
+        now = _monotonic_now()
+        if now is None:
+            raise RuntimeError("release blocked: installer cleanup clock became unavailable")
+        return now - started_at
+
+    def require_budget() -> None:
+        if elapsed() > HOST_INSTALLER_CLEANUP_TIMEOUT_SECONDS:
+            raise RuntimeError(
+                "installer timeout cleanup exceeded its bounded cleanup budget: "
+                f"seconds={HOST_INSTALLER_CLEANUP_TIMEOUT_SECONDS} phase_times={phase_times}"
+            )
+
+    def measure_census() -> list[dict[str, Any]]:
+        census_started = _monotonic_now()
+        try:
+            records = _host_installer_descendant_records(process.pid, contract)
+        finally:
+            measured = _measured_elapsed_seconds(census_started)
+            if measured is not None:
+                phase_times["census"] = phase_times.get("census", 0.0) + measured
+        return records
+
+    def bind(record: dict[str, Any]) -> None:
+        pid = record.get("pid")
+        creation = record.get("creation")
+        if not _is_positive_pid(pid) or not isinstance(creation, str) or not creation:
+            raise RuntimeError(f"release blocked: installer cleanup identity is incomplete: {record}")
+        key = (pid, creation)
+        for existing_pid, existing_creation in identities:
+            if existing_pid == pid and existing_creation != creation:
+                _validate_fresh_replacement_identity(
+                    {"pid": pid, "creation": creation, "executable": record.get("executable"), "source_provenance": record.get("source_provenance")},
+                    existing_creation,
+                    pid,
+                )
+                terminal[pid] = "reused"
+                return
+        identities.setdefault(key, record)
+
+    if initial_root_identity is not None:
+        bind(initial_root_identity)
+        initially_validated_pids.add(initial_root_identity["pid"])
+
+    while True:
+        require_budget()
+        for record in measure_census():
+            bind(record)
+
+        live: list[dict[str, Any]] = []
+        for identity in list(identities.values()):
+            pid = identity["pid"]
+            if pid in terminal:
+                continue
+            try:
+                if pid in initially_validated_pids:
+                    current = identity
+                    initially_validated_pids.remove(pid)
+                else:
+                    current = _read_fresh_native_process_identity(pid, _NativeReadState())
+            except _FreshProcessAbsent:
+                terminal[pid] = "absent"
+                continue
+            except _FreshProcessUnreadable as exc:
+                raise RuntimeError(
+                    f"release blocked: installer cleanup identity is unreadable: pid={pid}"
+                ) from exc
+            if current.get("creation") != identity["creation"]:
+                _validate_fresh_replacement_identity(current, identity["creation"], pid)
+                terminal[pid] = "reused"
+                continue
+            live.append(identity)
+
+        for identity in sorted(live, key=lambda item: item["pid"], reverse=True):
+            if identity["pid"] in stopped_pids:
+                continue
+            require_budget()
+            stop_started = _monotonic_now()
+            _terminate_host_installer_process(identity)
+            stopped_pids.add(identity["pid"])
+            stopped = _measured_elapsed_seconds(stop_started)
+            if stopped is not None:
+                phase_times["stop"] = phase_times.get("stop", 0.0) + stopped
+
+        if live:
+            continue
+
+        proof_started = _monotonic_now()
+        proof = _verify_host_installer_cleanup(list(identities.values()), frontend_root=frontend_root)
+        proved = _measured_elapsed_seconds(proof_started)
+        if proved is not None:
+            phase_times["final_proof"] = phase_times.get("final_proof", 0.0) + proved
+        drain_started = _monotonic_now()
+        stdout = ""
+        stderr = ""
+        while True:
+            require_budget()
+            try:
+                stdout, stderr = process.communicate(timeout=0)
+                break
+            except subprocess.TimeoutExpired as exc:
+                stdout = getattr(exc, "stdout", None) or getattr(exc, "output", None) or stdout
+                stderr = getattr(exc, "stderr", None) or stderr
+                time.sleep(0.01)
+        drained = _measured_elapsed_seconds(drain_started)
+        if drained is not None:
+            phase_times["pipe_drain"] = phase_times.get("pipe_drain", 0.0) + drained
+        return {"status": "measured", "descendant_state": "owned-identities-drained", "phase_times": phase_times, "proof": proof}, _bounded_subprocess_text(stdout), _bounded_subprocess_text(stderr)
+
+
+def _format_installer_cleanup_failure(step: str, exc: BaseException) -> str:
+    """Keep one installer cleanup failure with its step and traceback."""
+    return (
+        f"{type(exc).__name__}: {exc}\n"
+        f"step={step}\n"
+        f"traceback:\n{traceback.format_exc()}"
+    )
+
+
+def _wait_for_host_installer_locked(
+    contract: dict[str, Any], *, frontend_root: Path, timeout: int
+) -> subprocess.CompletedProcess[str]:
+    """Run one installer while its frontend ownership lock is held."""
+    environment = os.environ.copy()
+    environment["CITESPAN_HOST_INSTALL_OWNER"] = contract["marker"]
+    environment["CITESPAN_HOST_INSTALL_FRONTEND"] = str(frontend_root.resolve())
+    process = None
+    try:
+        process = subprocess.Popen(
+            contract["argv"],
+            cwd=ROOT,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=False,
+        )
+        stdout, stderr = process.communicate(timeout=timeout)
+        if not _is_positive_pid(getattr(process, "pid", None)):
+            raise RuntimeError("release blocked: direct frontend installer PID is unavailable")
+        descendants = _host_installer_descendants(process.pid)
+        if descendants:
+            census, _, _ = _cleanup_host_installer_resources(
+                process, contract, frontend_root=frontend_root
+            )
+            raise RuntimeError(
+                "release blocked: direct frontend installer returned while owned descendants remained; "
+                f"pids={descendants} cleanup={census} stdout={_sanitize_failure_text(stdout[-SUBPROCESS_DIAGNOSTIC_LIMIT:])} "
+                f"stderr={_sanitize_failure_text(stderr[-SUBPROCESS_DIAGNOSTIC_LIMIT:])}"
+            )
+    except subprocess.TimeoutExpired as exc:
+        primary_stdout = _bounded_subprocess_text(getattr(exc, "stdout", None) or getattr(exc, "output", None))
+        primary_stderr = _bounded_subprocess_text(getattr(exc, "stderr", None))
+        cleanup_failure = None
+        descendant_census = None
+        try:
+            if process is None or not _is_positive_pid(getattr(process, "pid", None)):
+                raise RuntimeError("installer root PID is unavailable")
+            root_identity = None
+            try:
+                root_identity = _read_fresh_native_process_identity(process.pid, _NativeReadState())
+                if not root_identity.get("creation"):
+                    raise RuntimeError("installer root native creation token is unavailable")
+                if not _host_installer_command_matches_contract(
+                    str(root_identity.get("native_command") or ""), contract
+                ):
+                    raise RuntimeError("installer root is not bound to the exact launch contract")
+            except _FreshProcessAbsent:
+                root_identity = None
+            descendant_census, _, _ = _cleanup_host_installer_resources(
+                process,
+                contract,
+                frontend_root=frontend_root,
+                initial_root_identity=root_identity,
+            )
+        except BaseException as cleanup_exc:
+            cleanup_failure = _format_installer_cleanup_failure(
+                "locked frontend dependency cleanup", cleanup_exc
+            )
+            if descendant_census is None:
+                descendant_census = {"status": "read_failed", "read_failure": cleanup_failure}
+        finally:
+            drain_started = _monotonic_now()
+            drain_failure = None
+            try:
+                stdout, stderr = process.communicate(timeout=0) if process is not None else ("", "")
+            except (subprocess.TimeoutExpired, OSError) as drain_exc:
+                drain_failure = _format_installer_cleanup_failure(
+                    "locked frontend dependency final pipe drain", drain_exc
+                )
+                stdout, stderr = primary_stdout, primary_stderr
+            drain_elapsed = _measured_elapsed_seconds(drain_started)
+            if isinstance(descendant_census, dict) and drain_elapsed is not None:
+                descendant_census.setdefault("phase_times", {})["pipe_drain"] = drain_elapsed
+            if drain_failure:
+                cleanup_failure = (
+                    f"{cleanup_failure}\n{drain_failure}" if cleanup_failure else drain_failure
+                )
+            primary_stdout = _bounded_subprocess_text(primary_stdout or stdout)
+            primary_stderr = _bounded_subprocess_text(primary_stderr or stderr)
+            if process is not None:
+                for stream_name in ("stdout", "stderr"):
+                    stream = getattr(process, stream_name, None)
+                    if stream is not None:
+                        stream.close()
+        evidence_path = _record_private_subprocess_timeout(
+            step="locked frontend dependency preparation",
+            argv_category="direct node/npm-cli installer",
+            command=contract["argv"],
+            timeout=exc,
+            timeout_seconds=timeout,
+            descendant_census=descendant_census,
+            cleanup_failure=cleanup_failure,
+        )
+        raise RuntimeError(
+            "release blocked: direct frontend installer timed out; "
+            f"marker={contract['marker']} stdout={primary_stdout} stderr={primary_stderr} "
+            f"cleanup_failure={cleanup_failure or 'none'} private evidence={evidence_path}"
+        ) from exc
+    finally:
+        if process is not None:
+            for stream_name in ("stdout", "stderr"):
+                stream = getattr(process, stream_name, None)
+                if stream is not None:
+                    stream.close()
+    return subprocess.CompletedProcess(contract["argv"], process.returncode, stdout, stderr)
+
+
+def _prepare_frontend_dependencies(frontend_root: Path | None = None) -> dict[str, Any]:
+    """Install the reviewed frontend lock through the direct Node/npm boundary."""
+    frontend_root = (ROOT / "frontend") if frontend_root is None else Path(frontend_root)
+    if not (frontend_root / "package.json").is_file() or not (frontend_root / "package-lock.json").is_file():
+        raise RuntimeError(
+            "release blocked: reviewed frontend package.json and package-lock.json are required "
+            f"before locked dependency preparation: {frontend_root}"
+        )
+    findings = _critical_dependency_findings()
+    if findings:
+        raise RuntimeError(
+            "release blocked: reviewed frontend dependency metadata is invalid before installation: "
+            f"findings={findings}"
+        )
+    contract = _host_installer_contract(frontend_root)
+    try:
+        result = _wait_for_host_installer(
+            contract,
+            frontend_root=frontend_root,
+            timeout=PLAYWRIGHT_PROVISION_TIMEOUT_SECONDS,
+        )
+    except RuntimeError:
+        raise
+    if type(result.returncode) is not int or result.returncode != 0:
+        diagnostic_path = _record_private_dependency_install_failure(
+            frontend_root=frontend_root,
+            command=contract["argv"],
+            result=result,
+        )
+        raise RuntimeError(
+            "release blocked: locked frontend dependency preparation failed: "
+            + json.dumps(
+                {
+                    "command_category": "direct node/npm-cli locked frontend dependency preparation",
+                    "exit_code": result.returncode,
+                    "stdout": _sanitize_failure_text(result.stdout[-SUBPROCESS_DIAGNOSTIC_LIMIT:]),
+                    "stderr": _sanitize_failure_text(result.stderr[-SUBPROCESS_DIAGNOSTIC_LIMIT:]),
+                    "private_diagnostic": str(diagnostic_path),
+                    "ownership_marker": contract["marker"],
+                },
+                sort_keys=True,
+            )
+        )
+    findings = _browser_dependency_findings(frontend_root)
+    if findings:
+        raise RuntimeError(
+            "release blocked: locked frontend dependency preparation did not produce a usable install: "
+            f"findings={findings}"
+        )
+    return {
+        "state": "completed",
+        "package_manager": "npm",
+        "lockfile": "frontend/package-lock.json",
+        "dependency_findings": findings,
+    }
+def _record_private_dependency_install_failure(
+    *, frontend_root: Path, command: list[str], result: subprocess.CompletedProcess[str]
+) -> Path:
+    EXTERNAL_PROOF_ROOT.mkdir(parents=True, exist_ok=True)
+    evidence_dir = Path(tempfile.mkdtemp(prefix="dependency-install-failure-", dir=EXTERNAL_PROOF_ROOT))
+    evidence_path = evidence_dir / "failure.json"
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "step": "locked frontend dependency preparation",
+                "command_category": "direct node/npm-cli locked frontend dependency preparation",
+                "frontend_root": _canonical_windows_path_identity(frontend_root),
+                "argv": _redacted_subprocess_argv(command),
+                "exit_code": result.returncode,
+                "stdout": _sanitize_failure_text(result.stdout[-SUBPROCESS_DIAGNOSTIC_LIMIT:]),
+                "stderr": _sanitize_failure_text(result.stderr[-SUBPROCESS_DIAGNOSTIC_LIMIT:]),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return evidence_path
+
+
+def _prepare_host(frontend_root: Path | None = None) -> dict[str, Any]:
+    """Prepare the host in the only permitted order before browser startup."""
+    process_before = _validate_host_process_evidence()
+    native = _prove_host_native_release()
+    dependencies = _prepare_frontend_dependencies(frontend_root)
+    _provision_live_verifier()
+    process_after = _validate_host_process_evidence()
+    readiness = _validate_browser_dependency_readiness(frontend_root, process=process_after)
+    return _summarize_host_preparation({
+        "process_before": process_before,
+        "native_release": native,
+        "dependencies": dependencies,
+        "process_after": process_after,
+        "readiness": readiness,
+    })
 
 
 def _critical_dependency_findings() -> list[str]:
@@ -2672,6 +5731,16 @@ def _demo_run_id(payload: dict[str, Any]) -> str:
     if value != CANONICAL_DEMO_RUN_ID:
         raise RuntimeError("release blocked: canonical synthetic demo identity is required")
     return value
+
+
+def _required_demo_run_id(payload: dict[str, Any]) -> str:
+    """Require the caller to bind live verification to one explicit demo run."""
+    value = _payload_value(payload, "demo_run_id")
+    if value is None:
+        value = _payload_value(payload, "run_id")
+    if value is None or not isinstance(value, str) or not value.strip():
+        raise RuntimeError("verification blocked: demo run id is required from the caller")
+    return _demo_run_id({"demo_run_id": value})
 
 
 def _compose_override(payload: dict[str, Any]) -> str:
@@ -4090,9 +7159,6 @@ def _prepare(
 ) -> dict[str, Any]:
     _validate_raw_input(payload)
     action = _action(payload)
-    if validate_process_evidence:
-        _validate_host_process_evidence()
-    action = _provider_payload(payload)
     demo_mode = _enforce_hosted_demo_mode(payload)
     release_text = _release_text()
     for name in _credential_scan_findings(release_text):
@@ -4113,8 +7179,9 @@ def _prepare(
     dependency_findings = _critical_dependency_findings()
     branding_findings = _branding_findings()
     release_ready = not dependency_findings and not branding_findings
-    if release_ready:
-        _provision_live_verifier()
+    host_preparation = None
+    if validate_process_evidence and release_ready:
+        host_preparation = _prepare_host()
     return {
         "action_key": action,
         "complete": release_ready,
@@ -4134,6 +7201,7 @@ def _prepare(
         "credential_history_findings": history_findings,
         "critical_dependency_findings": dependency_findings,
         "branding_findings": branding_findings,
+        "host_preparation": host_preparation,
         "release_config": {
             "live_url": _public_url(payload),
             "api_origin": _api_origin(payload),
@@ -4146,9 +7214,7 @@ def _prepare(
 def _run_live_verifier(payload: dict[str, Any]) -> dict[str, Any]:
     """Run the one authorized live verifier with script-relative arguments."""
     url = _public_url(payload)
-    run_id = _payload_value(payload, "demo_run_id") or _payload_value(payload, "run_id")
-    if not isinstance(run_id, str) or not run_id.strip():
-        run_id = CANONICAL_DEMO_RUN_ID
+    run_id = _required_demo_run_id(payload)
     configured_root = _payload_value(payload, "proof_dir") or os.environ.get(
         "CITESPAN_PROOF_DIR"
     )
@@ -4178,7 +7244,29 @@ def _run_live_verifier(payload: dict[str, Any]) -> dict[str, Any]:
         "--output-dir",
         str(output_dir),
     ]
-    result = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True)
+    started_at = _monotonic_now()
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=LIVE_VERIFIER_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        evidence_path = _record_private_subprocess_timeout(
+            step="live user-flow verification",
+            argv_category="project Python live verifier",
+            command=argv,
+            timeout=exc,
+            timeout_seconds=LIVE_VERIFIER_TIMEOUT_SECONDS,
+            elapsed_seconds=_measured_elapsed_seconds(started_at),
+        )
+        raise RuntimeError(
+            "live verification timed out; "
+            f"private evidence: {evidence_path}"
+        ) from exc
     if result.returncode != 0:
         raise RuntimeError(
             "live verification failed: "
@@ -4417,7 +7505,7 @@ def main() -> int:
         _require_project_python(args.command)
         payload = _read_input()
         value = {"prepare": _prepare, "observe": _observe, "execute": _execute, "verify": _verify}[args.command](payload)
-        print(json.dumps(value, sort_keys=True))
+        print(json.dumps(_sanitize_public_success(value), sort_keys=True))
         return 0
     except Exception as exc:
         evidence = _record_private_failure(
