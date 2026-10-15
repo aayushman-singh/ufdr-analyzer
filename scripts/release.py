@@ -76,6 +76,7 @@ LIVE_VERIFIER_TIMEOUT_SECONDS = 900
 SUBPROCESS_DIAGNOSTIC_LIMIT = 4096
 HOST_INSTALLER_CLEANUP_TIMEOUT_SECONDS = 30
 LEGACY_FAMILY_SOURCE_SHA256 = "3baead04ca0457c12b7ab0aebb8b0afc834d5f371aab3cb5c12c844489548cf5"
+LEGACY_CURRENT_OBSERVATION_SHA256 = "0b99210c848ac97b4cafb56c1b4f58ae96c8f2ed63b56ce49850f759456f14a7"
 DEPLOY_HOST = "root@169.58.64.150"
 DEPLOY_PATH = "/opt/citespan"
 DEPLOY_REPOSITORY = "https://github.com/aayushman-singh/ufdr-analyzer.git"
@@ -192,14 +193,20 @@ def _command_contains_path(command: str, target: object) -> bool:
 
 
 def _read_host_evidence(root: Path, filename: str) -> Any:
+    value, _ = _read_host_evidence_with_bytes(root, filename)
+    return value
+
+
+def _read_host_evidence_with_bytes(root: Path, filename: str) -> tuple[Any, bytes]:
     path = root / filename
     if not path.is_file() or path.is_symlink():
         raise RuntimeError(f"release blocked: host process evidence is missing or unsafe: {filename}")
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        raw_bytes = path.read_bytes()
+        value = json.loads(raw_bytes)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"release blocked: host process evidence cannot be read: {filename}") from exc
-    return value
+    return value, raw_bytes
 
 
 def _historical_evidence_error(filename: str, detail: str) -> RuntimeError:
@@ -921,12 +928,13 @@ def _assert_legacy_family_matches_normalized(legacy_record, normalized_record):
             f"pid={normalized_record['pid']} field=family_relation"
         )
 
-def _assert_family_source_provenance(legacy_document, normalized_document):
+def _assert_family_source_provenance(legacy_document, normalized_document, legacy_source_bytes):
     expected = LEGACY_FAMILY_SOURCE_SHA256
-    if "source_sha256" not in legacy_document:
+    measured = hashlib.sha256(legacy_source_bytes).hexdigest()
+    if measured != expected:
         raise RuntimeError(
-            "normalized current family evidence requires the immutable legacy source hash: "
-            f"field=source_sha256 expected={expected}"
+            "legacy family evidence bytes do not match the established source hash: "
+            f"measured={measured} expected={expected}"
         )
     legacy_digests = {
         field: legacy_document[field]
@@ -934,7 +942,7 @@ def _assert_family_source_provenance(legacy_document, normalized_document):
         if field in legacy_document
     }
     for field, value in legacy_digests.items():
-        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None or value != expected:
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None or value != measured:
             raise RuntimeError(
                 "legacy family evidence has an invalid immutable source digest: "
                 f"field={field} expected={expected}"
@@ -942,7 +950,7 @@ def _assert_family_source_provenance(legacy_document, normalized_document):
     normalized_provenance = normalized_document.get("source_provenance")
     if not isinstance(normalized_provenance, dict) or not normalized_provenance:
         raise RuntimeError("normalized current family evidence has no source provenance")
-    if normalized_provenance.get("source_sha256") != expected:
+    if normalized_provenance.get("source_sha256") != measured:
         raise RuntimeError(
             "normalized current family evidence requires the immutable legacy source hash in provenance: "
             f"field=source_sha256 expected={expected}"
@@ -966,15 +974,166 @@ def _assert_family_source_provenance(legacy_document, normalized_document):
                 )
 
 
-def _assert_legacy_current_observation(value: object) -> None:
-    if not isinstance(value, dict):
-        raise RuntimeError("release blocked: legacy current evidence must remain observation-only")
-    for field in ("ownership_approved", "cleanup_approved"):
-        if type(value.get(field)) is not bool or value[field] is not False:
+def _assert_legacy_current_observation(value: object, source_bytes: bytes) -> list[dict[str, Any]]:
+    expected = LEGACY_CURRENT_OBSERVATION_SHA256
+    measured = hashlib.sha256(source_bytes).hexdigest()
+    if measured != expected:
+        raise RuntimeError(
+            "release blocked: legacy current evidence bytes do not match the established observation: "
+            f"measured={measured} expected={expected}"
+        )
+    if not isinstance(value, dict) or set(value) != {
+        "nodes", "process_stopped", "dependency_installed", "ownership_approved"
+    }:
+        raise RuntimeError(
+            "release blocked: legacy current evidence has an unknown observation shape"
+        )
+    for field in ("process_stopped", "dependency_installed"):
+        if type(value[field]) is not bool:
             raise RuntimeError(
-                "release blocked: legacy current evidence must contain explicit false "
-                f"{field} approval"
+                f"release blocked: legacy current observation has invalid state type: field={field}"
             )
+        if value[field] is not False:
+            raise RuntimeError(
+                f"release blocked: legacy current observation requires explicit false state: field={field}"
+            )
+    if type(value["ownership_approved"]) is not bool or value["ownership_approved"] is not False:
+        raise RuntimeError(
+            "release blocked: legacy current observation must contain explicit false ownership approval"
+        )
+    return _current_node_observation_records(value["nodes"], "legacy-node-current-981.json")
+
+
+def _current_node_observation_records(value, label):
+    """Validate the saved current-observation records without changing their shape."""
+    safe_label = Path(str(label)).name
+    if not isinstance(value, list) or not value:
+        raise RuntimeError(f"current node observation invalid {safe_label}: expected a non-empty list")
+
+    required_record_fields = {
+        "historical_identity",
+        "read_only",
+        "current_identity",
+        "name",
+        "executable",
+        "cwd",
+        "parent_pid",
+        "command_sha256",
+        "script_paths",
+        "frontend_cwd_matches",
+        "historical_parent_matches",
+        "loaded_native_module_paths",
+        "parent_observation",
+        "full_identity_unchanged",
+    }
+    identity_fields = {"host", "pid", "creation_token", "kind", "group_id"}
+    identity_tuple_fields = ("host", "pid", "creation_token", "kind", "group_id")
+    normalized = []
+    seen = set()
+
+    def validate_identity(identity, record_number, field, expected_kind="node"):
+        if not isinstance(identity, dict) or set(identity) != identity_fields:
+            raise RuntimeError(
+                f"current node observation invalid {safe_label}: record={record_number} field={field}"
+            )
+        if not isinstance(identity["host"], str) or not identity["host"].strip():
+            raise RuntimeError(f"current node observation invalid {safe_label}: record={record_number} field={field}.host")
+        if not _is_positive_pid(identity["pid"]):
+            raise RuntimeError(f"current node observation invalid {safe_label}: record={record_number} field={field}.pid")
+        if not isinstance(identity["creation_token"], str) or not identity["creation_token"].strip():
+            raise RuntimeError(
+                f"current node observation invalid {safe_label}: record={record_number} field={field}.creation_token"
+            )
+        if identity["kind"] != expected_kind:
+            raise RuntimeError(f"current node observation invalid {safe_label}: record={record_number} field={field}.kind")
+        if not _is_positive_pid(identity["group_id"]):
+            raise RuntimeError(
+                f"current node observation invalid {safe_label}: record={record_number} field={field}.group_id"
+            )
+        return tuple(identity[field_name] for field_name in identity_tuple_fields)
+
+    def validate_parent(parent, record_number, child_pid, outer_parent_pid):
+        if not isinstance(parent, dict):
+            raise RuntimeError(f"current node observation invalid {safe_label}: record={record_number} field=parent_observation")
+        if set(parent) == {"pid", "read_failed", "error_type", "error"}:
+            if not _is_positive_pid(parent["pid"]) or parent["read_failed"] is not True:
+                raise RuntimeError(f"current node observation invalid {safe_label}: record={record_number} field=parent_observation")
+            if not all(isinstance(parent[field], str) and parent[field].strip() for field in ("error_type", "error")):
+                raise RuntimeError(f"current node observation invalid {safe_label}: record={record_number} field=parent_observation")
+            if parent["pid"] != outer_parent_pid:
+                raise RuntimeError(
+                    f"current node observation invalid {safe_label}: record={record_number} "
+                    "failed parent observation PID does not match outer parent relation: "
+                    f"child_pid={child_pid} outer_parent_pid={outer_parent_pid} "
+                    f"observed_failed_read_pid={parent['pid']}"
+                )
+            return
+        expected_parent_fields = {
+            "identity", "name", "executable", "cwd", "parent_pid", "command_sha256", "script_paths"
+        }
+        if set(parent) != expected_parent_fields:
+            raise RuntimeError(f"current node observation invalid {safe_label}: record={record_number} field=parent_observation")
+        validate_identity(parent["identity"], record_number, "parent_observation.identity", "ancestor")
+        for field in ("name", "executable", "cwd"):
+            if not isinstance(parent[field], str) or not parent[field].strip():
+                raise RuntimeError(f"current node observation invalid {safe_label}: record={record_number} field=parent_observation.{field}")
+        if not _is_positive_pid(parent["parent_pid"]):
+            raise RuntimeError(f"current node observation invalid {safe_label}: record={record_number} field=parent_observation.parent_pid")
+        if not isinstance(parent["script_paths"], list) or any(
+            not isinstance(path, str) for path in parent["script_paths"]
+        ):
+            raise RuntimeError(f"current node observation invalid {safe_label}: record={record_number} field=parent_observation.script_paths")
+        if not isinstance(parent["command_sha256"], str) or re.fullmatch(r"[0-9a-f]{64}", parent["command_sha256"]) is None:
+            raise RuntimeError(f"current node observation invalid {safe_label}: record={record_number} field=parent_observation.command_sha256")
+
+    for record_number, record in enumerate(value):
+        if not isinstance(record, dict) or set(record) != required_record_fields:
+            raise RuntimeError(
+                f"current node observation invalid {safe_label}: record={record_number} has unknown or missing fields"
+            )
+        historical_key = validate_identity(record["historical_identity"], record_number, "historical_identity")
+        current_key = validate_identity(record["current_identity"], record_number, "current_identity")
+        for field_name, historical_value, current_value in zip(
+            identity_tuple_fields, historical_key, current_key
+        ):
+            if current_value != historical_value:
+                raise RuntimeError(
+                    f"current node observation invalid {safe_label}: record={record_number} "
+                    f"identity continuity changed field={field_name}"
+                )
+        if historical_key in seen:
+            raise RuntimeError(f"current node observation invalid {safe_label}: duplicate identity pid={historical_key[0]}")
+        seen.add(historical_key)
+        if record["read_only"] is not True or record["full_identity_unchanged"] is not True:
+            raise RuntimeError(f"current node observation invalid {safe_label}: record={record_number} requires immutable read-only identity")
+        for field in ("name", "executable", "cwd"):
+            if not isinstance(record[field], str) or not record[field].strip():
+                raise RuntimeError(f"current node observation invalid {safe_label}: record={record_number} field={field}")
+        if not _is_positive_pid(record["parent_pid"]):
+            raise RuntimeError(f"current node observation invalid {safe_label}: record={record_number} field=parent_pid")
+        if not isinstance(record["command_sha256"], str) or re.fullmatch(r"[0-9a-f]{64}", record["command_sha256"]) is None:
+            raise RuntimeError(f"current node observation invalid {safe_label}: record={record_number} field=command_sha256")
+        for field in ("script_paths", "loaded_native_module_paths"):
+            if not isinstance(record[field], list) or any(not isinstance(path, str) for path in record[field]):
+                raise RuntimeError(f"current node observation invalid {safe_label}: record={record_number} field={field}")
+        for field in ("frontend_cwd_matches", "historical_parent_matches"):
+            if type(record[field]) is not bool:
+                raise RuntimeError(f"current node observation invalid {safe_label}: record={record_number} field={field}")
+        validate_parent(
+            record["parent_observation"],
+            record_number,
+            historical_key[1],
+            record["parent_pid"],
+        )
+        parent = record["parent_observation"]
+        if isinstance(parent, dict) and "identity" in parent:
+            if parent["identity"]["pid"] != record["parent_pid"]:
+                raise RuntimeError(
+                    f"current node observation invalid {safe_label}: record={record_number} "
+                    "parent_observation.identity.pid does not match parent_pid"
+                )
+        normalized.append({"pid": historical_key[1], "creation": historical_key[2]})
+    return normalized
 
 
 def _validate_additional_descendants(value, label):
@@ -1406,11 +1565,24 @@ def _load_host_process_contract() -> dict[str, Any]:
     root = HOST_PROCESS_EVIDENCE_ROOT.expanduser().resolve()
     if root == ROOT or ROOT in root.parents:
         raise RuntimeError("release blocked: host process evidence must be outside the product checkout")
-    documents = {filename: _read_host_evidence(root, filename) for filename in HOST_PROCESS_EVIDENCE_FILES}
+    documents = {}
+    source_bytes = {}
+    for filename in HOST_PROCESS_EVIDENCE_FILES:
+        documents[filename], source_bytes[filename] = _read_host_evidence_with_bytes(root, filename)
     node_records = _legacy_evidence_records(documents[_LEGACY_NODE_INVENTORY], _LEGACY_NODE_INVENTORY)
     lock_records = _legacy_evidence_records(documents[_LEGACY_LOCK_INVENTORY], _LEGACY_LOCK_INVENTORY)
     legacy_current = documents[HOST_PROCESS_EVIDENCE_FILES[2]]
-    _assert_legacy_current_observation(legacy_current)
+    current_observation_records = _assert_legacy_current_observation(
+        legacy_current, source_bytes[HOST_PROCESS_EVIDENCE_FILES[2]]
+    )
+    historical_node_keys = {(record["pid"], record["creation"]) for record in node_records}
+    current_observation_keys = {
+        (record["pid"], record["creation"]) for record in current_observation_records
+    }
+    if current_observation_keys != historical_node_keys:
+        raise RuntimeError(
+            "release blocked: current node observation identities disagree with the historical node inventory"
+        )
     legacy_document = documents[HOST_PROCESS_EVIDENCE_FILES[3]]
     normalized_document = documents[HOST_PROCESS_EVIDENCE_FILES[4]]
     legacy_family = _legacy_family_observation_records(legacy_document, HOST_PROCESS_EVIDENCE_FILES[3])
@@ -1419,7 +1591,11 @@ def _load_host_process_contract() -> dict[str, Any]:
         HOST_PROCESS_EVIDENCE_FILES[4],
         legacy_document,
     )
-    _assert_family_source_provenance(legacy_document, normalized_document)
+    _assert_family_source_provenance(
+        legacy_document,
+        normalized_document,
+        source_bytes[HOST_PROCESS_EVIDENCE_FILES[3]],
+    )
     presence = _current_cleanup_observation(
         documents[HOST_PROCESS_EVIDENCE_FILES[5]],
         HOST_PROCESS_EVIDENCE_FILES[5],

@@ -4186,82 +4186,206 @@ def test_current_family_records_rejects_boolean_pid_before_identity_matching():
         release._current_family_records(value, "normalized.json")
 
 
-@pytest.mark.parametrize(
-    "legacy_document,normalized_document",
-    [
-        ({"source_sha256": release.LEGACY_FAMILY_SOURCE_SHA256}, {"source_provenance": {"source_sha256": release.LEGACY_FAMILY_SOURCE_SHA256}}),
-        ({}, {"source_provenance": {"source_sha256": release.LEGACY_FAMILY_SOURCE_SHA256}}),
-        ({"source_sha256": "changed"}, {"source_provenance": {"source_sha256": release.LEGACY_FAMILY_SOURCE_SHA256}}),
-        ({"source_sha256": release.LEGACY_FAMILY_SOURCE_SHA256}, {"source_provenance": {"source_sha256": "changed"}}),
-        (
-            {
-                "source_sha256": release.LEGACY_FAMILY_SOURCE_SHA256,
-                "source_provenance": {"source_sha256": "changed"},
-            },
-            {"source_provenance": {"source_sha256": release.LEGACY_FAMILY_SOURCE_SHA256}},
-        ),
-    ],
-)
-def test_family_source_hash_is_required_and_immutable(legacy_document, normalized_document):
-    if legacy_document.get("source_sha256") == release.LEGACY_FAMILY_SOURCE_SHA256 and normalized_document["source_provenance"].get("source_sha256") == release.LEGACY_FAMILY_SOURCE_SHA256 and (
-        not legacy_document.get("source_provenance") or legacy_document["source_provenance"].get("source_sha256") == release.LEGACY_FAMILY_SOURCE_SHA256
-    ):
-        release._assert_family_source_provenance(legacy_document, normalized_document)
-    else:
-        with pytest.raises(RuntimeError, match="source hash|source_sha256|source provenance"):
-            release._assert_family_source_provenance(legacy_document, normalized_document)
+def _source_bytes_with_expected_hash(monkeypatch, value):
+    source = json.dumps(value, separators=(",", ":")).encode("utf-8")
+    monkeypatch.setattr(release, "LEGACY_FAMILY_SOURCE_SHA256", hashlib.sha256(source).hexdigest())
+    return source
 
 
-@pytest.mark.parametrize("field", ["source_hash", "sha256", "original_source_sha256"])
-def test_family_source_digest_aliases_bind_to_legacy_and_normalized_provenance(field):
-    expected = release.LEGACY_FAMILY_SOURCE_SHA256
-    legacy = {"source_sha256": expected, field: expected}
-    normalized = {"source_provenance": {"source_sha256": expected, field: expected}}
-
-    release._assert_family_source_provenance(legacy, normalized)
-
-    for legacy_value, normalized_value in [("0" * 64, expected), ("bad", expected), (expected, "0" * 64)]:
-        changed_legacy = dict(legacy)
-        changed_normalized = {"source_provenance": dict(normalized["source_provenance"])}
-        changed_legacy[field] = legacy_value
-        changed_normalized["source_provenance"][field] = normalized_value
-        with pytest.raises(RuntimeError, match="digest|provenance"):
-            release._assert_family_source_provenance(changed_legacy, changed_normalized)
-
-    missing_alias = {"source_provenance": {"source_sha256": expected}}
-    with pytest.raises(RuntimeError, match="provenance"):
-        release._assert_family_source_provenance(legacy, missing_alias)
+def _legacy_current_fixture():
+    return json.loads(
+        (release.HOST_PROCESS_EVIDENCE_ROOT / "legacy-node-current-981.json").read_text(
+            encoding="utf-8"
+        )
+    )
 
 
-def test_family_source_digest_rejects_missing_required_canonical_digest():
-    expected = release.LEGACY_FAMILY_SOURCE_SHA256
+def _legacy_current_source():
+    return (release.HOST_PROCESS_EVIDENCE_ROOT / "legacy-node-current-981.json").read_bytes()
+
+
+def test_family_source_hash_uses_raw_bytes_and_normalized_provenance(monkeypatch):
+    legacy = {"schema": "citespan.read-only-family-observation.v1", "observations": []}
+    normalized = {"source_provenance": {}}
+    source = _source_bytes_with_expected_hash(monkeypatch, legacy)
+    normalized["source_provenance"]["source_sha256"] = hashlib.sha256(source).hexdigest()
+
+    release._assert_family_source_provenance(legacy, normalized, source)
+
+    with pytest.raises(RuntimeError, match="bytes do not match"):
+        release._assert_family_source_provenance(legacy, normalized, source + b" ")
+
+
+def test_family_source_hash_rejects_mismatched_normalized_provenance(monkeypatch):
+    legacy = {"schema": "citespan.read-only-family-observation.v1", "observations": []}
+    source = _source_bytes_with_expected_hash(monkeypatch, legacy)
     with pytest.raises(RuntimeError, match="source_sha256"):
         release._assert_family_source_provenance(
-            {"source_hash": expected},
-            {"source_provenance": {"source_hash": expected}},
+            legacy,
+            {"source_provenance": {"source_sha256": "0" * 64}},
+            source,
         )
 
 
-def test_family_source_digest_rejects_conflicting_legacy_aliases():
-    expected = release.LEGACY_FAMILY_SOURCE_SHA256
-    with pytest.raises(RuntimeError, match="digest"):
-        release._assert_family_source_provenance(
-            {"source_sha256": expected, "source_hash": "0" * 64},
-            {"source_provenance": {"source_sha256": expected, "source_hash": "0" * 64}},
-        )
+def test_legacy_current_accepts_exact_schema_less_observation_without_authority(monkeypatch):
+    document = _legacy_current_fixture()
+    source = _legacy_current_source()
+    assert hashlib.sha256(source).hexdigest() == release.LEGACY_CURRENT_OBSERVATION_SHA256
+    records = release._assert_legacy_current_observation(document, source)
+    assert len(records) == 116
+    assert records[0]["pid"] == document["nodes"][0]["historical_identity"]["pid"]
+
+    with pytest.raises(RuntimeError, match="node-current-approval.v1"):
+        release._current_observation_records(document, "citespan-node-current-approval.json")
 
 
-@pytest.mark.parametrize("field", ["ownership_approved", "cleanup_approved"])
-@pytest.mark.parametrize("value", [None, True, "false"])
-def test_legacy_current_requires_explicit_false_approval_flags(field, value):
-    document = {"ownership_approved": False, "cleanup_approved": False}
-    document[field] = value
-    with pytest.raises(RuntimeError, match="explicit false"):
-        release._assert_legacy_current_observation(document)
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value.pop("ownership_approved"),
+        lambda value: value.update({"schema": "unknown"}),
+        lambda value: value.update({"ownership_approved": True}),
+        lambda value: value.update({"process_stopped": "false"}),
+        lambda value: value.update({"extra": True}),
+    ],
+)
+def test_legacy_current_rejects_malformed_or_unknown_shape(monkeypatch, mutate):
+    document = _legacy_current_fixture()
+    mutate(document)
+    source = json.dumps(document, separators=(",", ":")).encode()
+    monkeypatch.setattr(release, "LEGACY_CURRENT_OBSERVATION_SHA256", hashlib.sha256(source).hexdigest())
+    with pytest.raises(RuntimeError):
+        release._assert_legacy_current_observation(document, source)
 
 
-def test_legacy_current_accepts_the_unchanged_explicit_false_observation():
-    release._assert_legacy_current_observation({"ownership_approved": False, "cleanup_approved": False})
+@pytest.mark.parametrize("field", ["process_stopped", "dependency_installed"])
+def test_legacy_current_rejects_true_observation_state(field, monkeypatch):
+    document = _legacy_current_fixture()
+    document[field] = True
+    source = json.dumps(document, separators=(",", ":")).encode()
+    monkeypatch.setattr(release, "LEGACY_CURRENT_OBSERVATION_SHA256", hashlib.sha256(source).hexdigest())
+
+    with pytest.raises(RuntimeError, match=f"explicit false state: field={field}"):
+        release._assert_legacy_current_observation(document, source)
+
+
+def test_legacy_current_rejects_altered_raw_bytes(monkeypatch):
+    document = _legacy_current_fixture()
+    source = _legacy_current_source()
+    with pytest.raises(RuntimeError, match="bytes do not match"):
+        release._assert_legacy_current_observation(document, source + b" ")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda record: record.pop("historical_identity"),
+        lambda record: record.update({"unknown": True}),
+        lambda record: record["current_identity"].update({"pid": 999999}),
+        lambda record: record["parent_observation"].update({"unknown": True}),
+    ],
+)
+def test_legacy_current_rejects_malformed_nested_observation(monkeypatch, mutate):
+    document = _legacy_current_fixture()
+    mutate(document["nodes"][1])
+    source = json.dumps(document, separators=(",", ":")).encode()
+    monkeypatch.setattr(release, "LEGACY_CURRENT_OBSERVATION_SHA256", hashlib.sha256(source).hexdigest())
+
+    with pytest.raises(RuntimeError, match="current node observation"):
+        release._assert_legacy_current_observation(document, source)
+
+
+@pytest.mark.parametrize("field", ["host", "group_id", "kind"])
+def test_legacy_current_rejects_changed_identity_continuity_field(monkeypatch, field):
+    document = _legacy_current_fixture()
+    record = document["nodes"][1]
+    if field == "group_id":
+        record["current_identity"][field] += 1
+    elif field == "kind":
+        record["current_identity"][field] = "ancestor"
+    else:
+        record["current_identity"][field] = "different-host"
+    source = json.dumps(document, separators=(",", ":")).encode()
+    monkeypatch.setattr(release, "LEGACY_CURRENT_OBSERVATION_SHA256", hashlib.sha256(source).hexdigest())
+
+    expected = rf"identity continuity changed field={field}" if field != "kind" else r"current_identity\.kind"
+    with pytest.raises(RuntimeError, match=expected):
+        release._assert_legacy_current_observation(document, source)
+
+
+def test_legacy_current_rejects_parent_identity_pid_mismatch(monkeypatch):
+    document = _legacy_current_fixture()
+    record = document["nodes"][1]
+    record["parent_observation"]["identity"]["pid"] += 1
+    source = json.dumps(document, separators=(",", ":")).encode()
+    monkeypatch.setattr(release, "LEGACY_CURRENT_OBSERVATION_SHA256", hashlib.sha256(source).hexdigest())
+
+    with pytest.raises(RuntimeError, match=r"parent_observation\.identity\.pid does not match parent_pid"):
+        release._assert_legacy_current_observation(document, source)
+
+
+def test_legacy_current_rejects_failed_parent_pid_mismatch(monkeypatch):
+    document = _legacy_current_fixture()
+    record = next(
+        record
+        for record in document["nodes"]
+        if record["parent_observation"].get("read_failed") is True
+    )
+    record["parent_observation"]["pid"] += 1
+    source = json.dumps(document, separators=(",", ":")).encode()
+    monkeypatch.setattr(release, "LEGACY_CURRENT_OBSERVATION_SHA256", hashlib.sha256(source).hexdigest())
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"failed parent observation PID does not match outer parent relation: "
+            r"child_pid=.*outer_parent_pid=.*observed_failed_read_pid=.*"
+        ),
+    ):
+        release._assert_legacy_current_observation(document, source)
+
+
+def test_actual_family_source_bytes_bind_to_normalized_provenance():
+    root = release.HOST_PROCESS_EVIDENCE_ROOT
+    legacy_source = (root / "legacy-family-current-996.json").read_bytes()
+    legacy = json.loads(legacy_source)
+    normalized = json.loads((root / "citespan-node-family-current.v1.json").read_text(encoding="utf-8"))
+
+    assert hashlib.sha256(legacy_source).hexdigest() == release.LEGACY_FAMILY_SOURCE_SHA256
+    release._assert_family_source_provenance(legacy, normalized, legacy_source)
+
+    with pytest.raises(RuntimeError, match="bytes do not match"):
+        release._assert_family_source_provenance(legacy, normalized, legacy_source + b" ")
+
+    normalized["source_provenance"]["source_sha256"] = "0" * 64
+    with pytest.raises(RuntimeError, match="source_sha256"):
+        release._assert_family_source_provenance(legacy, normalized, legacy_source)
+
+
+def test_saved_host_process_contract_accepts_all_unchanged_inputs_without_side_effects(monkeypatch):
+    evidence_root = release.HOST_PROCESS_EVIDENCE_ROOT
+    expected_hashes = {
+        "legacy-node-current-981.json": "0b99210c848ac97b4cafb56c1b4f58ae96c8f2ed63b56ce49850f759456f14a7",
+        "legacy-family-current-996.json": "3baead04ca0457c12b7ab0aebb8b0afc834d5f371aab3cb5c12c844489548cf5",
+    }
+    for filename, expected in expected_hashes.items():
+        assert hashlib.sha256((evidence_root / filename).read_bytes()).hexdigest() == expected
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("saved-evidence validation attempted a side effect")
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", forbidden)
+    monkeypatch.setattr(release, "_terminate_host_installer_process", forbidden)
+    monkeypatch.setattr(release, "_install_backend_dependencies", forbidden, raising=False)
+    monkeypatch.setattr(release, "_execute_release", forbidden, raising=False)
+    monkeypatch.setattr(release, "_verify_release", forbidden, raising=False)
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+
+    result = release._load_host_process_contract()
+
+    assert len(result["node_records"]) == 116
+    assert len(result["family_records"]) == 145
+    assert result["approval_records"] == []
 
 
 def test_normalized_family_binding_rejects_missing_parent_evidence():
