@@ -1675,6 +1675,78 @@ class _NativeReadState:
     limited_only: bool = False
 
 
+_RESOURCE_IDENTITY_FIELDS = (
+    "pid",
+    "creation",
+    "parent_pid",
+    "cwd",
+    "executable",
+    "native_command",
+    "argv",
+    "argv_sha256",
+    "native_command_sha256",
+    "parent_observations",
+    "module_paths",
+    "files",
+    "ports",
+)
+
+
+def _has_complete_resource_identity(value: object) -> bool:
+    """Return whether a value contains all fields required for resource checks."""
+    return isinstance(value, dict) and all(field in value for field in _RESOURCE_IDENTITY_FIELDS)
+
+
+def _validate_fresh_exit_identity(identity: object, pid: int) -> None:
+    """Validate terminal evidence before excluding an exited census row."""
+    if not isinstance(identity, dict) or identity.get("pid") != pid:
+        raise RuntimeError(
+            "release blocked: fresh process exit evidence has a conflicting PID: "
+            f"pid={pid} identity={identity!r}"
+        )
+    if identity.get("state") != "exited":
+        raise RuntimeError(
+            "release blocked: fresh process exit evidence has an invalid state: "
+            f"pid={pid} state={identity.get('state')!r}"
+        )
+    creation = identity.get("creation")
+    if not isinstance(creation, str) or not creation:
+        raise RuntimeError(
+            "release blocked: fresh process exit evidence has no creation identity: "
+            f"pid={pid} creation={creation!r}"
+        )
+    exit_code = identity.get("exit_code")
+    proof = identity.get("exit_proof")
+    provenance = identity.get("source_provenance")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool) or exit_code == 259:
+        raise RuntimeError(
+            "release blocked: fresh process exit evidence is contradictory: "
+            f"pid={pid} exit_code={exit_code!r}"
+        )
+    if (
+        not isinstance(proof, dict)
+        or proof.get("handle_state") != "exited"
+        or proof.get("authoritative_win32_process") != "absent"
+        or proof.get("creation") != creation
+        or not isinstance(provenance, dict)
+        or provenance.get("authoritative_win32_process") != "absent"
+    ):
+        raise RuntimeError(
+            "release blocked: fresh process exit evidence is incomplete: "
+            f"pid={pid} evidence={identity!r}"
+        )
+    contradictory = sorted(
+        field
+        for field in _RESOURCE_IDENTITY_FIELDS
+        if field not in {"pid", "creation"} and field in identity
+    )
+    if contradictory:
+        raise RuntimeError(
+            "release blocked: fresh process exit evidence contains live fields: "
+            f"pid={pid} fields={contradictory}"
+        )
+
+
 _FRESH_STATE_TRANSITIONS = {
     "absent": frozenset({"absent", "reused", "live"}),
     "reused": frozenset({"absent", "reused", "live"}),
@@ -2004,8 +2076,8 @@ def _read_fresh_native_process_identity(
                 f"pid={pid} limited native process handle close failed: WinError {ctypes.get_last_error()}"
             )
 
-    # Only an exact creation-token match reaches this full read. No write or
-    # terminate rights are used.
+    # The limited read has already established the identity used by this full
+    # read. No write or terminate rights are used.
     rights = 0x0400 | 0x1000 | 0x0010 | 0x0040
     handle = kernel32.OpenProcess(rights, 0, pid)
     if not handle:
@@ -2527,22 +2599,7 @@ def _resource_process_is_relevant(
             "release blocked: fresh process relevance is unreadable: "
             f"pid={pid} current identity is missing"
         )
-    required_identity_fields = (
-        "pid",
-        "creation",
-        "parent_pid",
-        "cwd",
-        "executable",
-        "native_command",
-        "argv",
-        "argv_sha256",
-        "native_command_sha256",
-        "parent_observations",
-        "module_paths",
-        "files",
-        "ports",
-    )
-    missing = [field for field in required_identity_fields if field not in identity]
+    missing = [field for field in _RESOURCE_IDENTITY_FIELDS if field not in identity]
     if missing:
         raise RuntimeError(
             "release blocked: fresh process relevance is unreadable: "
@@ -3093,6 +3150,7 @@ def _fresh_resource_scope(
         owner for port, owner in port_records if port in scoped_ports and owner is not None
     }
     identities = dict(preloaded_identities or {})
+    terminal_exclusions = []
     try:
         protected.update(
             _bind_verified_protected_service(resources, process_rows_by_pid, identities)
@@ -3136,19 +3194,54 @@ def _fresh_resource_scope(
                 "release blocked: fresh resource census is unstable or unreadable; "
                 f"selected resource owner is absent from process census: pid={pid}"
             )
-        if pid in identities and pid not in (native_holder_pids | scoped_port_owner_pids):
+        row_identity = process_rows_by_pid[pid].get("current_identity")
+        can_reuse_identity = (
+            pid not in native_holder_pids
+            and pid not in scoped_port_owner_pids
+            and _has_complete_resource_identity(identities.get(pid))
+            and (row_identity is None or _has_complete_resource_identity(row_identity))
+        )
+        if can_reuse_identity:
             identity = identities[pid]
         else:
+            preloaded_identity = identities.get(pid)
+            expected_preloaded_creation = (
+                preloaded_identity.get("creation")
+                if isinstance(preloaded_identity, dict)
+                and isinstance(preloaded_identity.get("creation"), str)
+                else None
+            )
             try:
-                identity = process_rows_by_pid[pid].get("current_identity") or _read_fresh_native_process_identity(
-                    pid, _NativeReadState()
-                )
+                identity = _read_fresh_native_process_identity(pid, _NativeReadState())
             except (_FreshProcessAbsent, _FreshProcessUnreadable) as exc:
                 raise RuntimeError(
                     "release blocked: fresh resource census is unstable or unreadable; "
                     f"potentially relevant process identity failed: pid={pid}: {exc}"
                 ) from exc
-            identities[pid] = identity
+            if expected_preloaded_creation is not None and (
+                not isinstance(identity, dict)
+                or identity.get("pid") != pid
+                or identity.get("creation") != expected_preloaded_creation
+            ):
+                raise RuntimeError(
+                    "release blocked: fresh resource identity changed during hydration: "
+                    "stage=_fresh_resource_scope.full_identity_hydration "
+                    f"pid={pid} limited_creation={expected_preloaded_creation!r} "
+                    f"fresh_pid={identity.get('pid') if isinstance(identity, dict) else identity!r} "
+                    f"fresh_creation={identity.get('creation') if isinstance(identity, dict) else None!r}"
+                )
+        if isinstance(identity, dict) and identity.get("state") == "exited":
+            _validate_fresh_exit_identity(identity, pid)
+            if pid in native_holder_pids or pid in scoped_port_owner_pids:
+                raise RuntimeError(
+                    "release blocked: fresh resource owner exited during census: "
+                    f"pid={pid} native_holder={pid in native_holder_pids} "
+                    f"scoped_port_owner={pid in scoped_port_owner_pids}"
+                )
+            identities.pop(pid, None)
+            terminal_exclusions.append({"pid": pid, "reason": "authoritative native exit during census"})
+            continue
+        identities[pid] = identity
         if not isinstance(identity, dict) or identity.get("pid") != pid:
             raise RuntimeError(
                 "release blocked: fresh process relevance has conflicting PIDs: "
@@ -3162,7 +3255,10 @@ def _fresh_resource_scope(
             )
 
     relevant_processes = []
-    for pid, identity in identities.items():
+    for pid in sorted(candidate_pids):
+        identity = identities.get(pid)
+        if identity is None:
+            continue
         item = process_rows_by_pid.get(pid)
         if item is None:
             continue
@@ -3208,6 +3304,7 @@ def _fresh_resource_scope(
         "port_owner_identities": port_owner_identities,
         "protected_pids": protected,
         "unrelated_exclusions": unrelated_exclusions,
+        "terminal_exclusions": terminal_exclusions,
         "all_process_pids": all_process_pids,
     }
 
@@ -3351,6 +3448,7 @@ def _assert_fresh_host_process_census(contract: dict[str, Any]) -> dict[str, Any
         "replacement_pids": sorted(replacement_pids),
         "terminal_states": terminal_states,
         "transition_diagnostics": transition_diagnostics,
+        "terminal_exclusions": resource_scope["terminal_exclusions"],
         "resources": resources,
         "port_owner_identities": port_owner_identities,
         "unrelated_exclusions": unrelated_exclusions,

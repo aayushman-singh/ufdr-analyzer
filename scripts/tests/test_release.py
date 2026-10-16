@@ -2179,6 +2179,234 @@ def test_fresh_census_excludes_reused_replacement_from_resource_selection(monkey
     assert result["replacement_pids"] == [1]
 
 
+def test_fresh_resource_scope_rejects_replacement_between_limited_and_full_reads(monkeypatch):
+    root = str(release.ROOT.resolve())
+    replacement = {
+        "pid": 15008,
+        "creation": "replacement-15008",
+        "executable": "C:/tools/node.exe",
+        "source_provenance": {"reader": "native limited process handle"},
+    }
+    full_identity = _resource_identity(
+        15008,
+        cwd="C:/Repo/other-project",
+        argv=["node.exe", "C:/Repo/other-project/server.js"],
+    )
+    read_states = []
+
+    def read(pid, state, *_args, **_kwargs):
+        read_states.append((pid, state.expected_creation, state.limited_only))
+        return full_identity
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+    with pytest.raises(
+        RuntimeError,
+        match="identity changed during hydration.*limited_creation='replacement-15008'.*fresh_creation='creation-15008'",
+    ):
+        release._fresh_resource_scope(
+            {
+                "processes": [
+                    {
+                        "pid": 15008,
+                        "name": "node.exe",
+                        "executable": "C:/tools/node.exe",
+                        "parent_pid": 1,
+                    }
+                ],
+                "holders": [],
+                "ports": [],
+                "read_errors": [],
+            },
+            root,
+            scoped_ports={43123},
+            preloaded_identities={15008: replacement},
+        )
+
+    assert read_states == [(15008, None, False)]
+
+
+def test_fresh_resource_scope_hydrates_matching_limited_replacement(monkeypatch):
+    root = str(release.ROOT.resolve())
+    full_identity = _resource_identity(
+        15008,
+        cwd="C:/Repo/other-project",
+        argv=["node.exe", "C:/Repo/other-project/server.js"],
+    )
+    replacement = {
+        "pid": 15008,
+        "creation": full_identity["creation"],
+        "executable": "C:/tools/node.exe",
+        "source_provenance": {"reader": "native limited process handle"},
+    }
+
+    monkeypatch.setattr(
+        release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: full_identity
+    )
+    result = release._fresh_resource_scope(
+        {
+            "processes": [
+                {
+                    "pid": 15008,
+                    "name": "node.exe",
+                    "executable": "C:/tools/node.exe",
+                    "parent_pid": 1,
+                }
+            ],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+        root,
+        scoped_ports={43123},
+        preloaded_identities={15008: replacement},
+    )
+
+    assert result["identities"][15008] == full_identity
+    assert result["relevant_processes"] == []
+
+
+def test_fresh_resource_scope_excludes_partial_preloaded_noncandidate_without_native_read(monkeypatch):
+    root = str(release.ROOT.resolve())
+    replacement = {
+        "pid": 15011,
+        "creation": "replacement-15011",
+        "executable": "C:/Program Files/Bitdefender Agent/DiscoverySrv.exe",
+        "source_provenance": {"reader": "native limited process handle"},
+    }
+    reads = []
+
+    def read(pid, *_args, **_kwargs):
+        reads.append(pid)
+        raise AssertionError("excluded noncandidate must not be opened")
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+    result = release._fresh_resource_scope(
+        {
+            "processes": [
+                {
+                    "pid": 15011,
+                    "name": "DiscoverySrv.exe",
+                    "executable": "C:/Program Files/Bitdefender Agent/DiscoverySrv.exe",
+                    "parent_pid": 1,
+                }
+            ],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+        root,
+        scoped_ports={43123},
+        preloaded_identities={15011: replacement},
+    )
+
+    assert reads == []
+    assert result["unrelated_exclusions"] == [
+        {"pid": 15011, "reason": "outside measured frontend process family"}
+    ]
+    assert result["relevant_processes"] == []
+
+
+def test_fresh_resource_scope_keeps_partial_preloaded_noncandidate_separate(monkeypatch):
+    root = str(release.ROOT.resolve())
+    replacement = {
+        "pid": 15011,
+        "creation": "replacement-15011",
+        "executable": "C:/Program Files/Bitdefender Agent/DiscoverySrv.exe",
+        "source_provenance": {"reader": "native limited process handle"},
+    }
+    reads = []
+
+    def read(pid, *_args, **_kwargs):
+        reads.append(pid)
+        raise AssertionError("excluded noncandidate must not be opened")
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+    result = release._fresh_resource_scope(
+        {
+            "processes": [
+                {
+                    "pid": 15011,
+                    "name": "DiscoverySrv.exe",
+                    "executable": "C:/Program Files/Bitdefender Agent/DiscoverySrv.exe",
+                    "parent_pid": 1,
+                }
+            ],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+        root,
+        scoped_ports={43123},
+        preloaded_identities={15011: replacement},
+    )
+
+    assert reads == []
+    assert result["unrelated_exclusions"] == [
+        {"pid": 15011, "reason": "outside measured frontend process family"}
+    ]
+    assert result["relevant_processes"] == []
+
+
+def test_fresh_resource_scope_excludes_authoritatively_exited_process(monkeypatch):
+    exited = {
+        "pid": 15009,
+        "creation": "creation-15009",
+        "state": "exited",
+        "exit_code": 0,
+        "exit_proof": {
+            "handle_state": "exited",
+            "authoritative_win32_process": "absent",
+            "creation": "creation-15009",
+        },
+        "source_provenance": {"authoritative_win32_process": "absent"},
+    }
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: exited)
+
+    result = release._fresh_resource_scope(
+        {
+            "processes": [{"pid": 15009, "name": "node.exe", "parent_pid": 1}],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+        str(release.ROOT.resolve()),
+        scoped_ports={43123},
+    )
+
+    assert result["terminal_exclusions"] == [
+        {"pid": 15009, "reason": "authoritative native exit during census"}
+    ]
+    assert result["relevant_processes"] == []
+
+
+def test_fresh_resource_scope_rejects_contradictory_exit_during_census(monkeypatch):
+    exited = {
+        "pid": 15010,
+        "creation": "creation-15010",
+        "state": "exited",
+        "exit_code": 259,
+        "exit_proof": {
+            "handle_state": "exited",
+            "authoritative_win32_process": "absent",
+            "creation": "creation-15010",
+        },
+        "source_provenance": {"authoritative_win32_process": "absent"},
+    }
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: exited)
+
+    with pytest.raises(RuntimeError, match="exit evidence is contradictory"):
+        release._fresh_resource_scope(
+            {
+                "processes": [{"pid": 15010, "name": "node.exe", "parent_pid": 1}],
+                "holders": [],
+                "ports": [],
+                "read_errors": [],
+            },
+            str(release.ROOT.resolve()),
+            scoped_ports={43123},
+        )
+
+
 def test_fresh_census_rejects_unreadable_replacement_identity(monkeypatch):
     contract = _fresh_census_contract(count=1, states={1: "reused"})
     monkeypatch.setattr(
@@ -3552,7 +3780,12 @@ def test_fresh_resource_scope_fails_for_inaccessible_holder_or_port_owner(monkey
     native = (release.SCRIPT_ROOT / release.HOST_NATIVE_MODULE).resolve().as_posix()
     resources = {
         "processes": [
-            {"pid": 15008, "name": "service.exe", "executable": "C:/tools/service.exe", "parent_pid": 1}
+            {
+                "pid": 15008,
+                "name": "DiscoverySrv.exe",
+                "executable": "C:/Program Files/Bitdefender Agent/DiscoverySrv.exe",
+                "parent_pid": 1,
+            }
         ],
         "holders": [{"pid": 15008, "module_paths": [native]}] if resource_field == "holder" else [],
         "ports": [{"pid": 15008, "port": 43123}] if resource_field == "port" else [],
@@ -3565,7 +3798,12 @@ def test_fresh_resource_scope_fails_for_inaccessible_holder_or_port_owner(monkey
     )
 
     with pytest.raises(RuntimeError, match="potentially relevant process identity failed: pid=15008"):
-        release._fresh_resource_scope(resources, str(release.ROOT.resolve()), scoped_ports={43123})
+        release._fresh_resource_scope(
+            resources,
+            str(release.ROOT.resolve()),
+            scoped_ports={43123},
+            preloaded_identities={15008: {"pid": 15008, "creation": "replacement-15008"}},
+        )
 
 
 def test_resource_scope_excludes_unrelated_protected_row_without_executable():
