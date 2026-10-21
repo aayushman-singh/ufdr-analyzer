@@ -2226,7 +2226,7 @@ def test_fresh_resource_scope_rejects_replacement_between_limited_and_full_reads
             preloaded_identities={15008: replacement},
         )
 
-    assert read_states == [(15008, None, False)]
+    assert read_states == [(15008, "replacement-15008", False)]
 
 
 def test_fresh_resource_scope_hydrates_matching_limited_replacement(monkeypatch):
@@ -4056,8 +4056,8 @@ def _release_hook_scope_identity(root, *, parent_pid=25200, child_creation="200"
         "native_command_sha256": hashlib.sha256(parent_command.encode()).hexdigest(),
     }
     identity = _resource_identity(
-        904,
-        cwd=root,
+        os.getpid(),
+        cwd="C:/JarvisDeploy/jarvis",
         executable=project_python,
         argv=[project_python, script, "prepare"],
         parent_observations=[parent],
@@ -4083,9 +4083,10 @@ def _scope_resources(identity):
     }
 
 
-def test_fresh_resource_scope_accepts_the_complete_current_release_hook_contract():
+def test_fresh_resource_scope_accepts_the_complete_current_release_hook_contract(monkeypatch):
     root = str(release.ROOT.resolve())
     identity = _release_hook_scope_identity(root)
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
 
     result = release._fresh_resource_scope(
         _scope_resources(identity),
@@ -4141,7 +4142,8 @@ def test_fresh_resource_scope_blocks_release_hook_lookalikes(tmp_path, monkeypat
     if identity["parent_observations"][0].get("pid") != identity["parent_pid"]:
         identity["parent_observations"][0]["pid"] = 25200
     monkeypatch.setattr(release, "EXTERNAL_PROOF_ROOT", tmp_path)
-    with pytest.raises(RuntimeError, match="unprotected product-root process"):
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
+    with pytest.raises(RuntimeError, match="current census observer identity"):
         release._fresh_resource_scope(
             _scope_resources(identity),
             root,
@@ -4163,6 +4165,35 @@ def test_fresh_resource_scope_rejects_an_incomplete_hook_identity(monkeypatch):
             scoped_ports=set(),
             preloaded_identities={identity["pid"]: identity},
         )
+
+
+def test_fresh_resource_scope_rejects_release_hook_generation_change_during_classification(monkeypatch):
+    root = str(release.ROOT.resolve())
+    identity = _release_hook_scope_identity(root)
+    changed = dict(identity)
+    changed["creation"] = "300"
+    reads = iter((identity, changed))
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: next(reads))
+
+    with pytest.raises(RuntimeError, match="identity changed during classification.*phase=after-classification"):
+        release._fresh_resource_scope(
+            _scope_resources(identity),
+            root,
+            scoped_ports=set(),
+            preloaded_identities={identity["pid"]: identity},
+        )
+
+
+def test_fresh_host_process_census_accepts_the_current_release_hook_observer(monkeypatch):
+    root = str(release.ROOT.resolve())
+    identity = _release_hook_scope_identity(root)
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
+    monkeypatch.setattr(release, "_enumerate_fresh_frontend_resources", lambda: _scope_resources(identity))
+
+    result = release._assert_fresh_host_process_census(_fresh_census_contract(count=0))
+
+    assert result["states"] == {}
+    assert result["unrelated_exclusions"] == []
 
 
 def test_resource_scope_rejects_raw_protection_flag_when_product_relation_is_measured():

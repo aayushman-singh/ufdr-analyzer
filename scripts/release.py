@@ -2703,6 +2703,11 @@ def _resource_process_is_relevant(
         return False
     if _identity_is_protected(identity, product_root):
         return False
+    if type(pid) is int and pid == os.getpid():
+        raise RuntimeError(
+            "release blocked: current census observer identity is not the exact release hook: "
+            f"pid={pid} executable={identity['executable']!r} cwd={identity_cwd!r}"
+        )
     if name in {"system", "system idle process", "registry"}:
         return False
     frontend = _canonical_windows_path_identity(Path(product_root) / "frontend")
@@ -2818,19 +2823,26 @@ def _identity_is_protected(identity: dict[str, Any], product_root: str) -> bool:
     command = str(identity.get("native_command") or "").casefold()
     argv = " ".join(str(value) for value in identity.get("argv", [])).casefold()
     cwd = identity.get("cwd")
-    if not cwd or not _path_is_within(cwd, product_root):
-        return False
     if executable not in {"python", "python.exe", "cmd", "cmd.exe", "node", "node.exe"}:
         return False
-    normalized_command = command.replace("\\", "/")
-    normalized_argv = argv.replace("\\", "/")
-    release_script_marker = "scripts/release.py" in normalized_command or "scripts/release.py" in normalized_argv
-    if release_script_marker:
-        expected_executable = _canonical_windows_path_identity(
-            SCRIPT_ROOT / ".venv" / "Scripts" / "python.exe"
-        )
-        expected_script = _canonical_windows_path_identity(Path(__file__).resolve())
-        child_argv = identity.get("argv")
+    expected_executable = _canonical_windows_path_identity(
+        SCRIPT_ROOT / ".venv" / "Scripts" / "python.exe"
+    )
+    expected_script = _canonical_windows_path_identity(Path(__file__).resolve())
+    child_argv = identity.get("argv")
+    release_hook_identity = (
+        type(identity.get("pid")) is int
+        and identity["pid"] == os.getpid()
+        and isinstance(cwd, str)
+        and bool(cwd.strip())
+        and _canonical_windows_path_identity(identity.get("executable", "")) == expected_executable
+        and isinstance(child_argv, list)
+        and len(child_argv) == 3
+        and _canonical_windows_path_identity(child_argv[0]) == expected_executable
+        and _canonical_windows_path_identity(child_argv[1]) == expected_script
+        and child_argv[2] in {"prepare", "observe", "execute", "verify"}
+    )
+    if release_hook_identity:
         child_creation = identity.get("creation")
         parent_pid = identity.get("parent_pid")
         if (
@@ -2883,6 +2895,8 @@ def _identity_is_protected(identity: dict[str, Any], product_root: str) -> bool:
                 continue
             return True
         return False
+    if not cwd or not _path_is_within(cwd, product_root):
+        return False
     protected_markers = (
         "pytest",
         "runpy",
@@ -2903,6 +2917,53 @@ def _identity_is_protected(identity: dict[str, Any], product_root: str) -> bool:
         ):
             return True
     return False
+
+
+def _assert_current_release_hook_generation(
+    identity: dict[str, Any],
+    *,
+    phase: str,
+) -> None:
+    """Recheck the running release hook before and after resource classification."""
+    pid = os.getpid()
+    if identity.get("pid") != pid:
+        raise RuntimeError(
+            "release blocked: current census observer identity has a conflicting PID: "
+            f"expected_pid={pid} identity_pid={identity.get('pid')!r} phase={phase}"
+        )
+    if not _identity_is_protected(identity, str(ROOT.resolve())):
+        raise RuntimeError(
+            "release blocked: current census observer identity is not the exact release hook: "
+            f"pid={pid} phase={phase}"
+        )
+    creation = identity.get("creation")
+    try:
+        current = _read_fresh_native_process_identity(
+            pid,
+            _NativeReadState(expected_creation=creation),
+        )
+    except (_FreshProcessAbsent, _FreshProcessUnreadable, RuntimeError) as exc:
+        raise RuntimeError(
+            "release blocked: current census observer identity could not be revalidated: "
+            f"pid={pid} phase={phase}: {exc}"
+        ) from exc
+    for field in (
+        "pid",
+        "creation",
+        "parent_pid",
+        "cwd",
+        "executable",
+        "native_command",
+        "argv",
+        "argv_sha256",
+        "native_command_sha256",
+        "parent_observations",
+    ):
+        if current.get(field) != identity.get(field):
+            raise RuntimeError(
+                "release blocked: current census observer identity changed during classification: "
+                f"pid={pid} phase={phase} field={field}"
+            )
 
 
 def _fresh_process_row_needs_identity(
@@ -2932,6 +2993,8 @@ def _fresh_process_row_needs_identity(
         return True, "exact native-module holder"
     if pid in scoped_port_owner_pids:
         return True, "scoped listening-port owner"
+    if type(pid) is int and pid == os.getpid():
+        return True, "current in-process census observer requires fresh identity"
     if _has_product_root_relation(item, product_root, identity=preloaded_identity):
         return True, "measured product-root relation requires fresh identity"
     if pid in protected_pids:
@@ -3386,7 +3449,9 @@ def _fresh_resource_scope(
                 else None
             )
             try:
-                identity = _read_fresh_native_process_identity(pid, _NativeReadState())
+                identity = _read_fresh_native_process_identity(
+                    pid, _NativeReadState(expected_creation=expected_preloaded_creation)
+                )
             except _FreshProcessAbsent as exc:
                 absence = {
                     "pid": pid,
@@ -3478,6 +3543,13 @@ def _fresh_resource_scope(
                 f"identity_parent_pid={identity.get('parent_pid')!r}"
             )
 
+    observer_pid = os.getpid()
+    observer_identity = identities.get(observer_pid)
+    if observer_identity is not None and not _has_complete_resource_identity(observer_identity):
+        observer_identity = None
+    if observer_identity is not None:
+        _assert_current_release_hook_generation(observer_identity, phase="before-classification")
+
     relevant_processes = []
     for pid in sorted(candidate_pids):
         identity = identities.get(pid)
@@ -3507,6 +3579,9 @@ def _fresh_resource_scope(
             },
         ):
             relevant_processes.append({"row": item, "identity": identity})
+
+    if observer_identity is not None:
+        _assert_current_release_hook_generation(observer_identity, phase="after-classification")
 
     holder_pids = set()
     for item in resources["holders"]:
