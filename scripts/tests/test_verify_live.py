@@ -2,6 +2,7 @@ import json
 import ctypes
 import contextvars
 from contextlib import contextmanager
+from datetime import datetime
 import errno
 import hashlib
 import os
@@ -26,8 +27,13 @@ import pytest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend"))
 import release
 import verify_live
+from ai.planner import plan_question
+from ai.query_pipeline import run_plan
+from db_setup import AleappArtifact, Message
+from sqlmodel import Session, SQLModel, create_engine
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -333,6 +339,7 @@ def _launch_process_tree(argv, *, cwd=None, env=None):
         "pid": process.pid,
         "owner_marker": launch_env["CITESPAN_TEST_PROCESS_OWNER"],
         "creation_identity": None,
+        "descendant_identities": {},
     }
     while True:
         try:
@@ -389,7 +396,7 @@ def _process_metadata(pid):
             )
         try:
             metadata = json.loads(result.stdout)
-            return {
+            metadata = {
                 "pid": int(metadata["ProcessId"]),
                 "parent_pid": int(metadata["ParentProcessId"]),
                 "creation": _windows_creation_token(pid),
@@ -397,6 +404,13 @@ def _process_metadata(pid):
                 "command": str(metadata.get("CommandLine") or ""),
                 "cwd": _windows_current_working_directory(pid),
             }
+            parsed = _windows_command_line_argv(metadata["command"])
+            metadata["argv"] = parsed
+            metadata["argv_sha256"] = hashlib.sha256("\0".join(parsed).encode("utf-8")).hexdigest()
+            metadata["native_command_sha256"] = hashlib.sha256(
+                metadata["command"].encode("utf-8")
+            ).hexdigest()
+            return metadata
         except ProcessIdentityReadError:
             raise
         except (KeyError, TypeError, ValueError, RuntimeError) as exc:
@@ -410,7 +424,7 @@ def _process_metadata(pid):
     try:
         stat_fields = (proc_root / "stat").read_text(encoding="utf-8").split()
         command = (proc_root / "cmdline").read_bytes().replace(b"\x00", b" ").decode(errors="replace").strip()
-        return {
+        metadata = {
             "pid": pid,
             "parent_pid": int(stat_fields[3]),
             "creation": stat_fields[21],
@@ -418,6 +432,11 @@ def _process_metadata(pid):
             "command": command,
             "cwd": str((proc_root / "cwd").resolve()),
         }
+        parsed = command.split()
+        metadata["argv"] = parsed
+        metadata["argv_sha256"] = hashlib.sha256("\0".join(parsed).encode("utf-8")).hexdigest()
+        metadata["native_command_sha256"] = hashlib.sha256(command.encode("utf-8")).hexdigest()
+        return metadata
     except (FileNotFoundError, OSError, ValueError) as exc:
         raise ProcessIdentityReadError(f"process identity lookup failed for pid {pid}: {exc}") from exc
 
@@ -586,6 +605,13 @@ def _current_process_tree(root_pid):
             }
             for item in selected
         }
+        for item in metadata.values():
+            parsed = _windows_command_line_argv(item["command"])
+            item["argv"] = parsed
+            item["argv_sha256"] = hashlib.sha256("\0".join(parsed).encode("utf-8")).hexdigest()
+            item["native_command_sha256"] = hashlib.sha256(
+                item["command"].encode("utf-8")
+            ).hexdigest()
     else:
         process_graph = {}
         for entry in Path("/proc").iterdir():
@@ -636,11 +662,13 @@ def _assert_owned_process_tree(process):
         raise RuntimeError("process cleanup denied: missing launch ownership record")
     current_root = _process_metadata(process.pid)
     recorded_root = owner["creation_identity"]
-    identity_keys = ("pid", "creation", "executable", "command", "cwd")
-    if any(current_root[key] != recorded_root[key] for key in identity_keys):
-        raise RuntimeError(
-            f"process cleanup denied: root identity changed; recorded={recorded_root} current={current_root}"
-        )
+    _assert_complete_process_identity(recorded_root, "recorded launch root")
+    _assert_complete_process_identity(current_root, "current launch root")
+    _assert_process_identity_matches(
+        recorded_root,
+        current_root,
+        "process cleanup denied: root identity changed",
+    )
     expected_cwd = _canonical_path_identity(owner["cwd"])
     current_cwd = _canonical_path_identity(current_root["cwd"])
     if not current_cwd:
@@ -656,22 +684,141 @@ def _assert_owned_process_tree(process):
             f"process cleanup denied: root command changed; expected={owner['argv']} current={current_root['command']}"
         )
     tree = _current_process_tree(process.pid)
-    if not tree or tree[0]["pid"] != process.pid:
+    if not tree:
         raise RuntimeError(f"process cleanup denied: owned root {process.pid} is not in the current process tree")
-    for item in tree[1:]:
-        if not item["executable"]:
-            raise RuntimeError(f"process cleanup denied: descendant {item['pid']} executable is unavailable")
-        item_cwd = _canonical_path_identity(item["cwd"])
-        if not item_cwd:
-            raise RuntimeError(f"process cleanup denied: descendant {item['pid']} worktree is unavailable")
-        if item_cwd != expected_cwd:
+    census_root = tree[0]
+    _assert_complete_process_identity(census_root, "census launch root")
+    _assert_process_identity_matches(
+        current_root,
+        census_root,
+        "process cleanup denied: census root identity changed",
+    )
+    if census_root["pid"] != process.pid:
+        raise RuntimeError(
+            f"process cleanup denied: census root PID changed; expected={process.pid} current={census_root['pid']}"
+        )
+    if census_root["parent_pid"] != recorded_root["parent_pid"]:
+        raise RuntimeError(
+            "process cleanup denied: census root parent relation changed; "
+            f"recorded={recorded_root['parent_pid']} current={census_root['parent_pid']}"
+        )
+    _assert_owned_tree_graph(tree, expected_cwd, census_root["pid"])
+    return _bind_census_parent_generations(tree, census_root["pid"])
+
+
+_PROCESS_IDENTITY_FIELDS = (
+    "pid",
+    "creation",
+    "executable",
+    "command",
+    "cwd",
+    "argv",
+    "argv_sha256",
+    "native_command_sha256",
+    "parent_pid",
+)
+
+
+def _assert_complete_process_identity(identity, label):
+    missing = [field for field in _PROCESS_IDENTITY_FIELDS if field not in identity]
+    if missing:
+        raise RuntimeError(f"process cleanup denied: {label} is incomplete; missing={missing} identity={identity}")
+    if not isinstance(identity["pid"], int) or isinstance(identity["pid"], bool):
+        raise RuntimeError(f"process cleanup denied: {label} has invalid PID; identity={identity}")
+    if not isinstance(identity["parent_pid"], int) or isinstance(identity["parent_pid"], bool):
+        raise RuntimeError(f"process cleanup denied: {label} has invalid parent PID; identity={identity}")
+    if not isinstance(identity["creation"], str) or not identity["creation"]:
+        raise RuntimeError(f"process cleanup denied: {label} has invalid creation identity; identity={identity}")
+    for field in ("executable", "command", "cwd"):
+        if not isinstance(identity[field], str) or not identity[field]:
+            raise RuntimeError(f"process cleanup denied: {label} has no {field} identity; identity={identity}")
+    if not isinstance(identity["argv"], list) or any(not isinstance(item, str) for item in identity["argv"]):
+        raise RuntimeError(f"process cleanup denied: {label} has invalid parsed argv; identity={identity}")
+    if hashlib.sha256("\0".join(identity["argv"]).encode("utf-8")).hexdigest() != identity["argv_sha256"]:
+        raise RuntimeError(f"process cleanup denied: {label} has incoherent parsed argv hash; identity={identity}")
+    if hashlib.sha256(identity["command"].encode("utf-8")).hexdigest() != identity["native_command_sha256"]:
+        raise RuntimeError(f"process cleanup denied: {label} has incoherent native command hash; identity={identity}")
+
+
+def _assert_process_identity_matches(expected, actual, label):
+    differences = {
+        field: {"expected": expected[field], "actual": actual[field]}
+        for field in _PROCESS_IDENTITY_FIELDS
+        if expected[field] != actual[field]
+    }
+    if differences:
+        raise RuntimeError(f"{label}; differences={differences}")
+
+
+def _bind_census_parent_generations(tree, root_pid):
+    """Attach each retained child edge to the parent generation in this census."""
+    by_pid = {item["pid"]: item for item in tree}
+    bound = []
+    for item in tree:
+        identity = dict(item)
+        if identity["pid"] != root_pid:
+            parent = by_pid.get(identity["parent_pid"])
+            if parent is None:
+                raise RuntimeError(
+                    "process cleanup denied: census child parent is missing; "
+                    f"pid={identity['pid']} parent_pid={identity['parent_pid']}"
+                )
+            if not isinstance(parent.get("creation"), str) or not parent["creation"]:
+                raise RuntimeError(
+                    "process cleanup denied: census parent generation is missing or malformed; "
+                    f"pid={identity['pid']} parent_pid={identity['parent_pid']} "
+                    f"parent_creation={parent.get('creation')!r}"
+                )
+            identity["parent_creation"] = parent["creation"]
+        bound.append(identity)
+    return bound
+
+
+def _assert_owned_tree_graph(tree, expected_cwd, root_pid):
+    by_pid = {}
+    for item in tree:
+        _assert_complete_process_identity(item, f"census identity pid={item.get('pid')}")
+        pid = item["pid"]
+        if pid in by_pid:
+            raise RuntimeError(f"process cleanup denied: census contains duplicate PID; pid={pid}")
+        by_pid[pid] = item
+        if _canonical_path_identity(item["cwd"]) != expected_cwd:
             raise RuntimeError(
-                f"process cleanup denied: descendant {item['pid']} left the product worktree "
-                f"expected={owner['cwd']} current={item['cwd']}"
+                f"process cleanup denied: process left the product worktree; pid={pid} "
+                f"expected={expected_cwd} current={item['cwd']}"
             )
-        if not item["command"]:
-            raise RuntimeError(f"process cleanup denied: descendant {item['pid']} has no command identity")
-    return tree
+    if root_pid not in by_pid:
+        raise RuntimeError(f"process cleanup denied: census root is missing; pid={root_pid}")
+
+    for pid, item in by_pid.items():
+        if pid == root_pid:
+            continue
+        parent = by_pid.get(item["parent_pid"])
+        if parent is not None and _creation_token_is_newer(parent["creation"], item["creation"]):
+            raise RuntimeError(
+                "process cleanup denied: child creation predates its recorded parent generation; "
+                f"pid={pid} child_creation={item['creation']} parent_pid={parent['pid']} "
+                f"parent_creation={parent['creation']}"
+            )
+
+    validated = {root_pid}
+    remaining = set(by_pid) - validated
+    while remaining:
+        progress = False
+        for pid in tuple(remaining):
+            parent_pid = by_pid[pid]["parent_pid"]
+            if parent_pid in validated:
+                if parent_pid == pid:
+                    raise RuntimeError(f"process cleanup denied: census contains a self-cycle; pid={pid}")
+                validated.add(pid)
+                remaining.remove(pid)
+                progress = True
+        if not progress:
+            parent_relations = {pid: by_pid[pid]["parent_pid"] for pid in sorted(remaining)}
+            raise RuntimeError(
+                "process cleanup denied: census contains a missing or cyclic parent relation; "
+                f"remaining={sorted(remaining)} parents={parent_relations}"
+            )
 
 
 def _canonical_path_identity(path):
@@ -997,7 +1144,16 @@ def _stop_verified_process_identities(identities, label, timeout, *, state_map=N
                 f"pid={pid} error={exc}"
             ) from exc
         phase_times["identity_read"] = phase_times.get("identity_read", 0.0) + time.monotonic() - identity_started
-        for field in ("creation", "executable", "command", "cwd", "parent_pid"):
+        for field in (
+            "creation",
+            "executable",
+            "command",
+            "cwd",
+            "parent_pid",
+            "argv",
+            "argv_sha256",
+            "native_command_sha256",
+        ):
             if current.get(field) != item.get(field):
                 raise RuntimeError(
                     f"{label} cleanup denied: identity changed before stop: pid={pid} "
@@ -1030,6 +1186,46 @@ def _stop_verified_process_identities(identities, label, timeout, *, state_map=N
     return terminal_states
 
 
+def _validate_recorded_descendant_edges(recorded_by_pid, root_pid, label):
+    """Validate retained parent generations before any recorded identity stop."""
+    for pid, identity in recorded_by_pid.items():
+        if pid == root_pid:
+            continue
+        parent_pid = identity.get("parent_pid")
+        parent_creation = identity.get("parent_creation")
+        if type(parent_pid) is not int:
+            raise RuntimeError(
+                f"{label} cleanup denied: retained parent edge is invalid: "
+                f"child_pid={pid} parent_pid={parent_pid!r} "
+                f"expected_parent_creation=<valid> observed_parent_creation={parent_creation!r} "
+                "cleanup_step=validate_recorded_parent_edge"
+            )
+        if not isinstance(parent_creation, str) or not parent_creation:
+            raise RuntimeError(
+                f"{label} cleanup denied: retained parent generation is missing or malformed: "
+                f"child_pid={pid} parent_pid={parent_pid} expected_parent_creation=<valid> "
+                f"observed_parent_creation={parent_creation!r} "
+                "cleanup_step=validate_recorded_parent_edge"
+            )
+        parent = recorded_by_pid.get(parent_pid)
+        if not isinstance(parent, dict):
+            raise RuntimeError(
+                f"{label} cleanup denied: retained parent identity is unknown: "
+                f"child_pid={pid} parent_pid={parent_pid} expected_parent_creation=<recorded-parent> "
+                f"observed_parent_creation={parent_creation!r} "
+                "cleanup_step=validate_recorded_parent_edge"
+            )
+        expected_parent_creation = parent.get("creation")
+        if parent_creation != expected_parent_creation:
+            raise RuntimeError(
+                f"{label} cleanup denied: retained parent generation does not match: "
+                f"child_pid={pid} parent_pid={parent_pid} "
+                f"expected_parent_creation={expected_parent_creation!r} "
+                f"observed_parent_creation={parent_creation!r} "
+                "cleanup_step=validate_recorded_parent_edge"
+            )
+
+
 def _terminate_process_tree(process, label, timeout=15, owned_port=None):
     if process is None:
         return ""
@@ -1040,7 +1236,17 @@ def _terminate_process_tree(process, label, timeout=15, owned_port=None):
             raise RuntimeError(f"{label} cleanup denied: exact root identity was not captured")
         deadline = time.monotonic() + timeout
         recorded_by_pid = {process.pid: dict(owner["creation_identity"])}
-        state_map = {process.pid: {"pid": process.pid, "state": "live", "creation": owner["creation_identity"]["creation"]}}
+        recorded_by_pid.update(
+            {
+                int(pid): dict(identity)
+                for pid, identity in owner.get("descendant_identities", {}).items()
+                if int(pid) != process.pid
+            }
+        )
+        state_map = {
+            pid: {"pid": pid, "state": "live", "creation": identity["creation"]}
+            for pid, identity in recorded_by_pid.items()
+        }
         phase_times = {}
         while True:
             census_started = time.monotonic()
@@ -1052,6 +1258,7 @@ def _terminate_process_tree(process, label, timeout=15, owned_port=None):
                 tree = [
                     item for pid, item in recorded_by_pid.items() if pid != process.pid
                 ]
+                _validate_recorded_descendant_edges(recorded_by_pid, process.pid, label)
                 state_map[process.pid] = {
                     "pid": process.pid,
                     "state": "already_exited",
@@ -1072,8 +1279,8 @@ def _terminate_process_tree(process, label, timeout=15, owned_port=None):
             )
             descendants = [
                 item
-                for item in tree
-                if item["pid"] != process.pid and state_map[item["pid"]]["state"] == "live"
+                for pid, item in recorded_by_pid.items()
+                if pid != process.pid and state_map[pid]["state"] == "live"
             ]
             if descendants:
                 remaining = deadline - time.monotonic()
@@ -1846,30 +2053,64 @@ class _FakeLocator:
         return "CiteSpan"
 
 
+def _canonical_query_response():
+    return {
+        "planner": "stub",
+        "rows": [
+            {
+                "source_table": "aleappartifact",
+                "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
+                "citations": [
+                    {
+                        "source_table": "aleappartifact",
+                        "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
+                        "column": "category",
+                        "snippet": "WhatsApp messages",
+                        "matched_value": "WhatsApp",
+                        "char_start": 0,
+                        "char_end": 8,
+                    }
+                ],
+            },
+            {
+                "source_table": "message",
+                "row_id": verify_live.CANONICAL_DEMO_MESSAGE_ROW_IDS[0],
+                "citations": [
+                    {
+                        "source_table": "message",
+                        "row_id": verify_live.CANONICAL_DEMO_MESSAGE_ROW_IDS[0],
+                        "column": "content",
+                        "snippet": "Can you send the bitcoin wallet address for the transfer?",
+                        "matched_value": "bitcoin",
+                        "char_start": 17,
+                        "char_end": 24,
+                    }
+                ],
+            },
+            {
+                "source_table": "message",
+                "row_id": verify_live.CANONICAL_DEMO_MESSAGE_ROW_IDS[1],
+                "citations": [
+                    {
+                        "source_table": "message",
+                        "row_id": verify_live.CANONICAL_DEMO_MESSAGE_ROW_IDS[1],
+                        "column": "content",
+                        "snippet": "Use the bank transfer reference for the synthetic sample.",
+                        "matched_value": "bank",
+                        "char_start": 8,
+                        "char_end": 12,
+                    }
+                ],
+            },
+        ],
+    }
+
+
 class _FakePage:
     def __init__(self):
         self.title_value = "CiteSpan"
         self.actions = []
-        self.query_response = {
-            "planner": "stub",
-            "rows": [
-                {
-                    "source_table": "aleappartifact",
-                    "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
-                    "citations": [
-                        {
-                            "source_table": "aleappartifact",
-                            "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
-                            "column": "filename",
-                            "snippet": "whatsapp_messages.csv",
-                            "matched_value": "whatsapp",
-                            "char_start": 0,
-                            "char_end": 8,
-                        }
-                    ]
-                }
-            ],
-        }
+        self.query_response = _canonical_query_response()
         self.request = _FakeRequest()
         self.url = ""
         self.reset_response_observed = False
@@ -1902,7 +2143,7 @@ class _FakePage:
             "#run-id": _FakeLocator(verify_live.CANONICAL_DEMO_RUN_ID),
             "#question": _FakeLocator(actions=self.actions, action=selector),
             "[data-testid='cited-result-row']": _FakeLocator(texts=["row"]),
-        ".cite": _FakeLocator(texts=["whatsapp"]),
+        ".cite": _FakeLocator(texts=["WhatsApp", "bitcoin", "bank"]),
             "text=chars ": _FakeLocator(texts=["chars 0-4"]),
         }
         return values.get(selector, _FakeLocator())
@@ -2045,7 +2286,8 @@ def test_browser_flow_proves_clean_session_and_cited_evidence(tmp_path):
     )
 
     assert result["query_response"]["planner"] == "stub"
-    assert result["query_response"]["rows"][0]["citations"][0]["matched_value"] == "whatsapp"
+    assert len(result["query_response"]["rows"]) == 3
+    assert result["query_response"]["rows"][0]["citations"][0]["matched_value"] == "WhatsApp"
     assert result["upload_status"] == 403
     assert result["ingestion_statuses"] == {
         "/api/ingest/": 403,
@@ -2055,6 +2297,7 @@ def test_browser_flow_proves_clean_session_and_cited_evidence(tmp_path):
     assert (tmp_path / "citespan-home.png").is_file()
     assert (tmp_path / "citespan-upload-disabled.png").is_file()
     assert (tmp_path / "citespan-query-results.png").is_file()
+    assert (tmp_path / "citespan-query-plan.png").is_file()
     assert (("button", "Create Account"), True) in page.actions
     assert (("button", "Reset to sample"), True) in page.actions
     assert page.reset_response_observed is True
@@ -2282,28 +2525,83 @@ def test_live_verification_default_output_is_script_relative():
 
 
 def test_citation_validation_requires_evidence_spans_and_offsets():
-    verify_live._validate_cited_response(
-        {
-            "planner": "stub",
-            "rows": [
-                {
-                    "source_table": "aleappartifact",
-                    "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
-                    "citations": [
-                        {
-                            "source_table": "aleappartifact",
-                            "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
-                            "column": "category",
-                            "snippet": "WhatsApp messages",
-                            "matched_value": "WhatsApp",
-                            "char_start": 0,
-                            "char_end": 8,
-                        }
-                    ]
-                }
-            ],
+    verify_live._validate_cited_response(_canonical_query_response())
+
+
+def test_default_question_executes_canonical_rows_with_transfer_citations(monkeypatch):
+    source = (ROOT / "scripts" / "verify_live.py").read_text(encoding="utf-8")
+    assert 'default="Show me all messages mentioning a transfer"' in source
+
+    monkeypatch.setenv("DEMO_MODE", "1")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine)
+    run_id = uuid.UUID(verify_live.CANONICAL_DEMO_RUN_ID)
+    artifact_id = uuid.UUID(verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID)
+    message_ids = [uuid.UUID(value) for value in verify_live.CANONICAL_DEMO_MESSAGE_ROW_IDS]
+    canonical_rows = verify_live.CANONICAL_EVIDENCE_MANIFEST["rows"]
+    artifact = canonical_rows[("aleappartifact", verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID)]["columns"]
+
+    with Session(engine) as session:
+        session.add(
+            AleappArtifact(
+                id=artifact_id,
+                run_id=run_id,
+                artifact_type="csv",
+                filename=artifact["filename"],
+                file_path=artifact["file_path"],
+                category=artifact["category"],
+                row_count=1,
+                data=artifact["data"],
+            )
+        )
+        session.add_all(
+            [
+                Message(
+                    id=message_ids[0],
+                    run_id=run_id,
+                    sender="+15551234567",
+                    receiver="+15559876543",
+                    timestamp=datetime(2024, 1, 1, 12, 0, 0),
+                    content=canonical_rows[("message", verify_live.CANONICAL_DEMO_MESSAGE_ROW_IDS[0])]["columns"]["content"],
+                ),
+                Message(
+                    id=message_ids[1],
+                    run_id=run_id,
+                    sender="+15559876543",
+                    receiver="+15551234567",
+                    timestamp=datetime(2024, 1, 1, 13, 0, 0),
+                    content=canonical_rows[("message", verify_live.CANONICAL_DEMO_MESSAGE_ROW_IDS[1])]["columns"]["content"],
+                ),
+            ]
+        )
+        session.commit()
+
+        plan, planner = plan_question("Show me all messages mentioning a transfer")
+        answer = run_plan(
+            session,
+            plan,
+            run_id,
+            question="Show me all messages mentioning a transfer",
+            planner=planner,
+        )
+        response = answer.to_dict()
+
+        assert planner == "stub"
+        assert {row["source_table"] for row in response["rows"]} == {"message", "aleappartifact"}
+        assert {uuid.UUID(row["row_id"]) for row in response["rows"]} == {
+            uuid.UUID(verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID),
+            *(uuid.UUID(value) for value in verify_live.CANONICAL_DEMO_MESSAGE_ROW_IDS),
         }
-    )
+        verify_live._validate_cited_response(response)
+
+        old_plan, old_planner = plan_question("Show me all WhatsApp messages mentioning a bank transfer")
+        old_answer = run_plan(session, old_plan, run_id, planner=old_planner)
+        assert old_planner == "stub"
+        assert [row.source_table for row in old_answer.rows] == ["aleappartifact"]
+        assert [uuid.UUID(row.row_id) for row in old_answer.rows] == [
+            uuid.UUID(verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID)
+        ]
 
 
 def test_citation_validation_rejects_results_without_evidence_spans():
@@ -2363,33 +2661,20 @@ def test_live_verification_validates_the_observed_query_response():
 
 
 def test_proof_writer_returns_exact_durable_paths_and_draft(tmp_path):
-    (tmp_path / "citespan-home.png").write_bytes(b"home")
-    (tmp_path / "citespan-query-results.png").write_bytes(b"results")
+    screenshot_names = [
+        "citespan-home.png",
+        "citespan-upload-disabled.png",
+        "citespan-query-plan.png",
+        "citespan-query-results.png",
+    ]
+    for name in screenshot_names:
+        (tmp_path / name).write_bytes(b"screenshot")
     result = verify_live._write_proof_artifacts(
         tmp_path,
         "https://citespan.example",
         "Show bank transfers",
-        ["citespan-home.png", "citespan-query-results.png"],
-        {
-            "planner": "stub",
-            "rows": [
-                {
-                    "source_table": "aleappartifact",
-                    "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
-                    "citations": [
-                        {
-                            "source_table": "aleappartifact",
-                            "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
-                            "column": "category",
-                            "snippet": "WhatsApp messages",
-                            "matched_value": "WhatsApp",
-                            "char_start": 0,
-                            "char_end": 8,
-                        }
-                    ]
-                }
-            ],
-        },
+        screenshot_names,
+        _canonical_query_response(),
         "citespan-test",
         ingestion_statuses={
             "/api/ingest/": 403,
@@ -2448,32 +2733,18 @@ def test_proof_writer_does_not_write_when_proof_is_incomplete(tmp_path):
 
 
 def test_proof_writer_rejects_missing_screenshot_files(tmp_path):
-    observed = {
-        "planner": "stub",
-        "rows": [
-            {
-                "source_table": "aleappartifact",
-                "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
-                "citations": [
-                    {
-                        "source_table": "aleappartifact",
-                        "row_id": verify_live.CANONICAL_DEMO_ARTIFACT_ROW_ID,
-                        "column": "category",
-                        "snippet": "WhatsApp messages",
-                        "matched_value": "WhatsApp",
-                        "char_start": 0,
-                        "char_end": 8,
-                    }
-                ]
-            }
-        ],
-    }
+    observed = _canonical_query_response()
     with pytest.raises(RuntimeError, match="existing browser screenshots"):
         verify_live._write_proof_artifacts(
             tmp_path,
             "https://citespan.example",
             "Q",
-            ["missing.png"],
+            [
+                "citespan-home.png",
+                "citespan-upload-disabled.png",
+                "citespan-query-plan.png",
+                "missing.png",
+            ],
             observed,
             "citespan-test",
             ingestion_statuses={
@@ -2560,6 +2831,7 @@ def test_citation_validation_accepts_canonical_artifact_columns_and_compact_uuid
             }
         ],
     }
+    response["rows"].extend(_canonical_query_response()["rows"][1:])
     verify_live._validate_cited_response(response)
 
 
@@ -2585,7 +2857,6 @@ def test_citation_validation_fails_closed_when_manifest_is_missing_or_ambiguous(
     monkeypatch.setattr(verify_live, "CANONICAL_EVIDENCE_MANIFEST", None)
     with pytest.raises(RuntimeError, match="canonical evidence manifest"):
         verify_live._validate_cited_response(_canonical_artifact_response())
-
     monkeypatch.setattr(
         verify_live,
         "CANONICAL_EVIDENCE_MANIFEST",
@@ -2598,6 +2869,37 @@ def test_citation_validation_fails_closed_when_manifest_is_missing_or_ambiguous(
     with pytest.raises(RuntimeError, match="canonical evidence manifest"):
         verify_live._validate_cited_response(_canonical_artifact_response())
 
+
+def test_citation_validation_rejects_partial_canonical_row_coverage():
+    with pytest.raises(RuntimeError, match="every canonical evidence row"):
+        verify_live._validate_cited_response(_canonical_artifact_response())
+
+
+def test_proof_writer_rejects_three_screenshots_even_when_files_exist(tmp_path):
+    for name in (
+        "citespan-home.png",
+        "citespan-upload-disabled.png",
+        "citespan-query-results.png",
+    ):
+        (tmp_path / name).write_bytes(b"screenshot")
+    with pytest.raises(RuntimeError, match="four distinct browser screenshots"):
+        verify_live._write_proof_artifacts(
+            tmp_path,
+            "https://citespan.example",
+            "Q",
+            [
+                "citespan-home.png",
+                "citespan-upload-disabled.png",
+                "citespan-query-results.png",
+            ],
+            _canonical_query_response(),
+            "citespan-test",
+            ingestion_statuses={
+                "/api/ingest/": 403,
+                "/api/ingest/validate-path": 403,
+                "/api/ingest/aleapp-structure": 403,
+            },
+        )
 
 def test_public_home_copy_states_the_verified_hosted_demo_limits():
     source = (ROOT / "frontend" / "app" / "page.tsx").read_text(encoding="utf-8")
@@ -4538,6 +4840,46 @@ def _frontend_candidate_tree(candidate, graph, expected_cwd):
     return tree
 
 
+def _refresh_owned_process_tree(process):
+    """Capture the exact live descendant set at a lifecycle synchronization point."""
+    owner = getattr(process, "_citespan_owner", None)
+    if owner is None:
+        raise RuntimeError("process ownership refresh denied: missing launch ownership record")
+    if not isinstance(owner.get("owner_marker"), str) or not owner["owner_marker"]:
+        raise RuntimeError("process ownership refresh denied: launch ownership marker is incomplete")
+    tree = _assert_owned_process_tree(process)
+    captured = owner.get("descendant_identities")
+    if not isinstance(captured, dict):
+        raise RuntimeError("process ownership refresh denied: recorded ownership map is incomplete")
+    candidate_identities = {}
+    by_pid = {item["pid"]: item for item in tree}
+    for item in tree:
+        identity = dict(item)
+        identity["launch_marker"] = owner["owner_marker"]
+        parent_pid = item["parent_pid"]
+        if item["pid"] != process.pid:
+            parent = by_pid.get(parent_pid)
+            if parent is None:
+                raise RuntimeError(
+                    "process ownership refresh denied: descendant parent is not in the validated census; "
+                    f"pid={item['pid']} parent_pid={parent_pid}"
+                )
+            identity["parent_creation"] = parent["creation"]
+        previous = captured.get(item["pid"])
+        if previous is not None:
+            _assert_complete_process_identity(previous, f"recorded identity pid={item['pid']}")
+            _assert_process_identity_matches(
+                previous,
+                item,
+                f"process ownership refresh denied: recorded identity changed for pid={item['pid']}",
+            )
+        candidate_identities[item["pid"]] = identity
+    if process.pid not in candidate_identities:
+        raise RuntimeError(f"process ownership refresh failed: root pid {process.pid} was not captured")
+    captured.update(candidate_identities)
+    return tuple(captured.values())
+
+
 def _frontend_additional_tree(record, graph, expected_cwd):
     current = _process_metadata(record["pid"])
     if current["creation"] != str(record["creation"]):
@@ -5406,10 +5748,193 @@ def _wait_for_http(url, process):
         try:
             with urlopen(url, timeout=2) as response:
                 if response.status == 200:
+                    _refresh_owned_process_tree(process)
                     return
         except OSError:
             time.sleep(0.25)
     raise RuntimeError(f"frontend did not become ready at {url}")
+
+
+def _owned_tree_test_identity(pid, creation, *, parent_pid, command=None, cwd="C:/work"):
+    command = command or f"python process-{pid}"
+    argv = command.split()
+    return {
+        "pid": pid,
+        "creation": creation,
+        "executable": "python.exe",
+        "command": command,
+        "cwd": cwd,
+        "argv": argv,
+        "argv_sha256": hashlib.sha256("\0".join(argv).encode("utf-8")).hexdigest(),
+        "native_command_sha256": hashlib.sha256(command.encode("utf-8")).hexdigest(),
+        "parent_pid": parent_pid,
+    }
+
+
+def _owned_tree_test_process(root, marker="launch-marker", descendants=None):
+    return SimpleNamespace(
+        pid=root["pid"],
+        _citespan_owner={
+            "cwd": root["cwd"],
+            "argv": root["argv"],
+            "effective_argv": root["argv"],
+            "pid": root["pid"],
+            "owner_marker": marker,
+            "creation_identity": root,
+            "descendant_identities": descendants or {},
+        },
+    )
+
+
+def _disable_platform_launch_contract_for_owned_tree_test(monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "_assert_windows_owned_command", lambda *_args: None)
+
+
+def test_owned_tree_refresh_rejects_root_reuse_before_recording(monkeypatch):
+    original_root = _owned_tree_test_identity(10, "original-root", parent_pid=1, command="python launch")
+    reused_root = _owned_tree_test_identity(10, "reused-root", parent_pid=1, command="python replacement")
+    unrelated_child = _owned_tree_test_identity(11, "foreign-child", parent_pid=10, command="python foreign")
+    process = _owned_tree_test_process(
+        original_root,
+        descendants={99: {"pid": 99, "creation": "preserved"}},
+    )
+    before = dict(process._citespan_owner["descendant_identities"])
+
+    _disable_platform_launch_contract_for_owned_tree_test(monkeypatch)
+    monkeypatch.setattr(sys.modules[__name__], "_process_metadata", lambda _pid: original_root)
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_current_process_tree",
+        lambda _pid: [reused_root, unrelated_child],
+    )
+
+    with pytest.raises(RuntimeError, match="census root identity changed"):
+        _refresh_owned_process_tree(process)
+
+    assert process._citespan_owner["descendant_identities"] == before
+
+
+def test_owned_tree_capture_retains_parent_generation_for_root_exit_cleanup(monkeypatch):
+    root = _owned_tree_test_identity(10, "9000", parent_pid=1, command="python launch")
+    child = _owned_tree_test_identity(11, "10000", parent_pid=10, command="python child")
+    process = _owned_tree_test_process(root)
+
+    _disable_platform_launch_contract_for_owned_tree_test(monkeypatch)
+    monkeypatch.setattr(sys.modules[__name__], "_process_metadata", lambda _pid: root)
+    monkeypatch.setattr(sys.modules[__name__], "_current_process_tree", lambda _pid: [root, child])
+
+    captured = _assert_owned_process_tree(process)
+
+    assert captured[1]["parent_creation"] == "9000"
+
+
+def test_owned_tree_refresh_records_only_a_valid_coherent_snapshot(monkeypatch):
+    root = _owned_tree_test_identity(10, "9000", parent_pid=1, command="python launch")
+    child = _owned_tree_test_identity(11, "10000", parent_pid=10, command="python child")
+    process = _owned_tree_test_process(root)
+    _disable_platform_launch_contract_for_owned_tree_test(monkeypatch)
+    monkeypatch.setattr(sys.modules[__name__], "_process_metadata", lambda _pid: root)
+    monkeypatch.setattr(sys.modules[__name__], "_current_process_tree", lambda _pid: [root, child])
+
+    captured = _refresh_owned_process_tree(process)
+
+    assert [item["pid"] for item in captured] == [10, 11]
+    assert process._citespan_owner["descendant_identities"][11]["parent_creation"] == "9000"
+    assert all(item["launch_marker"] == "launch-marker" for item in captured)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("executable", "other.exe", "root identity changed"),
+        ("command", "python changed", "root identity changed"),
+        ("cwd", "C:/other", "root identity changed"),
+        ("parent_pid", 77, "root identity changed"),
+    ],
+)
+def test_owned_tree_refresh_rejects_changed_root_identity(monkeypatch, field, value, message):
+    root = _owned_tree_test_identity(10, "root", parent_pid=1, command="python launch")
+    changed = dict(root)
+    changed[field] = value
+    if field == "command":
+        changed["argv"] = changed["command"].split()
+        changed["argv_sha256"] = hashlib.sha256("\0".join(changed["argv"]).encode("utf-8")).hexdigest()
+        changed["native_command_sha256"] = hashlib.sha256(changed["command"].encode("utf-8")).hexdigest()
+    process = _owned_tree_test_process(root)
+    _disable_platform_launch_contract_for_owned_tree_test(monkeypatch)
+    monkeypatch.setattr(sys.modules[__name__], "_process_metadata", lambda _pid: root)
+    monkeypatch.setattr(sys.modules[__name__], "_current_process_tree", lambda _pid: [changed])
+
+    with pytest.raises(RuntimeError, match=message):
+        _refresh_owned_process_tree(process)
+    assert process._citespan_owner["descendant_identities"] == {}
+
+
+def test_owned_tree_refresh_rejects_changed_child_parent_without_mutation(monkeypatch):
+    root = _owned_tree_test_identity(10, "root", parent_pid=1, command="python launch")
+    child = _owned_tree_test_identity(11, "child", parent_pid=99, command="python child")
+    process = _owned_tree_test_process(root, descendants={12: {"pid": 12, "creation": "keep"}})
+    before = dict(process._citespan_owner["descendant_identities"])
+    _disable_platform_launch_contract_for_owned_tree_test(monkeypatch)
+    monkeypatch.setattr(sys.modules[__name__], "_process_metadata", lambda _pid: root)
+    monkeypatch.setattr(sys.modules[__name__], "_current_process_tree", lambda _pid: [root, child])
+
+    with pytest.raises(RuntimeError, match="missing or cyclic parent relation"):
+        _refresh_owned_process_tree(process)
+    assert process._citespan_owner["descendant_identities"] == before
+
+
+def test_owned_tree_refresh_rejects_child_older_than_reused_parent_without_mutation(monkeypatch):
+    root = _owned_tree_test_identity(10, "9000", parent_pid=1, command="python launch")
+    old_child = _owned_tree_test_identity(11, "8000", parent_pid=10, command="python child")
+    process = _owned_tree_test_process(root, descendants={12: {"pid": 12, "creation": "keep"}})
+    before = dict(process._citespan_owner["descendant_identities"])
+    _disable_platform_launch_contract_for_owned_tree_test(monkeypatch)
+    monkeypatch.setattr(sys.modules[__name__], "_process_metadata", lambda _pid: root)
+    monkeypatch.setattr(sys.modules[__name__], "_current_process_tree", lambda _pid: [root, old_child])
+
+    with pytest.raises(RuntimeError, match="child creation predates its recorded parent generation"):
+        _refresh_owned_process_tree(process)
+
+    assert process._citespan_owner["descendant_identities"] == before
+
+
+def test_owned_tree_refresh_rejects_child_pid_reuse_without_mutation(monkeypatch):
+    root = _owned_tree_test_identity(10, "9000", parent_pid=1, command="python launch")
+    child = _owned_tree_test_identity(11, "11000", parent_pid=10, command="python child")
+    previous_child = _owned_tree_test_identity(11, "10000", parent_pid=10, command="python child")
+    process = _owned_tree_test_process(root, descendants={11: previous_child})
+    _disable_platform_launch_contract_for_owned_tree_test(monkeypatch)
+    monkeypatch.setattr(sys.modules[__name__], "_process_metadata", lambda _pid: root)
+    monkeypatch.setattr(sys.modules[__name__], "_current_process_tree", lambda _pid: [root, child])
+
+    with pytest.raises(RuntimeError, match="recorded identity changed for pid=11"):
+        _refresh_owned_process_tree(process)
+    assert process._citespan_owner["descendant_identities"][11] == previous_child
+
+
+@pytest.mark.parametrize("field", ["argv_sha256", "native_command_sha256"])
+def test_owned_tree_refresh_rejects_incoherent_root_hash(monkeypatch, field):
+    root = _owned_tree_test_identity(10, "root", parent_pid=1, command="python launch")
+    changed = dict(root)
+    changed[field] = "not-the-measured-hash"
+    process = _owned_tree_test_process(root)
+    _disable_platform_launch_contract_for_owned_tree_test(monkeypatch)
+    monkeypatch.setattr(sys.modules[__name__], "_process_metadata", lambda _pid: root)
+    monkeypatch.setattr(sys.modules[__name__], "_current_process_tree", lambda _pid: [changed])
+
+    with pytest.raises(RuntimeError, match="incoherent"):
+        _refresh_owned_process_tree(process)
+    assert process._citespan_owner["descendant_identities"] == {}
+
+
+def test_owned_tree_refresh_requires_the_launch_marker(monkeypatch):
+    root = _owned_tree_test_identity(10, "root", parent_pid=1, command="python launch")
+    process = _owned_tree_test_process(root, marker="")
+
+    with pytest.raises(RuntimeError, match="launch ownership marker is incomplete"):
+        _refresh_owned_process_tree(process)
+    assert process._citespan_owner["descendant_identities"] == {}
 
 
 def test_process_tree_cleanup_uses_controlled_terminal_identity_state(monkeypatch):
@@ -5477,6 +6002,156 @@ def test_process_tree_cleanup_drains_a_late_owned_descendant(monkeypatch):
     _terminate_process_tree(Process(), "late descendant fixture")
 
     assert stopped == [11, 12, 10]
+
+
+def test_process_tree_cleanup_uses_recorded_descendants_after_root_exit(monkeypatch):
+    root = {"pid": 10, "creation": "root"}
+    child = {
+        "pid": 11,
+        "creation": "child",
+        "parent_pid": 10,
+        "parent_creation": "root",
+    }
+    owner = {
+        "creation_identity": root,
+        "owner_marker": "launch-marker",
+        "descendant_identities": {11: {**child, "launch_marker": "launch-marker"}},
+    }
+    stopped = []
+
+    class Process:
+        pid = 10
+        _citespan_owner = owner
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout):
+            return None
+
+    def stopped_identities(identities, _label, _timeout, **_kwargs):
+        stopped.extend(item["pid"] for item in identities)
+        return [{"pid": item["pid"], "state": "already_exited"} for item in identities]
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_assert_owned_process_tree",
+        lambda _process: (_ for _ in ()).throw(ProcessIdentityAbsent("root exited")),
+    )
+    monkeypatch.setattr(sys.modules[__name__], "_stop_verified_process_identities", stopped_identities)
+    monkeypatch.setattr(sys.modules[__name__], "_read_process_output", lambda *_args, **_kwargs: "")
+
+    _terminate_process_tree(Process(), "recorded descendant fixture")
+
+    assert stopped == [11, 10]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("parent_creation", None, "missing or malformed"),
+        ("parent_creation", "reused-root", "does not match"),
+    ],
+)
+def test_process_tree_cleanup_rejects_invalid_recorded_parent_generation_before_stop(
+    monkeypatch, field, value, message
+):
+    root = {"pid": 10, "creation": "root"}
+    child = {
+        "pid": 11,
+        "creation": "child",
+        "parent_pid": 10,
+        "parent_creation": "root",
+    }
+    child[field] = value
+    owner = {
+        "creation_identity": root,
+        "owner_marker": "launch-marker",
+        "descendant_identities": {11: {**child, "launch_marker": "launch-marker"}},
+    }
+    stopped = []
+
+    class Process:
+        pid = 10
+        _citespan_owner = owner
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout):
+            raise AssertionError("root wait must not run after validation failure")
+
+    def stop(identities, _label, _timeout, **_kwargs):
+        stopped.extend(item["pid"] for item in identities)
+        raise AssertionError("stop must not run after validation failure")
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_assert_owned_process_tree",
+        lambda _process: (_ for _ in ()).throw(ProcessIdentityAbsent("root exited")),
+    )
+    monkeypatch.setattr(sys.modules[__name__], "_stop_verified_process_identities", stop)
+
+    with pytest.raises(RuntimeError, match=message):
+        _terminate_process_tree(Process(), "invalid recorded edge fixture")
+
+    assert stopped == []
+    assert owner["descendant_identities"] == {11: {**child, "launch_marker": "launch-marker"}}
+
+
+def test_process_tree_cleanup_does_not_bind_recorded_child_to_reused_parent_generation(monkeypatch):
+    root = {"pid": 10, "creation": "root"}
+    replacement_parent = {
+        "pid": 12,
+        "creation": "new-parent",
+        "parent_pid": 10,
+        "parent_creation": "root",
+    }
+    child = {
+        "pid": 11,
+        "creation": "child",
+        "parent_pid": 12,
+        "parent_creation": "old-parent",
+    }
+    owner = {
+        "creation_identity": root,
+        "owner_marker": "launch-marker",
+        "descendant_identities": {
+            12: {**replacement_parent, "launch_marker": "launch-marker"},
+            11: {**child, "launch_marker": "launch-marker"},
+        },
+    }
+    stopped = []
+
+    class Process:
+        pid = 10
+        _citespan_owner = owner
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout):
+            raise AssertionError("root wait must not run after validation failure")
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_assert_owned_process_tree",
+        lambda _process: (_ for _ in ()).throw(ProcessIdentityAbsent("root exited")),
+    )
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_stop_verified_process_identities",
+        lambda identities, *_args, **_kwargs: stopped.extend(item["pid"] for item in identities),
+    )
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        _terminate_process_tree(Process(), "reused parent fixture")
+
+    assert stopped == []
+    assert owner["descendant_identities"] == {
+        12: {**replacement_parent, "launch_marker": "launch-marker"},
+        11: {**child, "launch_marker": "launch-marker"},
+    }
 
 
 def test_process_tree_cleanup_stops_a_seven_level_chain_leaf_first(monkeypatch):

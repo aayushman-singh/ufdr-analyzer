@@ -192,6 +192,36 @@ def _command_contains_path(command: str, target: object) -> bool:
     return False
 
 
+def _has_product_root_relation(
+    item: dict[str, Any],
+    product_root: str,
+    *,
+    identity: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether measured row or complete identity names the product root."""
+    if _path_is_within(item.get("cwd", ""), product_root) or _path_is_within(
+        item.get("executable", ""), product_root
+    ):
+        return True
+
+    command = item.get("command")
+    if isinstance(command, str):
+        tokens = [
+            next(part for part in token if part).rstrip(",;")
+            for token in re.findall(r'"([^"]+)"|([^\s]+)', command)
+        ]
+        if any(_path_is_within(token, product_root) for token in tokens):
+            return True
+
+    if not _has_complete_resource_identity(identity):
+        return False
+    if _path_is_within(identity["cwd"], product_root) or _path_is_within(
+        identity["executable"], product_root
+    ):
+        return True
+    return any(_path_is_within(argument, product_root) for argument in identity["argv"])
+
+
 def _read_host_evidence(root: Path, filename: str) -> Any:
     value, _ = _read_host_evidence_with_bytes(root, filename)
     return value
@@ -2566,6 +2596,10 @@ def _resource_process_is_relevant(
     product_root: str,
     *,
     identity: dict[str, Any] | None = None,
+    positive_product_relation: bool = False,
+    native_holder_module_paths: tuple[str, ...] = (),
+    scoped_port_records: tuple[tuple[int, int], ...] = (),
+    protected_relation: dict[str, Any] | None = None,
 ) -> bool:
     """Classify one process from one complete fresh identity and row."""
     if not isinstance(item, dict):
@@ -2652,7 +2686,20 @@ def _resource_process_is_relevant(
     identity_cwd = str(identity["cwd"])
     identity_argv = [str(value) for value in identity["argv"]]
     name = Path(str(item.get("name") or identity_executable)).name.casefold()
+    has_measured_native_holder = bool(native_holder_module_paths)
+    has_measured_scoped_port_owner = bool(scoped_port_records)
+    if has_measured_native_holder or has_measured_scoped_port_owner:
+        return True
+    measured_product_relation = positive_product_relation or _has_product_root_relation(
+        item, product_root, identity=identity
+    )
     if item.get("protected_or_unrelated_state") in {"protected", "unrelated"}:
+        if measured_product_relation:
+            raise RuntimeError(
+                "release blocked: protected or unrelated process retains a positive "
+                "product-root relation: "
+                f"pid={pid} cwd={identity_cwd!r} executable={identity['executable']!r}"
+            )
         return False
     if _identity_is_protected(identity, product_root):
         return False
@@ -2707,17 +2754,53 @@ def _resource_process_is_relevant(
         for port in item.get("ports", [])
     )
     if known_type and not name.startswith("python") and (
-        (has_frontend_role and has_frontend_cwd) or has_checked_wrapper_relation or has_scoped_port
+        (has_frontend_role and has_frontend_cwd)
+        or has_checked_wrapper_relation
+        or has_scoped_port
     ):
         return True
-    if known_type and name.startswith("python"):
-        if _path_is_within(identity_cwd, product_root) or any(
-            _path_is_within(argument, product_root) for argument in identity_argv[1:]
-        ):
-            raise RuntimeError(
-                "release blocked: unprotected product-root process remains: "
-                f"pid={pid} executable={identity['executable']!r} cwd={identity_cwd!r}"
+    if known_type and name.startswith("python") and (
+        _path_is_within(identity_cwd, product_root)
+        or any(_path_is_within(argument, product_root) for argument in identity_argv[1:])
+    ):
+        raise RuntimeError(
+            "release blocked: unprotected product-root process remains: "
+            f"pid={pid} executable={identity['executable']!r} cwd={identity_cwd!r}"
+        )
+    if measured_product_relation:
+        original_error = RuntimeError(
+            "release blocked: selected process retains a positive product-root relation "
+            "but current identity does not establish a supported product resource relation"
+        )
+        try:
+            raise original_error
+        except RuntimeError:
+            original_traceback = traceback.format_exc()
+        try:
+            evidence_path, evidence_digest = _record_private_resource_scope_failure(
+                item=item,
+                identity=identity,
+                native_holder_module_paths=native_holder_module_paths,
+                scoped_port_records=scoped_port_records,
+                product_root=product_root,
+                positive_product_relation=positive_product_relation,
+                measured_product_relation=measured_product_relation,
+                protected_relation=protected_relation,
+                failed_step="_resource_process_is_relevant.unsupported_positive_product_relation",
+                original_error=original_error,
+                original_traceback=original_traceback,
             )
+        except Exception as diagnostic_error:
+            raise RuntimeError(
+                "release blocked: unsupported positive product-root relation diagnostic failed "
+                f"for pid={pid}; original_failure={type(original_error).__name__}; "
+                f"diagnostic_failure={type(diagnostic_error).__name__}"
+            ) from original_error
+        raise RuntimeError(
+            "release blocked: unsupported positive product-root relation "
+            f"for pid={pid}; private_evidence={evidence_path}; evidence_digest={evidence_digest}"
+        ) from original_error
+    if known_type and name.startswith("python"):
         return False
     if known_type:
         return False
@@ -2765,15 +2848,15 @@ def _identity_is_protected(identity: dict[str, Any], product_root: str) -> bool:
 def _fresh_process_row_needs_identity(
     item: dict[str, Any],
     *,
+    product_root: str,
     native_holder_pids: set[int],
     scoped_port_owner_pids: set[int],
     protected_pids: set[int],
+    preloaded_identity: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
     """Select rows for full identity reads from measured current evidence."""
     pid = item.get("pid")
-    if type(pid) is int and pid in (0, 4):
-        return False, "Windows system sentinel"
-    if not _is_positive_pid(pid):
+    if not _is_process_pid(pid):
         raise RuntimeError("release blocked: fresh process relevance has an invalid PID")
     parent_pid = item.get("parent_pid")
     if not _is_parent_pid(parent_pid):
@@ -2781,10 +2864,16 @@ def _fresh_process_row_needs_identity(
             "release blocked: fresh process relevance has an invalid or missing parent PID: "
             f"pid={pid} parent_pid={parent_pid!r}"
         )
+    if pid in (0, 4):
+        return False, "Windows system sentinel"
+    if not _is_positive_pid(pid):
+        raise RuntimeError("release blocked: fresh process relevance has an invalid PID")
     if pid in native_holder_pids:
         return True, "exact native-module holder"
     if pid in scoped_port_owner_pids:
         return True, "scoped listening-port owner"
+    if _has_product_root_relation(item, product_root, identity=preloaded_identity):
+        return True, "measured product-root relation requires fresh identity"
     if pid in protected_pids:
         return False, "verified protected ancestry"
     if item.get("protected_or_unrelated_state") in {"protected", "unrelated"}:
@@ -3110,7 +3199,14 @@ def _fresh_resource_scope(
         if not isinstance(item, dict):
             raise RuntimeError("release blocked: fresh process census contains a non-object row")
         pid = item.get("pid")
-        if type(pid) is int and pid in (0, 4):
+        if not _is_process_pid(pid):
+            raise RuntimeError(f"release blocked: fresh process relevance has an invalid PID: pid={pid!r}")
+        parent_pid = item.get("parent_pid")
+        if not _is_parent_pid(parent_pid):
+            raise RuntimeError(
+                f"release blocked: fresh process relevance has an invalid or missing parent PID: pid={pid} parent_pid={parent_pid!r}"
+            )
+        if pid in (0, 4):
             continue
         if not _is_positive_pid(pid):
             raise RuntimeError(f"release blocked: fresh process relevance has an invalid PID: pid={pid!r}")
@@ -3126,14 +3222,10 @@ def _fresh_resource_scope(
             )
         process_rows_by_pid[pid] = item
         all_process_pids.add(pid)
-        parent_pid = item.get("parent_pid")
-        if not _is_parent_pid(parent_pid):
-            raise RuntimeError(
-                f"release blocked: fresh process relevance has an invalid or missing parent PID: pid={pid} parent_pid={parent_pid!r}"
-            )
 
     native_path = _host_path_identity((SCRIPT_ROOT / HOST_NATIVE_MODULE).resolve())
     native_holder_pids = set()
+    native_holder_module_paths_by_pid: dict[int, tuple[str, ...]] = {}
     for item in resources["holders"]:
         if not isinstance(item, dict) or not _is_positive_pid(item.get("pid")):
             raise RuntimeError("release blocked: fresh native holder identity is unreadable")
@@ -3143,14 +3235,27 @@ def _fresh_resource_scope(
                 "release blocked: fresh resource census is unstable or unreadable; "
                 f"native holder modules are unreadable: pid={item.get('pid')}"
             )
-        if any(isinstance(path, str) and _host_path_identity(path) == native_path for path in module_paths):
+        matched_paths = tuple(
+            path for path in module_paths
+            if isinstance(path, str) and _host_path_identity(path) == native_path
+        )
+        if matched_paths:
             native_holder_pids.add(item["pid"])
+            native_holder_module_paths_by_pid[item["pid"]] = (
+                native_holder_module_paths_by_pid.get(item["pid"], ()) + matched_paths
+            )
     port_records = _resource_port_records(resources["ports"])
     scoped_port_owner_pids = {
         owner for port, owner in port_records if port in scoped_ports and owner is not None
     }
+    scoped_port_records_by_pid: dict[int, tuple[tuple[int, int], ...]] = {}
+    for port, owner in port_records:
+        if port in scoped_ports and owner is not None:
+            scoped_port_records_by_pid.setdefault(owner, tuple())
+            scoped_port_records_by_pid[owner] += ((port, owner),)
     identities = dict(preloaded_identities or {})
     terminal_exclusions = []
+    private_diagnostics = []
     try:
         protected.update(
             _bind_verified_protected_service(resources, process_rows_by_pid, identities)
@@ -3164,6 +3269,7 @@ def _fresh_resource_scope(
         ) from exc
     candidate_pids = native_holder_pids | scoped_port_owner_pids
     unrelated_exclusions = []
+    positive_product_relation_pids: set[int] = set()
     for item in resources["processes"]:
         pid = item.get("pid")
         if type(pid) is int and pid in (0, 4):
@@ -3173,14 +3279,22 @@ def _fresh_resource_scope(
             raise RuntimeError(f"release blocked: fresh process relevance has an invalid PID: pid={pid!r}")
         needs_identity, reason = _fresh_process_row_needs_identity(
             item,
+            product_root=product_root,
             native_holder_pids=native_holder_pids,
             scoped_port_owner_pids=scoped_port_owner_pids,
             protected_pids=protected,
+            preloaded_identity=identities.get(pid) or item.get("current_identity"),
         )
         if not needs_identity:
             unrelated_exclusions.append({"pid": pid, "reason": reason})
             continue
         candidate_pids.add(pid)
+        if _has_product_root_relation(
+            item,
+            product_root,
+            identity=identities.get(pid) or item.get("current_identity"),
+        ):
+            positive_product_relation_pids.add(pid)
 
     for pid in sorted(candidate_pids):
         if pid not in process_rows_by_pid:
@@ -3213,7 +3327,57 @@ def _fresh_resource_scope(
             )
             try:
                 identity = _read_fresh_native_process_identity(pid, _NativeReadState())
-            except (_FreshProcessAbsent, _FreshProcessUnreadable) as exc:
+            except _FreshProcessAbsent as exc:
+                absence = {
+                    "pid": pid,
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                try:
+                    evidence_path, evidence_digest = _record_private_resource_scope_failure(
+                        item=process_rows_by_pid[pid],
+                        identity=None,
+                        native_holder_module_paths=native_holder_module_paths_by_pid.get(pid, ()),
+                        scoped_port_records=scoped_port_records_by_pid.get(pid, ()),
+                        product_root=product_root,
+                        positive_product_relation=pid in positive_product_relation_pids,
+                        measured_product_relation=pid in positive_product_relation_pids,
+                        protected_relation={
+                            "pid": pid,
+                            "protected": pid in protected,
+                            "protected_pids": sorted(protected),
+                        },
+                        failed_step="_fresh_resource_scope.full_identity_hydration",
+                        original_error=exc,
+                        original_traceback=traceback.format_exc(),
+                        native_absence=absence,
+                    )
+                except Exception as diagnostic_error:
+                    raise RuntimeError(
+                        "release blocked: native process absence diagnostic failed "
+                        f"for pid={pid}; diagnostic_failure={type(diagnostic_error).__name__}"
+                    ) from exc
+                if pid in native_holder_pids or pid in scoped_port_owner_pids:
+                    raise RuntimeError(
+                        "release blocked: fresh resource owner became absent during census: "
+                        f"pid={pid} native_holder={pid in native_holder_pids} "
+                        f"scoped_port_owner={pid in scoped_port_owner_pids}; "
+                        f"private_evidence={evidence_path}; evidence_digest={evidence_digest}"
+                    ) from exc
+                identities.pop(pid, None)
+                terminal_exclusions.append(
+                    {"pid": pid, "reason": "explicit native absence during census"}
+                )
+                private_diagnostics.append(
+                    {
+                        "pid": pid,
+                        "kind": "native_absence",
+                        "path": str(evidence_path),
+                        "digest": evidence_digest,
+                    }
+                )
+                continue
+            except _FreshProcessUnreadable as exc:
                 raise RuntimeError(
                     "release blocked: fresh resource census is unstable or unreadable; "
                     f"potentially relevant process identity failed: pid={pid}: {exc}"
@@ -3262,10 +3426,26 @@ def _fresh_resource_scope(
         item = process_rows_by_pid.get(pid)
         if item is None:
             continue
-        if pid in protected and pid not in (native_holder_pids | scoped_port_owner_pids):
+        if (
+            pid in protected
+            and pid not in (native_holder_pids | scoped_port_owner_pids)
+            and pid not in positive_product_relation_pids
+        ):
             protected.add(pid)
             continue
-        if _resource_process_is_relevant(item, product_root, identity=identity):
+        if _resource_process_is_relevant(
+            item,
+            product_root,
+            identity=identity,
+            positive_product_relation=pid in positive_product_relation_pids,
+            native_holder_module_paths=native_holder_module_paths_by_pid.get(pid, ()),
+            scoped_port_records=scoped_port_records_by_pid.get(pid, ()),
+            protected_relation={
+                "pid": pid,
+                "protected": pid in protected,
+                "protected_pids": sorted(protected),
+            },
+        ):
             relevant_processes.append({"row": item, "identity": identity})
 
     holder_pids = set()
@@ -3300,11 +3480,14 @@ def _fresh_resource_scope(
         "relevant_processes": relevant_processes,
         "holder_pids": holder_pids,
         "native_holder_pids": native_holder_pids,
+        "native_holder_module_paths_by_pid": native_holder_module_paths_by_pid,
         "port_records": port_records,
+        "scoped_port_records_by_pid": scoped_port_records_by_pid,
         "port_owner_identities": port_owner_identities,
         "protected_pids": protected,
         "unrelated_exclusions": unrelated_exclusions,
         "terminal_exclusions": terminal_exclusions,
+        "private_diagnostics": private_diagnostics,
         "all_process_pids": all_process_pids,
     }
 
@@ -3449,6 +3632,7 @@ def _assert_fresh_host_process_census(contract: dict[str, Any]) -> dict[str, Any
         "terminal_states": terminal_states,
         "transition_diagnostics": transition_diagnostics,
         "terminal_exclusions": resource_scope["terminal_exclusions"],
+        "private_diagnostics": resource_scope["private_diagnostics"],
         "resources": resources,
         "port_owner_identities": port_owner_identities,
         "unrelated_exclusions": unrelated_exclusions,
@@ -4396,6 +4580,92 @@ def _record_private_provisioning_failure(
     return evidence_path
 
 
+def _record_private_resource_scope_failure(
+    *,
+    item: dict[str, Any],
+    identity: dict[str, Any] | None,
+    native_holder_module_paths: tuple[str, ...],
+    scoped_port_records: tuple[tuple[int, int], ...],
+    product_root: str,
+    positive_product_relation: bool,
+    measured_product_relation: bool,
+    protected_relation: dict[str, Any] | None,
+    failed_step: str,
+    original_error: BaseException,
+    original_traceback: str,
+    native_absence: dict[str, Any] | None = None,
+) -> tuple[Path, str]:
+    """Retain complete private evidence for an unsupported resource relation."""
+    evidence_root = (EXTERNAL_PROOF_ROOT / "resource-scope-failures").expanduser().resolve()
+    if evidence_root == ROOT or ROOT in evidence_root.parents:
+        raise RuntimeError("resource scope evidence must be outside the product checkout")
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    os.chmod(evidence_root, 0o700)
+    source_path = Path(__file__).resolve()
+    source_bytes = source_path.read_bytes()
+    try:
+        source_revision = _git("rev-parse", "HEAD")
+    except Exception as exc:
+        raise RuntimeError("resource scope evidence could not read source revision") from exc
+    evidence = {
+        "schema": "citespan.resource-scope-failure.v1",
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "failed_step": failed_step,
+        "product_root": product_root,
+        "selected_relation": {
+            "positive_product_relation": positive_product_relation,
+            "measured_product_relation": measured_product_relation,
+            "source": "raw row, selected identity, and scope facts",
+        },
+        "protected_relation": protected_relation,
+        "raw_process_row": item,
+        "complete_current_identity": identity,
+        "native_absence": native_absence,
+        "native_holder_module_paths": list(native_holder_module_paths),
+        "scoped_port_records": [list(record) for record in scoped_port_records],
+        "identity_binding": {
+            "pid": identity.get("pid") if identity else None,
+            "creation": identity.get("creation") if identity else None,
+            "parent_pid": identity.get("parent_pid") if identity else None,
+            "parent_observations": identity.get("parent_observations") if identity else None,
+            "native_command": identity.get("native_command") if identity else None,
+            "native_command_sha256": identity.get("native_command_sha256") if identity else None,
+            "argv": identity.get("argv") if identity else None,
+            "argv_sha256": identity.get("argv_sha256") if identity else None,
+        },
+        "source": {
+            "revision": source_revision,
+            "artifact": str(source_path),
+            "artifact_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        },
+        "original_failure": {
+            "type": type(original_error).__name__,
+            "message": str(original_error),
+            "traceback": original_traceback,
+        },
+    }
+    payload = (json.dumps(evidence, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    descriptor, temporary_path = tempfile.mkstemp(
+        dir=evidence_root, prefix=".resource-scope-", suffix=".tmp"
+    )
+    final_path = evidence_root / f"unsupported-positive-relation-{uuid.uuid4().hex}.json"
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, final_path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+    return final_path, hashlib.sha256(payload).hexdigest()
+
+
 def _bounded_subprocess_text(value: object) -> str:
     if value is None:
         return ""
@@ -4810,28 +5080,129 @@ def _host_installer_descendants(root_pid: int) -> list[int]:
             raise RuntimeError("release blocked: installer descendant census contains an invalid row")
         pid = row.get("pid")
         parent_pid = row.get("parent_pid")
-        if isinstance(pid, bool) or not isinstance(pid, int) or pid < 0:
-            raise RuntimeError("release blocked: installer descendant census has an invalid PID")
-        if pid == 0:
+        if not _is_process_pid(pid):
+            raise RuntimeError(
+                "release blocked: installer descendant census has an invalid PID: "
+                f"pid={pid!r}"
+            )
+        if not _is_parent_pid(parent_pid):
+            raise RuntimeError(
+                "release blocked: installer descendant census has an invalid parent: "
+                f"pid={pid} parent_pid={parent_pid!r}"
+            )
+        if pid in (0, 4):
             continue
-        if isinstance(parent_pid, bool) or not isinstance(parent_pid, int) or parent_pid <= 0:
-            raise RuntimeError(f"release blocked: installer descendant census has an invalid parent: pid={pid}")
+        if parent_pid in (0, 4):
+            continue
         children.setdefault(parent_pid, []).append(pid)
-    pending = list(children.get(root_pid, []))
+    pending = [(pid, {root_pid}) for pid in children.get(root_pid, [])]
     descendants: list[int] = []
     while pending:
-        pid = pending.pop()
+        pid, ancestry = pending.pop()
+        if pid in ancestry:
+            raise RuntimeError(f"release blocked: installer descendant census contains a cycle: pid={pid}")
         if pid in descendants:
             continue
         descendants.append(pid)
-        pending.extend(children.get(pid, []))
+        next_ancestry = ancestry | {pid}
+        pending.extend((child, next_ancestry) for child in children.get(pid, []))
     return sorted(descendants)
 
 
 def _host_installer_descendant_records(
-    root_pid: int, contract: dict[str, Any]
+    root_pid: int,
+    contract: dict[str, Any],
+    *,
+    root_identity: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Capture exact descendant identities in leaf-first order."""
+    """Capture exact descendant identities and process-generation edges."""
+    current_root: dict[str, Any] | None = None
+    root_missing_before = False
+
+    def creation_generation(value: object, *, pid: int, role: str) -> int:
+        if not isinstance(value, str) or not value.isdigit():
+            raise RuntimeError(
+                "release blocked: installer process generation is not comparable: "
+                f"pid={pid} role={role} creation={value!r}"
+            )
+        return int(value)
+
+    def validate_root_identity(
+        expected: dict[str, Any], current: dict[str, Any], *, phase: str
+    ) -> None:
+        required = (
+            "pid", "creation", "executable", "native_command", "argv",
+            "argv_sha256", "native_command_sha256", "cwd", "parent_pid",
+        )
+        missing = [field for field in required if field not in expected or field not in current]
+        if missing:
+            raise RuntimeError(
+                "release blocked: installer root identity is incomplete: "
+                f"phase={phase} fields={sorted(set(missing))}"
+            )
+        if expected.get("pid") != root_pid or current.get("pid") != root_pid:
+            raise RuntimeError(
+                "release blocked: installer root identity does not match the census root: "
+                f"phase={phase} expected_pid={expected.get('pid')!r} current_pid={current.get('pid')!r} "
+                f"root_pid={root_pid}"
+            )
+        creation_generation(expected["creation"], pid=root_pid, role="expected-root")
+        creation_generation(current["creation"], pid=root_pid, role="current-root")
+        for field in (
+            "creation", "argv", "argv_sha256", "native_command",
+            "native_command_sha256", "parent_pid",
+        ):
+            if current[field] != expected[field]:
+                raise RuntimeError(
+                    "release blocked: installer root identity changed during census: "
+                    f"phase={phase} pid={root_pid} field={field}"
+                )
+        for field in ("executable", "cwd"):
+            if _host_path_identity(current[field]) != _host_path_identity(expected[field]):
+                raise RuntimeError(
+                    "release blocked: installer root identity changed during census: "
+                    f"phase={phase} pid={root_pid} field={field}"
+                )
+        if not isinstance(current["argv"], list) or not current["argv"] or not all(
+            isinstance(value, str) for value in current["argv"]
+        ):
+            raise RuntimeError(
+                "release blocked: installer root identity has invalid parsed arguments: "
+                f"phase={phase} pid={root_pid}"
+            )
+        if current["argv_sha256"] != hashlib.sha256(
+            "\0".join(current["argv"]).encode("utf-8")
+        ).hexdigest():
+            raise RuntimeError(
+                "release blocked: installer root identity has an invalid parsed-argument hash: "
+                f"phase={phase} pid={root_pid}"
+            )
+        if current["native_command_sha256"] != hashlib.sha256(
+            current["native_command"].encode("utf-8")
+        ).hexdigest():
+            raise RuntimeError(
+                "release blocked: installer root identity has an invalid native-command hash: "
+                f"phase={phase} pid={root_pid}"
+            )
+        if not _host_installer_command_matches_contract(current["native_command"], contract):
+            raise RuntimeError(
+                "release blocked: installer root is not bound to the exact launch contract: "
+                f"phase={phase} pid={root_pid}"
+            )
+
+    if root_identity is not None:
+        validate_root_identity(root_identity, root_identity, phase="expected-root")
+        try:
+            current_root = _read_fresh_native_process_identity(root_pid, _NativeReadState())
+        except _FreshProcessAbsent:
+            root_missing_before = True
+        except _FreshProcessUnreadable as exc:
+            raise RuntimeError(
+                f"release blocked: installer root identity is unreadable before census: pid={root_pid}"
+            ) from exc
+        if current_root is not None:
+            validate_root_identity(root_identity, current_root, phase="before-census")
+
     resources = _enumerate_fresh_frontend_resources()
     rows = resources.get("processes") if isinstance(resources, dict) else None
     read_errors = resources.get("read_errors") if isinstance(resources, dict) else None
@@ -4846,12 +5217,63 @@ def _host_installer_descendant_records(
             raise RuntimeError("release blocked: installer descendant census contains an invalid row")
         pid = row.get("pid")
         parent_pid = row.get("parent_pid")
-        if not _is_positive_pid(pid):
-            continue
-        if not _is_positive_pid(parent_pid):
+        if not _is_process_pid(pid):
+            raise RuntimeError(f"release blocked: installer descendant census has an invalid PID: pid={pid!r}")
+        if not _is_parent_pid(parent_pid):
             raise RuntimeError(f"release blocked: installer descendant census has an invalid parent: pid={pid}")
+        if pid in (0, 4) or parent_pid in (0, 4):
+            continue
         row_by_pid[pid] = row
         children.setdefault(parent_pid, []).append(pid)
+
+    census_root = row_by_pid.get(root_pid)
+    if root_identity is not None:
+        if root_missing_before:
+            if census_root is not None or children.get(root_pid):
+                raise RuntimeError(
+                    "release blocked: installer root exited while descendant census still names its generation: "
+                    f"pid={root_pid}"
+                )
+            return []
+        if current_root is None:
+            raise RuntimeError(
+                f"release blocked: installer root identity was not captured before census: pid={root_pid}"
+            )
+        if census_root is not None:
+            if census_root.get("parent_pid") != current_root["parent_pid"]:
+                raise RuntimeError(
+                    "release blocked: installer census root parent changed: "
+                    f"pid={root_pid} census_parent_pid={census_root.get('parent_pid')!r} "
+                    f"identity_parent_pid={current_root['parent_pid']!r}"
+                )
+            if not isinstance(census_root.get("command"), str) or not _host_installer_command_matches_contract(
+                census_root["command"], contract
+            ):
+                raise RuntimeError(
+                    "release blocked: installer census root is not bound to the exact launch contract: "
+                    f"pid={root_pid}"
+                )
+        elif children.get(root_pid):
+            raise RuntimeError(
+                "release blocked: installer census omitted the checked root but retained descendants: "
+                f"pid={root_pid}"
+            )
+        try:
+            after_root = _read_fresh_native_process_identity(root_pid, _NativeReadState())
+        except _FreshProcessAbsent as exc:
+            if census_root is not None or children.get(root_pid):
+                raise RuntimeError(
+                    "release blocked: installer root exited during descendant census: "
+                    f"pid={root_pid}"
+                ) from exc
+            return []
+        except _FreshProcessUnreadable as exc:
+            raise RuntimeError(
+                f"release blocked: installer root identity is unreadable after census: pid={root_pid}"
+            ) from exc
+        validate_root_identity(root_identity, after_root, phase="after-census")
+        validate_root_identity(current_root, after_root, phase="census-window")
+        current_root = after_root
 
     ordered: list[int] = []
     active: set[int] = set()
@@ -4867,12 +5289,60 @@ def _host_installer_descendant_records(
             ordered.append(pid)
 
     visit(root_pid)
+    parent_identities: dict[int, dict[str, Any]] = {}
+    if root_identity is not None:
+        parent_identities[root_pid] = current_root or root_identity
+
+    def validate_edge(child: dict[str, Any], parent: dict[str, Any], parent_pid: int) -> dict[str, Any]:
+        if child.get("parent_pid") != parent_pid:
+            raise RuntimeError(
+                "release blocked: installer parent edge changed during identity capture: "
+                f"child_pid={child.get('pid')} parent_pid={parent_pid} "
+                f"observed_parent_pid={child.get('parent_pid')!r}"
+            )
+        child_generation = creation_generation(
+            child.get("creation"), pid=child["pid"], role="child"
+        )
+        parent_generation = creation_generation(
+            parent.get("creation"), pid=parent_pid, role="parent"
+        )
+        if child_generation < parent_generation:
+            raise RuntimeError(
+                "release blocked: installer child predates captured parent generation: "
+                f"child_pid={child['pid']} child_creation={child['creation']} "
+                f"parent_pid={parent_pid} parent_creation={parent['creation']}"
+            )
+        return {
+            "child_pid": child["pid"],
+            "child_creation": child["creation"],
+            "parent_pid": parent_pid,
+            "parent_creation": parent["creation"],
+            "relation": "current parent generation of exact installer child",
+        }
+
     records = []
     for pid in ordered:
         identity = _read_fresh_native_process_identity(pid, _NativeReadState())
         if identity.get("pid") != pid or not identity.get("creation"):
             raise RuntimeError(f"release blocked: installer descendant identity is incomplete: pid={pid}")
         row = row_by_pid[pid]
+        parent_pid = row["parent_pid"]
+        if identity.get("parent_pid") != parent_pid:
+            raise RuntimeError(
+                "release blocked: installer descendant parent changed during identity capture: "
+                f"child_pid={pid} census_parent_pid={parent_pid} "
+                f"identity_parent_pid={identity.get('parent_pid')!r}"
+            )
+        parent = parent_identities.get(parent_pid)
+        if parent is None:
+            parent = _read_fresh_native_process_identity(parent_pid, _NativeReadState())
+            if parent.get("pid") != parent_pid or not parent.get("creation"):
+                raise RuntimeError(
+                    "release blocked: installer parent identity is incomplete: "
+                    f"parent_pid={parent_pid}"
+                )
+            parent_identities[parent_pid] = parent
+        identity["installer_parent_generation"] = validate_edge(identity, parent, parent_pid)
         command = str(identity.get("native_command") or row.get("command") or "")
         if not command or not _host_installer_command_matches_contract(command, contract):
             raise RuntimeError(
@@ -4881,6 +5351,60 @@ def _host_installer_descendant_records(
             )
         records.append(identity)
     return records
+
+
+def _validate_installer_parent_generation(identity: dict[str, Any]) -> None:
+    edge = identity.get("installer_parent_generation")
+    if not isinstance(edge, dict):
+        raise RuntimeError(
+            "release blocked: installer cleanup identity has no retained parent generation proof: "
+            f"pid={identity.get('pid')!r}"
+        )
+    if edge.get("child_pid") != identity.get("pid") or edge.get("child_creation") != identity.get("creation"):
+        raise RuntimeError(
+            "release blocked: installer cleanup parent generation proof does not match child identity: "
+            f"pid={identity.get('pid')!r}"
+        )
+    parent_pid = edge.get("parent_pid")
+    if not _is_positive_pid(parent_pid):
+        raise RuntimeError(
+            "release blocked: installer cleanup parent generation proof has an invalid parent PID: "
+            f"pid={identity.get('pid')!r} parent_pid={parent_pid!r}"
+        )
+    if identity.get("parent_pid") != parent_pid:
+        raise RuntimeError(
+            "release blocked: installer cleanup parent generation proof has a changed parent PID: "
+            f"pid={identity.get('pid')!r} parent_pid={identity.get('parent_pid')!r} "
+            f"expected={parent_pid}"
+        )
+    if "parent_observations" in identity:
+        observations = identity.get("parent_observations")
+        if not isinstance(observations, list) or len(observations) != 1:
+            raise RuntimeError(
+                "release blocked: installer cleanup parent generation proof has no exact recheck: "
+                f"pid={identity.get('pid')!r} parent_pid={parent_pid}"
+            )
+        observation = observations[0]
+        if not isinstance(observation, dict) or (
+            observation.get("pid") != parent_pid
+            or observation.get("creation") != edge.get("parent_creation")
+        ):
+            raise RuntimeError(
+                "release blocked: installer cleanup parent generation changed before stop: "
+                f"pid={identity.get('pid')!r} parent_pid={parent_pid}"
+            )
+    child_generation = str(edge.get("child_creation", ""))
+    parent_generation = str(edge.get("parent_creation", ""))
+    if not child_generation.isdigit() or not parent_generation.isdigit():
+        raise RuntimeError(
+            "release blocked: installer cleanup parent generation proof is not comparable: "
+            f"pid={identity.get('pid')!r}"
+        )
+    if int(child_generation) < int(parent_generation):
+        raise RuntimeError(
+            "release blocked: installer cleanup child predates its retained parent generation: "
+            f"pid={identity.get('pid')!r} parent_pid={parent_pid}"
+        )
 
 
 def _host_installer_command_matches_contract(command: str, contract: dict[str, Any]) -> bool:
@@ -4993,7 +5517,11 @@ def _cleanup_host_installer_resources(
     def measure_census() -> list[dict[str, Any]]:
         census_started = _monotonic_now()
         try:
-            records = _host_installer_descendant_records(process.pid, contract)
+            records = _host_installer_descendant_records(
+                process.pid,
+                contract,
+                root_identity=initial_root_identity,
+            )
         finally:
             measured = _measured_elapsed_seconds(census_started)
             if measured is not None:
@@ -5005,6 +5533,8 @@ def _cleanup_host_installer_resources(
         creation = record.get("creation")
         if not _is_positive_pid(pid) or not isinstance(creation, str) or not creation:
             raise RuntimeError(f"release blocked: installer cleanup identity is incomplete: {record}")
+        if pid != process.pid:
+            _validate_installer_parent_generation(record)
         key = (pid, creation)
         for existing_pid, existing_creation in identities:
             if existing_pid == pid and existing_creation != creation:
@@ -5023,8 +5553,21 @@ def _cleanup_host_installer_resources(
 
     while True:
         require_budget()
-        for record in measure_census():
-            bind(record)
+        census_records = measure_census()
+        identities_before_census = dict(identities)
+        terminal_before_census = set(terminal)
+        stopped_before_census = set(stopped_pids)
+        try:
+            for record in census_records:
+                bind(record)
+        except BaseException:
+            identities.clear()
+            identities.update(identities_before_census)
+            terminal.clear()
+            terminal.update(terminal_before_census)
+            stopped_pids.clear()
+            stopped_pids.update(stopped_before_census)
+            raise
 
         live: list[dict[str, Any]] = []
         for identity in list(identities.values()):
@@ -5048,6 +5591,9 @@ def _cleanup_host_installer_resources(
                 _validate_fresh_replacement_identity(current, identity["creation"], pid)
                 terminal[pid] = "reused"
                 continue
+            if pid != process.pid:
+                current["installer_parent_generation"] = identity["installer_parent_generation"]
+                _validate_installer_parent_generation(current)
             live.append(identity)
 
         for identity in sorted(live, key=lambda item: item["pid"], reverse=True):

@@ -270,6 +270,13 @@ def _validate_cited_response(response: dict, expected_run_id: str = CANONICAL_DE
                 raise RuntimeError("query citation evidence span is outside its snippet")
             if canonical_content[start:end] != matched_value:
                 raise RuntimeError("query citation evidence text does not match its character span")
+    expected_rows = set(manifest["rows"])
+    if seen_rows != expected_rows:
+        missing = sorted(expected_rows - seen_rows)
+        raise RuntimeError(
+            "query result does not cover every canonical evidence row: "
+            f"missing={missing}"
+        )
 
 
 def _assert_exported_routes_use_trailing_slash() -> None:
@@ -331,8 +338,10 @@ def _write_proof_artifacts(
     }:
         raise RuntimeError("live proof requires every public ingestion boundary to return HTTP 403")
     screenshot_paths = [output_dir / item for item in screenshots]
-    if not screenshots or any(not path.is_file() for path in screenshot_paths):
-        raise RuntimeError("live proof requires existing browser screenshots")
+    if len(screenshots) != 4 or len(set(screenshots)) != 4:
+        raise RuntimeError("live proof requires four distinct browser screenshots")
+    if any(not path.is_file() for path in screenshot_paths):
+        raise RuntimeError("live proof requires four existing browser screenshots")
     row_count = len(observed_response["rows"])
     citation_count = sum(len(row["citations"]) for row in observed_response["rows"])
     proof = {
@@ -492,6 +501,7 @@ def _run_browser_flow(playwright, live_url: str, run_id: str, question: str, out
         page.get_by_role("status", name="Sample loaded: canonical synthetic UFDR.").wait_for()
         if page.locator("#run-id").input_value() != run_id:
             raise RuntimeError("demo reset returned the wrong canonical run")
+        page.screenshot(path=str(output_dir / "citespan-query-plan.png"), full_page=True)
         page.locator("#question").fill(question)
         page.get_by_role("button", name="Run query").click()
         page.get_by_text("Cited Results", exact=True).wait_for()
@@ -531,7 +541,7 @@ def main() -> int:
     parser.add_argument("--url", default=os.environ.get("CITESPAN_URL", AUTHORIZED_LIVE_ORIGIN))
     parser.add_argument("--run-id", default=os.environ.get("CITESPAN_DEMO_RUN_ID"))
     parser.add_argument("--deployment-id", default=os.environ.get("CITESPAN_DEPLOYMENT_ID"))
-    parser.add_argument("--question", default="Show me all WhatsApp messages mentioning a bank transfer")
+    parser.add_argument("--question", default="Show me all messages mentioning a transfer")
     parser.add_argument(
         "--output-dir",
         default=None,
@@ -565,6 +575,7 @@ def main() -> int:
         output_dir / "citespan-home.png",
         output_dir / "citespan-query-results.png",
         output_dir / "citespan-upload-disabled.png",
+        output_dir / "citespan-query-plan.png",
     ]
     for path in [proof_path, post_path, *screenshot_paths]:
         path.unlink(missing_ok=True)
@@ -585,6 +596,7 @@ def main() -> int:
         [
             "citespan-home.png",
             "citespan-upload-disabled.png",
+            "citespan-query-plan.png",
             "citespan-query-results.png",
         ],
         observed["query_response"],

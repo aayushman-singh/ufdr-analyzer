@@ -49,6 +49,10 @@ class BashProcessHandleTimeout(RuntimeError):
     """The exact Bash process handle did not signal before the finite bound."""
 
 
+class PidSubclass(int):
+    """A non-canonical integer value used to test strict PID boundaries."""
+
+
 @pytest.mark.parametrize(
     "origin",
     [
@@ -2265,6 +2269,318 @@ def test_fresh_resource_scope_hydrates_matching_limited_replacement(monkeypatch)
     assert result["relevant_processes"] == []
 
 
+def test_fresh_resource_scope_reads_unknown_process_with_product_root_cwd(monkeypatch):
+    root = str(release.ROOT.resolve())
+    reads = []
+
+    def read(pid, *_args, **_kwargs):
+        reads.append(pid)
+        raise release._FreshProcessUnreadable("access denied")
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+
+    with pytest.raises(RuntimeError, match="potentially relevant process identity failed: pid=15012"):
+        release._fresh_resource_scope(
+            {
+                "processes": [
+                    {
+                        "pid": 15012,
+                        "name": "mystery.exe",
+                        "executable": "C:/tools/mystery.exe",
+                        "cwd": root,
+                        "parent_pid": 1,
+                    }
+                ],
+                "holders": [],
+                "ports": [],
+                "read_errors": [],
+            },
+            root,
+            scoped_ports=set(),
+        )
+
+    assert reads == [15012]
+
+
+def test_fresh_resource_scope_reads_unknown_process_with_product_root_executable(monkeypatch):
+    root = str(release.ROOT.resolve())
+    reads = []
+
+    def read(pid, *_args, **_kwargs):
+        reads.append(pid)
+        raise release._FreshProcessUnreadable("access denied")
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+
+    with pytest.raises(RuntimeError, match="potentially relevant process identity failed: pid=15013"):
+        release._fresh_resource_scope(
+            {
+                "processes": [
+                    {
+                        "pid": 15013,
+                        "name": "mystery.exe",
+                        "executable": f"{root}/bin/mystery.exe",
+                        "cwd": "C:/other",
+                        "parent_pid": 1,
+                    }
+                ],
+                "holders": [],
+                "ports": [],
+                "read_errors": [],
+            },
+            root,
+            scoped_ports=set(),
+        )
+
+    assert reads == [15013]
+
+
+def test_fresh_resource_scope_reads_unknown_process_with_product_root_command(monkeypatch):
+    root = str(release.ROOT.resolve())
+    reads = []
+
+    def read(pid, *_args, **_kwargs):
+        reads.append(pid)
+        raise release._FreshProcessUnreadable("access denied")
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+
+    with pytest.raises(RuntimeError, match="potentially relevant process identity failed: pid=15016"):
+        release._fresh_resource_scope(
+            {
+                "processes": [
+                    {
+                        "pid": 15016,
+                        "name": "mystery.exe",
+                        "executable": "C:/tools/mystery.exe",
+                        "cwd": "C:/other",
+                        "command": f'mystery.exe "{root}/frontend/server.js"',
+                        "parent_pid": 1,
+                    }
+                ],
+                "holders": [],
+                "ports": [],
+                "read_errors": [],
+            },
+            root,
+            scoped_ports=set(),
+        )
+
+    assert reads == [15016]
+
+
+@pytest.mark.parametrize("relation", ["cwd", "executable", "command", "preloaded_argv"])
+def test_fresh_resource_scope_preserves_positive_relation_over_explicit_exclusion(monkeypatch, relation):
+    root = str(release.ROOT.resolve())
+    pid = 15020
+    identity = _resource_identity(pid, cwd="C:/other", executable="C:/tools/mystery.exe")
+    item = {
+        "pid": pid,
+        "name": "mystery.exe",
+        "executable": "C:/tools/mystery.exe",
+        "cwd": "C:/other",
+        "parent_pid": 1,
+        "protected_or_unrelated_state": "unrelated",
+    }
+    if relation == "cwd":
+        item["cwd"] = f"{root}/frontend"
+    elif relation == "executable":
+        item["executable"] = f"{root}/bin/mystery.exe"
+    elif relation == "command":
+        item["command"] = f'mystery.exe "{root}/frontend/server.js"'
+    else:
+        identity["argv"] = ["mystery.exe", f"{root}/frontend/server.js"]
+        identity["native_command"] = " ".join(identity["argv"])
+        identity["argv_sha256"] = hashlib.sha256("\0".join(identity["argv"]).encode()).hexdigest()
+        identity["native_command_sha256"] = hashlib.sha256(identity["native_command"].encode()).hexdigest()
+
+    reads = []
+
+    def read(read_pid, *_args, **_kwargs):
+        reads.append(read_pid)
+        return identity
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+    with pytest.raises(RuntimeError, match="positive product-root relation"):
+        release._fresh_resource_scope(
+            {"processes": [item], "holders": [], "ports": [], "read_errors": []},
+            root,
+            scoped_ports=set(),
+            preloaded_identities={pid: identity} if relation == "preloaded_argv" else None,
+        )
+
+    assert reads == ([] if relation == "preloaded_argv" else [pid])
+
+
+@pytest.mark.parametrize(
+    ("pid", "identity"),
+    [
+        (
+            15017,
+            lambda root: _resource_identity(15017, cwd=f"{root}/frontend", argv=["mystery.exe", "worker.js"]),
+        ),
+        (
+            15018,
+            lambda root: _resource_identity(
+                15018,
+                cwd="C:/other",
+                argv=["mystery.exe", f"{root}/frontend/server.js"],
+            ),
+        ),
+    ],
+)
+def test_fresh_resource_scope_preserves_complete_preloaded_product_relation(monkeypatch, pid, identity):
+    root = str(release.ROOT.resolve())
+    preloaded = identity(root)
+
+    def read(*_args, **_kwargs):
+        raise AssertionError("complete positive identity must not be re-read")
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+
+    with pytest.raises(RuntimeError, match="positive product-root relation"):
+        release._fresh_resource_scope(
+            {
+                "processes": [
+                    {
+                        "pid": pid,
+                        "name": "mystery.exe",
+                        "executable": "C:/tools/mystery.exe",
+                        "cwd": "C:/other",
+                        "parent_pid": 1,
+                    }
+                ],
+                "holders": [],
+                "ports": [],
+                "read_errors": [],
+            },
+            root,
+            scoped_ports=set(),
+            preloaded_identities={pid: preloaded},
+        )
+
+
+def test_fresh_resource_scope_classifies_complete_unknown_product_root_holder(monkeypatch):
+    root = str(release.ROOT.resolve())
+    native = (release.SCRIPT_ROOT / release.HOST_NATIVE_MODULE).resolve().as_posix()
+    identity = _resource_identity(
+        15014,
+        cwd=root,
+        executable="C:/tools/mystery.exe",
+        argv=["mystery.exe", "worker.bin"],
+    )
+    identity["module_paths"] = [native]
+    monkeypatch.setattr(
+        release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity
+    )
+
+    result = release._fresh_resource_scope(
+        {
+            "processes": [
+                {
+                    "pid": 15014,
+                    "name": "mystery.exe",
+                    "executable": "C:/tools/mystery.exe",
+                    "cwd": root,
+                    "parent_pid": 1,
+                }
+            ],
+            "holders": [{"pid": 15014, "module_paths": [native]}],
+            "ports": [],
+            "read_errors": [],
+        },
+        root,
+        scoped_ports=set(),
+    )
+
+    assert [entry["identity"]["pid"] for entry in result["relevant_processes"]] == [15014]
+
+
+def test_fresh_resource_scope_excludes_unknown_process_outside_product_root(monkeypatch):
+    root = str(release.ROOT.resolve())
+    replacement = {
+        "pid": 15015,
+        "creation": "replacement-15015",
+        "executable": "C:/tools/mystery.exe",
+        "source_provenance": {"reader": "native limited process handle"},
+    }
+    reads = []
+
+    def read(pid, *_args, **_kwargs):
+        reads.append(pid)
+        raise AssertionError("outside-scope unknown process must not be opened")
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+    result = release._fresh_resource_scope(
+        {
+            "processes": [
+                {
+                    "pid": 15015,
+                    "name": "mystery.exe",
+                    "executable": "C:/tools/mystery.exe",
+                    "cwd": "C:/other",
+                    "parent_pid": 1,
+                }
+            ],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+        root,
+        scoped_ports=set(),
+        preloaded_identities={15015: replacement},
+    )
+
+    assert reads == []
+    assert result["unrelated_exclusions"] == [
+        {"pid": 15015, "reason": "outside measured frontend process family"}
+    ]
+    assert result["relevant_processes"] == []
+
+
+def test_fresh_resource_scope_excludes_product_root_sibling_without_native_read(monkeypatch):
+    root = str(release.ROOT.resolve())
+    replacement = {
+        "pid": 15019,
+        "creation": "replacement-15019",
+        "executable": "C:/tools/mystery.exe",
+        "source_provenance": {"reader": "native limited process handle"},
+    }
+    reads = []
+
+    def read(pid, *_args, **_kwargs):
+        reads.append(pid)
+        raise AssertionError("product-root sibling must not be opened")
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+    sibling = f"{root}-sibling"
+    result = release._fresh_resource_scope(
+        {
+            "processes": [
+                {
+                    "pid": 15019,
+                    "name": "mystery.exe",
+                    "executable": "C:/tools/mystery.exe",
+                    "cwd": sibling,
+                    "command": f'mystery.exe "{sibling}/frontend/server.js"',
+                    "parent_pid": 1,
+                }
+            ],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+        root,
+        scoped_ports=set(),
+        preloaded_identities={15019: replacement},
+    )
+
+    assert reads == []
+    assert result["unrelated_exclusions"] == [
+        {"pid": 15019, "reason": "outside measured frontend process family"}
+    ]
+
+
 def test_fresh_resource_scope_excludes_partial_preloaded_noncandidate_without_native_read(monkeypatch):
     root = str(release.ROOT.resolve())
     replacement = {
@@ -2407,6 +2723,101 @@ def test_fresh_resource_scope_rejects_contradictory_exit_during_census(monkeypat
         )
 
 
+def _absent_resource_scope_fixture(pid=15012):
+    return {
+        "processes": [
+            {
+                "pid": pid,
+                "name": "node.exe",
+                "executable": "C:/node.exe",
+                "cwd": "C:/product/frontend",
+                "parent_pid": 1,
+            }
+        ],
+        "holders": [],
+        "ports": [],
+        "read_errors": [],
+    }
+
+
+def test_fresh_resource_scope_excludes_explicitly_absent_candidate_once_and_retains_private_evidence(
+    monkeypatch, tmp_path
+):
+    reads = []
+
+    def read(pid, *_args, **_kwargs):
+        reads.append(pid)
+        raise release._FreshProcessAbsent("pid=15012 is absent")
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+    monkeypatch.setattr(release, "EXTERNAL_PROOF_ROOT", tmp_path)
+    monkeypatch.setattr(release, "_git", lambda *_args: "checkpoint-1655")
+
+    result = release._fresh_resource_scope(
+        _absent_resource_scope_fixture(),
+        "C:/product",
+        scoped_ports={43123},
+    )
+
+    assert reads == [15012]
+    assert result["terminal_exclusions"] == [
+        {"pid": 15012, "reason": "explicit native absence during census"}
+    ]
+    diagnostic = result["private_diagnostics"][0]
+    payload = Path(diagnostic["path"]).read_bytes()
+    evidence = json.loads(payload)
+    assert diagnostic["digest"] == hashlib.sha256(payload).hexdigest()
+    assert evidence["native_absence"] == {
+        "pid": 15012,
+        "type": "_FreshProcessAbsent",
+        "message": "pid=15012 is absent",
+    }
+    assert evidence["complete_current_identity"] is None
+    assert result["relevant_processes"] == []
+
+
+@pytest.mark.parametrize("resource_field", ["native", "port"])
+def test_fresh_resource_scope_blocks_absent_measured_resource_owner(
+    monkeypatch, tmp_path, resource_field
+):
+    resources = _absent_resource_scope_fixture(15013)
+    if resource_field == "native":
+        native = (release.SCRIPT_ROOT / release.HOST_NATIVE_MODULE).resolve().as_posix()
+        resources["holders"] = [{"pid": 15013, "module_paths": [native]}]
+    else:
+        resources["ports"] = [{"pid": 15013, "port": 43123}]
+
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            release._FreshProcessAbsent("pid=15013 is absent")
+        ),
+    )
+    monkeypatch.setattr(release, "EXTERNAL_PROOF_ROOT", tmp_path)
+    monkeypatch.setattr(release, "_git", lambda *_args: "checkpoint-1655")
+
+    with pytest.raises(RuntimeError, match="fresh resource owner became absent during census"):
+        release._fresh_resource_scope(resources, "C:/product", scoped_ports={43123})
+
+
+def test_fresh_resource_scope_keeps_generic_unreadable_identity_blocking(monkeypatch):
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            release._FreshProcessUnreadable("access denied")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="potentially relevant process identity failed: pid=15012"):
+        release._fresh_resource_scope(
+            _absent_resource_scope_fixture(),
+            "C:/product",
+            scoped_ports={43123},
+        )
+
+
 def test_fresh_census_rejects_unreadable_replacement_identity(monkeypatch):
     contract = _fresh_census_contract(count=1, states={1: "reused"})
     monkeypatch.setattr(
@@ -2493,13 +2904,17 @@ def test_fresh_census_rejects_unreadable_identity(monkeypatch):
         release._assert_fresh_host_process_census(contract)
 
 
-@pytest.mark.parametrize("field", ["processes", "holders", "ports"])
-def test_fresh_census_rejects_current_frontend_resources(monkeypatch, field):
-    contract = _fresh_census_contract()
-    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda _pid, *_args, **_kwargs: (_ for _ in ()).throw(release._FreshProcessAbsent("absent")))
-    resources = {"processes": [], "holders": [], "ports": [], "read_errors": []}
-    if field == "ports":
-        resources["processes"] = [
+def test_fresh_census_classifies_process_absence_as_terminal_exclusion(monkeypatch, tmp_path):
+    reads = []
+
+    def read_absent(pid, *_args, **_kwargs):
+        reads.append(pid)
+        raise release._FreshProcessAbsent("absent")
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read_absent)
+    monkeypatch.setattr(release, "EXTERNAL_PROOF_ROOT", tmp_path)
+    resources = {
+        "processes": [
             {
                 "pid": 999,
                 "name": "node.exe",
@@ -2508,27 +2923,107 @@ def test_fresh_census_rejects_current_frontend_resources(monkeypatch, field):
                 "cwd": str(release.ROOT.resolve() / "frontend"),
                 "command": f"node {release.ROOT.resolve()}/frontend/server.js",
             }
-        ]
-        resources[field] = [{"port": 4100, "pid": 999}]
-    elif field == "processes":
-        resources[field] = [
-            {
-                "pid": 999,
-                "name": "node.exe",
-                "parent_pid": 1,
-                "cwd": str(release.ROOT.resolve() / "frontend"),
-                "command": f"node {release.ROOT.resolve()}/frontend/server.js",
-            }
-        ]
-    else:
-        resources[field] = [{
-            "pid": 999,
-            "module_paths": [str((release.SCRIPT_ROOT / release.HOST_NATIVE_MODULE).resolve())],
-        }]
-    monkeypatch.setattr(release, "_enumerate_fresh_frontend_resources", lambda: resources)
+        ],
+        "holders": [],
+        "ports": [],
+        "read_errors": [],
+    }
+    result = release._fresh_resource_scope(
+        resources,
+        str(release.ROOT.resolve()),
+        scoped_ports=set(),
+        preloaded_identities={},
+        protected_pids=set(),
+    )
 
-    with pytest.raises(RuntimeError, match="fresh resource census is unstable or unreadable"):
+    assert reads == [999]
+    assert result["terminal_exclusions"] == [
+        {"pid": 999, "reason": "explicit native absence during census"}
+    ]
+    diagnostic = result["private_diagnostics"]
+    assert len(diagnostic) == 1
+    assert diagnostic[0]["pid"] == 999
+    assert diagnostic[0]["kind"] == "native_absence"
+    assert diagnostic[0]["path"]
+    assert diagnostic[0]["digest"]
+    evidence = json.loads(Path(diagnostic[0]["path"]).read_text(encoding="utf-8"))
+    assert evidence["native_absence"] == {
+        "pid": 999,
+        "type": "_FreshProcessAbsent",
+        "message": "absent",
+    }
+    assert diagnostic[0]["digest"] == hashlib.sha256(
+        Path(diagnostic[0]["path"]).read_bytes()
+    ).hexdigest()
+
+
+def test_fresh_census_rejects_absent_native_holder(monkeypatch):
+    contract = _fresh_census_contract()
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda _pid, *_args, **_kwargs: (_ for _ in ()).throw(release._FreshProcessAbsent("absent")),
+    )
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [],
+            "holders": [
+                {
+                    "pid": 999,
+                    "module_paths": [str((release.SCRIPT_ROOT / release.HOST_NATIVE_MODULE).resolve())],
+                }
+            ],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"fresh resource census is unstable or unreadable; fresh native module holder identity is unreadable: pid=999",
+    ):
         release._assert_fresh_host_process_census(contract)
+
+
+def test_fresh_census_rejects_absent_scoped_port_owner(monkeypatch):
+    contract = _fresh_census_contract()
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda _pid, *_args, **_kwargs: (_ for _ in ()).throw(release._FreshProcessAbsent("absent")),
+    )
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [
+                {
+                    "pid": 999,
+                    "name": "node.exe",
+                    "executable": "C:/node.exe",
+                    "parent_pid": 1,
+                    "cwd": str(release.ROOT.resolve() / "frontend"),
+                    "command": f"node {release.ROOT.resolve()}/frontend/server.js",
+                }
+            ],
+            "holders": [],
+            "ports": [{"port": 4100, "pid": 999}],
+            "read_errors": [],
+        },
+    )
+
+    with pytest.raises(RuntimeError) as error:
+        release._assert_fresh_host_process_census(contract)
+
+    message = str(error.value)
+    assert "fresh resource owner became absent during census" in message
+    assert "pid=999" in message
+    assert "native_holder=False" in message
+    assert "scoped_port_owner=True" in message
+    assert "private_evidence=" in message
+    assert "evidence_digest=" in message
 
 
 def test_fresh_census_accepts_explicit_empty_resource_measurement(monkeypatch):
@@ -2722,8 +3217,8 @@ def test_fresh_census_does_not_make_unrelated_reader_relevant_from_historical_pi
         "parent_pid": 100,
         "name": "powershell.exe",
         "executable": "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
-        "command": f"powershell -Command Get-CimInstance {root}",
-        "cwd": root,
+        "command": "powershell -Command Get-CimInstance C:/other",
+        "cwd": "C:/other",
     }
     monkeypatch.setattr(
         release,
@@ -2752,8 +3247,8 @@ def test_fresh_census_excludes_unrelated_python_with_product_root_text(monkeypat
         "parent_pid": 100,
         "name": "python.exe",
         "executable": "C:/Python311/python.exe",
-        "command": f"python -m pytest {root}/scripts/tests",
-        "cwd": root,
+        "command": "python -m pytest C:/other/scripts/tests",
+        "cwd": "C:/Python311",
     }
     reads = []
 
@@ -3221,6 +3716,120 @@ def test_resource_scope_accepts_checked_cmd_wrapper_relation():
     assert release._resource_process_is_relevant(row, root, identity=identity) is True
 
 
+def test_fresh_resource_scope_rejects_cmd_parent_text_fragments(monkeypatch, tmp_path):
+    root = str(release.ROOT.resolve())
+    monkeypatch.setattr(release, "EXTERNAL_PROOF_ROOT", tmp_path)
+    parent_argv = [
+        r"C:\\Python311\\python.exe",
+        "-c",
+        "print('subprocess.Popen child.wait invalid cmd contract')",
+    ]
+    parent_command = " ".join(parent_argv)
+    parent = {
+        "pid": 919,
+        "state": "readable_current_parent",
+        "creation": "parent-creation-919",
+        "parent_pid": 1,
+        "cwd": root,
+        "executable": r"C:\\Python311\\python.exe",
+        "argv": parent_argv,
+        "argv_sha256": hashlib.sha256("\0".join(parent_argv).encode()).hexdigest(),
+        "native_command": parent_command,
+        "native_command_sha256": hashlib.sha256(parent_command.encode()).hexdigest(),
+        "relation": "current parent of exact child identity",
+    }
+    identity = _resource_identity(
+        920,
+        cwd=f"{root}/frontend",
+        executable=r"C:\\Windows\\System32\\cmd.exe",
+        argv=["cmd.exe", "/c", "echo", "sample"],
+        parent_observations=[parent],
+    )
+    identity["parent_pid"] = parent["pid"]
+    reads = []
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda pid, *_args, **_kwargs: reads.append(pid),
+    )
+    with pytest.raises(RuntimeError, match="positive product-root relation"):
+        release._fresh_resource_scope(
+            {
+                "processes": [
+                    {
+                        "pid": 920,
+                        "name": "cmd.exe",
+                        "executable": identity["executable"],
+                        "cwd": f"{root}/frontend",
+                        "parent_pid": 919,
+                        "current_identity": identity,
+                    }
+                ],
+                "holders": [],
+                "ports": [],
+                "read_errors": [],
+            },
+            root,
+            scoped_ports=set(),
+            preloaded_identities={920: identity},
+        )
+
+
+    assert reads == []
+
+
+def test_resource_scope_keeps_cmd_wrapper_fail_closed_without_owned_parent_relation(tmp_path, monkeypatch):
+    root = str(release.ROOT.resolve())
+    monkeypatch.setattr(release, "EXTERNAL_PROOF_ROOT", tmp_path)
+    identity = _resource_identity(
+        920,
+        cwd=f"{root}/frontend",
+        executable=r"C:\\Windows\\System32\\cmd.exe",
+        argv=["cmd.exe", "/c", "echo", "sample"],
+        parent_observations=[{"pid": 25200, "state": "verified_absent_parent"}],
+    )
+    identity["parent_pid"] = 25200
+    row = {
+        "pid": 920,
+        "name": "cmd.exe",
+        "executable": identity["executable"],
+        "cwd": identity["cwd"],
+        "parent_pid": 25200,
+        "current_identity": identity,
+    }
+
+    with pytest.raises(RuntimeError, match="positive product-root relation") as error:
+        release._resource_process_is_relevant(row, root, identity=identity)
+
+    message = str(error.value)
+    assert "private_evidence=" in message
+    assert identity["native_command"] not in message
+
+
+@pytest.mark.parametrize(
+    ("native_holder_module_paths", "scoped_port_records"),
+    [(('C:/product/lightningcss.node',), ()), ((), ((4100, 920),))],
+)
+def test_resource_scope_holders_and_ports_override_checked_cmd_protection(
+    native_holder_module_paths, scoped_port_records
+):
+    root = str(release.ROOT.resolve())
+    identity = _resource_identity(
+        920,
+        cwd=f"{root}/frontend",
+        executable=r"C:\\Windows\\System32\\cmd.exe",
+        argv=["cmd.exe", "/c", "echo", "sample"],
+    )
+
+    assert release._resource_process_is_relevant(
+        {"pid": 920, "name": "cmd.exe", "executable": identity["executable"]},
+        root,
+        identity=identity,
+        native_holder_module_paths=native_holder_module_paths,
+        scoped_port_records=scoped_port_records,
+    ) is True
+
+
 def test_resource_scope_accepts_current_holder_and_scoped_port_evidence():
     root = str(release.ROOT.resolve())
     native = (release.SCRIPT_ROOT / release.HOST_NATIVE_MODULE).resolve().as_posix()
@@ -3237,6 +3846,234 @@ def test_resource_scope_accepts_current_holder_and_scoped_port_evidence():
 
     assert release._resource_process_is_relevant(holder, root, identity=holder_identity) is True
     assert release._resource_process_is_relevant(port, root, identity=port_identity) is True
+
+
+@pytest.mark.parametrize(
+    ("resource_kind", "resources", "expected_relation"),
+    [
+        (
+            "holder",
+            lambda pid, native: {
+                "processes": [{"pid": pid, "name": "service.exe", "executable": "C:/tools/service.exe", "parent_pid": 1}],
+                "holders": [{"pid": pid, "module_paths": [native]}],
+                "ports": [],
+                "read_errors": [],
+            },
+            "native_holder_module_paths_by_pid",
+        ),
+        (
+            "port",
+            lambda pid, native: {
+                "processes": [{"pid": pid, "name": "service.exe", "executable": "C:/tools/service.exe", "parent_pid": 1}],
+                "holders": [],
+                "ports": [{"port": 4100, "pid": pid}],
+                "read_errors": [],
+            },
+            "scoped_port_records_by_pid",
+        ),
+    ],
+)
+def test_resource_scope_carries_selected_resource_relation_into_final_classifier(
+    resource_kind, resources, expected_relation, monkeypatch
+):
+    root = str(release.ROOT.resolve())
+    pid = 900
+    native = str((release.SCRIPT_ROOT / release.HOST_NATIVE_MODULE).resolve())
+    identity = _resource_identity(pid, cwd="C:/other", executable="C:/tools/service.exe")
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
+
+    result = release._fresh_resource_scope(
+        resources(pid, native),
+        root,
+        scoped_ports={4100},
+    )
+
+    assert [entry["identity"]["pid"] for entry in result["relevant_processes"]] == [pid]
+    assert result[expected_relation][pid]
+    if resource_kind == "holder":
+        assert result[expected_relation][pid] == (native,)
+    else:
+        assert result[expected_relation][pid] == ((4100, pid),)
+
+
+def test_resource_scope_does_not_promote_unrelated_holder_or_unscoped_port():
+    root = str(release.ROOT.resolve())
+    identity = _resource_identity(901, cwd="C:/other", executable="C:/tools/service.exe")
+    row = {"pid": 901, "name": "service.exe", "executable": identity["executable"]}
+    unrelated_holder = {"pid": 901, "module_paths": ["C:/other/lightningcss.node"]}
+    row["module_paths"] = unrelated_holder["module_paths"]
+    unrelated_port_identity = _resource_identity(902, cwd="C:/other", executable="C:/tools/service.exe")
+    unrelated_port_identity["ports"] = [43123]
+    unrelated_port = {"pid": 902, "name": "service.exe", "executable": unrelated_port_identity["executable"]}
+
+    assert release._resource_process_is_relevant(
+        row,
+        root,
+        identity=identity,
+        native_holder_module_paths=(),
+        scoped_port_records=(),
+    ) is False
+    assert release._resource_process_is_relevant(
+        unrelated_port,
+        root,
+        identity=unrelated_port_identity,
+        native_holder_module_paths=(),
+        scoped_port_records=(),
+    ) is False
+
+
+def test_resource_scope_preserves_generic_positive_relation_inconsistency_error():
+    root = str(release.ROOT.resolve())
+    identity = _resource_identity(903, cwd="C:/other", executable="C:/tools/service.exe")
+    with pytest.raises(RuntimeError, match="positive product-root relation"):
+        release._resource_process_is_relevant(
+            {"pid": 903, "name": "service.exe", "executable": identity["executable"]},
+            root,
+            identity=identity,
+            positive_product_relation=True,
+        )
+
+
+def test_resource_scope_retains_private_failure_identity_and_digest(tmp_path, monkeypatch):
+    root = str(release.ROOT.resolve())
+    identity = _resource_identity(
+        903,
+        cwd="C:/other",
+        executable="C:/tools/service.exe",
+        argv=["service.exe", "C:/other/service.js"],
+    )
+    row = {
+        "pid": 903,
+        "parent_pid": 1,
+        "name": "service.exe",
+        "executable": identity["executable"],
+        "current_identity": identity,
+    }
+    monkeypatch.setattr(release, "EXTERNAL_PROOF_ROOT", tmp_path)
+    monkeypatch.setattr(release, "_git", lambda *_args: "checkpoint-1511")
+
+    with pytest.raises(RuntimeError) as error:
+        release._resource_process_is_relevant(
+            row,
+            root,
+            identity=identity,
+            positive_product_relation=True,
+            protected_relation={"pid": 903, "protected": False},
+        )
+
+    message = str(error.value)
+    assert "private_evidence=" in message
+    assert identity["native_command"] not in message
+    evidence_path = Path(message.split("private_evidence=", 1)[1].split(";", 1)[0])
+    payload = evidence_path.read_bytes()
+    evidence = json.loads(payload)
+    assert hashlib.sha256(payload).hexdigest() in message
+    assert evidence["raw_process_row"] == row
+    assert evidence["complete_current_identity"] == identity
+    assert evidence["identity_binding"]["creation"] == identity["creation"]
+    assert evidence["identity_binding"]["argv_sha256"] == identity["argv_sha256"]
+    assert evidence["identity_binding"]["native_command_sha256"] == identity["native_command_sha256"]
+    assert evidence["native_holder_module_paths"] == []
+    assert evidence["scoped_port_records"] == []
+    assert evidence["selected_relation"]["measured_product_relation"] is True
+    assert evidence["protected_relation"] == {"pid": 903, "protected": False}
+    assert evidence["source"]["revision"] == "checkpoint-1511"
+    assert evidence["source"]["artifact_sha256"]
+    source_path = Path(release.__file__).resolve()
+    assert source_path.exists()
+    assert source_path.name == "release.py"
+    assert Path(evidence["source"]["artifact"]).resolve() == source_path
+    assert evidence["source"]["artifact_sha256"] == hashlib.sha256(source_path.read_bytes()).hexdigest()
+    assert "scripts/scripts" not in evidence["source"]["artifact"].replace("\\", "/")
+    assert evidence["original_failure"]["type"] == "RuntimeError"
+    assert evidence["original_failure"]["traceback"]
+    if os.name != "nt":
+        assert evidence_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_resource_scope_failure_evidence_write_is_fail_closed(monkeypatch):
+    root = str(release.ROOT.resolve())
+    identity = _resource_identity(904, cwd="C:/other", executable="C:/tools/service.exe")
+    monkeypatch.setattr(
+        release,
+        "_record_private_resource_scope_failure",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("evidence destination denied")),
+    )
+
+    with pytest.raises(RuntimeError, match="original_failure=RuntimeError") as error:
+        release._resource_process_is_relevant(
+            {"pid": 904, "name": "service.exe", "executable": identity["executable"]},
+            root,
+            identity=identity,
+            positive_product_relation=True,
+        )
+
+    assert "diagnostic_failure=OSError" in str(error.value)
+    assert "evidence destination denied" not in str(error.value)
+
+
+def test_private_resource_scope_evidence_resolves_the_real_release_source():
+    assert release.SCRIPT_ROOT == Path(release.__file__).resolve().parents[1]
+    source_path = Path(release.__file__).resolve()
+    assert source_path.exists()
+    assert source_path.name == "release.py"
+
+
+def test_resource_scope_excludes_checked_protected_identity_with_product_relation():
+    root = str(release.ROOT.resolve())
+    identity = _resource_identity(
+        904,
+        cwd=root,
+        executable=f"{root}/.venv/Scripts/python.exe",
+        argv=["python.exe", "-m", "pytest", "scripts/tests"],
+    )
+    assert release._resource_process_is_relevant(
+        {"pid": 904, "name": "python.exe", "cwd": root},
+        root,
+        identity=identity,
+    ) is False
+
+
+def test_resource_scope_rejects_raw_protection_flag_when_product_relation_is_measured():
+    root = str(release.ROOT.resolve())
+    identity = _resource_identity(
+        905,
+        cwd=f"{root}/frontend",
+        argv=["node.exe", f"{root}/frontend/server.js"],
+    )
+    with pytest.raises(RuntimeError, match="protected or unrelated process retains a positive"):
+        release._resource_process_is_relevant(
+            {
+                "pid": 905,
+                "name": "node.exe",
+                "protected_or_unrelated_state": "protected",
+            },
+            root,
+            identity=identity,
+        )
+
+
+@pytest.mark.parametrize(
+    ("native_holder_module_paths", "scoped_port_records"),
+    [(("C:/product/lightningcss.node",), ()), ((), ((4100, 906),))],
+)
+def test_resource_scope_holders_and_ports_override_checked_protection(
+    native_holder_module_paths, scoped_port_records
+):
+    root = str(release.ROOT.resolve())
+    identity = _resource_identity(
+        906,
+        cwd=root,
+        executable=f"{root}/.venv/Scripts/python.exe",
+        argv=["python.exe", "-m", "pytest", "scripts/tests"],
+    )
+    assert release._resource_process_is_relevant(
+        {"pid": 906, "name": "python.exe", "cwd": root},
+        root,
+        identity=identity,
+        native_holder_module_paths=native_holder_module_paths,
+        scoped_port_records=scoped_port_records,
+    ) is True
 
 
 def test_canonical_windows_paths_use_case_and_component_boundaries():
@@ -3360,6 +4197,18 @@ def test_resource_scope_excludes_system_processes_without_full_fields(pid):
     ) is False
 
 
+@pytest.mark.parametrize("parent_pid", [False, 4.0, PidSubclass(4), None])
+def test_fresh_process_row_rejects_malformed_parent_on_system_sentinel(parent_pid):
+    with pytest.raises(RuntimeError, match="invalid or missing parent PID"):
+        release._fresh_process_row_needs_identity(
+            {"pid": 0, "parent_pid": parent_pid},
+            product_root="C:/product",
+            native_holder_pids=set(),
+            scoped_port_owner_pids=set(),
+            protected_pids=set(),
+        )
+
+
 @pytest.mark.parametrize("pid", [False, 0.0, 4.0])
 def test_resource_scope_rejects_non_integer_sentinel_pids(pid):
     with pytest.raises(RuntimeError, match="invalid"):
@@ -3367,6 +4216,7 @@ def test_resource_scope_rejects_non_integer_sentinel_pids(pid):
     with pytest.raises(RuntimeError, match="invalid PID"):
         release._fresh_process_row_needs_identity(
             {"pid": pid, "name": "System"},
+            product_root="C:/product",
             native_holder_pids=set(),
             scoped_port_owner_pids=set(),
             protected_pids=set(),
@@ -10692,13 +11542,16 @@ def test_host_installer_final_pipe_drain_failure_is_retained(tmp_path, monkeypat
         assert "synthetic final pipe drain failure" in message
 
 
-def test_host_installer_descendants_ignores_windows_pid_zero_sentinel(monkeypatch):
+def test_host_installer_descendants_ignores_windows_parent_sentinels(monkeypatch):
     monkeypatch.setattr(
         release,
         "_enumerate_fresh_frontend_resources",
         lambda: {
             "processes": [
                 {"pid": 0, "parent_pid": 0, "name": "System Idle Process"},
+                {"pid": 4, "parent_pid": 0, "name": "System"},
+                {"pid": 127, "parent_pid": 4, "name": "unrelated"},
+                {"pid": 128, "parent_pid": 0, "name": "unrelated"},
                 {"pid": 125, "parent_pid": 1},
                 {"pid": 126, "parent_pid": 125},
             ],
@@ -10709,6 +11562,372 @@ def test_host_installer_descendants_ignores_windows_pid_zero_sentinel(monkeypatc
     )
 
     assert release._host_installer_descendants(125) == [126]
+
+
+@pytest.mark.parametrize("parent_pid", [False, 4.0, PidSubclass(4), None])
+def test_fresh_resource_scope_rejects_malformed_parent_on_system_sentinel(parent_pid):
+    resources = {
+        "processes": [{"pid": 0, "parent_pid": parent_pid}],
+        "holders": [],
+        "ports": [],
+        "read_errors": [],
+    }
+    with pytest.raises(RuntimeError, match="invalid or missing parent PID"):
+        release._fresh_resource_scope(resources, "C:/product", scoped_ports=set())
+
+
+@pytest.mark.parametrize("parent_pid", [False, 4.0, PidSubclass(4), None])
+def test_host_installer_descendants_rejects_malformed_parent_on_system_sentinel(monkeypatch, parent_pid):
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [{"pid": 0, "parent_pid": parent_pid}],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="invalid parent: pid=0"):
+        release._host_installer_descendants(999)
+
+
+@pytest.mark.parametrize("parent_pid", [False, True, 0.0, 4.0, -1])
+def test_host_installer_descendants_rejects_malformed_parent_values(monkeypatch, parent_pid):
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [{"pid": 125, "parent_pid": parent_pid}],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="invalid parent: pid=125"):
+        release._host_installer_descendants(999)
+
+
+def test_host_installer_descendants_rejects_pid_subclass(monkeypatch):
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [{"pid": PidSubclass(125), "parent_pid": 1}],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match=r"invalid PID: pid=125"):
+        release._host_installer_descendants(999)
+
+
+def test_host_installer_descendants_rejects_parent_pid_subclass(monkeypatch):
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [{"pid": 125, "parent_pid": PidSubclass(1)}],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match=r"invalid parent: pid=125 parent_pid=1"):
+        release._host_installer_descendants(999)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("pid", False, "invalid PID"),
+        ("pid", 125.0, "invalid PID"),
+        ("pid", PidSubclass(125), "invalid PID"),
+        ("parent_pid", False, "invalid parent"),
+        ("parent_pid", 1.0, "invalid parent"),
+        ("parent_pid", PidSubclass(1), "invalid parent"),
+    ],
+)
+def test_host_installer_descendant_records_rejects_malformed_pids_before_native_read(
+    monkeypatch, field, value, expected
+):
+    row = {"pid": 125, "parent_pid": 1, "command": "synthetic"}
+    row[field] = value
+    native_reads = []
+
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [row],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+
+    def fail_if_called(pid, *_args, **_kwargs):
+        native_reads.append(pid)
+        raise AssertionError("malformed installer PID reached native identity reader")
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", fail_if_called)
+
+    with pytest.raises(RuntimeError, match=expected) as error:
+        release._host_installer_descendant_records(125, {"argv": []})
+
+    assert native_reads == []
+    if field == "parent_pid":
+        assert "invalid parent: pid=125" in str(error.value)
+    else:
+        assert "invalid PID: pid=" in str(error.value)
+
+
+def test_host_installer_descendant_records_accepts_exact_integer_chain_and_sentinels(monkeypatch):
+    contract = {"argv": ["node", "frontend", "npm", "frontend", "ci", "--ignore-scripts"]}
+    command = "node frontend npm frontend ci --ignore-scripts"
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [
+                {"pid": 0, "parent_pid": 0},
+                {"pid": 4, "parent_pid": 0},
+                {"pid": 128, "parent_pid": 4},
+                {"pid": 125, "parent_pid": 1},
+                {"pid": 126, "parent_pid": 125, "command": command},
+                {"pid": 127, "parent_pid": 126, "command": command},
+            ],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+    native_reads = []
+
+    parent_pids = {125: 1, 126: 125, 127: 126}
+
+    def read_identity(pid, *_args, **_kwargs):
+        native_reads.append(pid)
+        return {
+            "pid": pid,
+            "creation": str(1000 + pid),
+            "parent_pid": parent_pids[pid],
+            "native_command": command,
+        }
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read_identity)
+
+    records = release._host_installer_descendant_records(125, contract)
+
+    assert native_reads == [127, 126, 126, 125]
+    assert [record["pid"] for record in records] == [127, 126]
+    assert records[0]["installer_parent_generation"]["parent_pid"] == 126
+
+
+def test_host_installer_descendant_records_rejects_reused_parent_generation_before_cleanup(monkeypatch):
+    contract = {"argv": ["node", "frontend", "npm", "frontend", "ci", "--ignore-scripts"]}
+    command = "node frontend npm frontend ci --ignore-scripts"
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [{"pid": 125, "parent_pid": 1}, {"pid": 126, "parent_pid": 125}],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+    native_reads = []
+
+    def read_identity(pid, *_args, **_kwargs):
+        native_reads.append(pid)
+        if pid == 126:
+            return {
+                "pid": 126,
+                "creation": "8000",
+                "parent_pid": 125,
+                "native_command": command,
+            }
+        return {"pid": 125, "creation": "9000", "parent_pid": 1, "native_command": command}
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read_identity)
+
+    with pytest.raises(RuntimeError, match="child predates captured parent generation"):
+        release._host_installer_descendant_records(125, contract)
+
+    assert native_reads == [126, 125]
+
+
+def _complete_installer_root_identity(pid, creation, parent_pid, command, *, executable="C:/Node/node.exe", cwd="C:/app/frontend"):
+    argv = ["node", "frontend", "npm", "frontend", "ci", "--ignore-scripts"]
+    return {
+        "pid": pid,
+        "creation": creation,
+        "parent_pid": parent_pid,
+        "executable": executable,
+        "cwd": cwd,
+        "argv": argv,
+        "argv_sha256": hashlib.sha256("\0".join(argv).encode()).hexdigest(),
+        "native_command": command,
+        "native_command_sha256": hashlib.sha256(command.encode()).hexdigest(),
+    }
+
+
+def test_host_installer_descendant_records_rejects_root_generation_reuse_before_children(monkeypatch):
+    contract = {"argv": ["node", "frontend", "npm", "frontend", "ci", "--ignore-scripts"]}
+    command = "node frontend npm frontend ci --ignore-scripts"
+    original = _complete_installer_root_identity(125, "1000", 1, command)
+    replacement = _complete_installer_root_identity(125, "2000", 1, command)
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [
+                {"pid": 125, "parent_pid": 1, "command": command},
+                {"pid": 126, "parent_pid": 125, "command": command},
+            ],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+    native_reads = []
+
+    def read_identity(pid, *_args, **_kwargs):
+        native_reads.append(pid)
+        return replacement
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read_identity)
+    stopped = []
+    monkeypatch.setattr(release, "_terminate_host_installer_process", lambda identity: stopped.append(identity["pid"]))
+
+    with pytest.raises(RuntimeError, match="root identity changed during census"):
+        release._cleanup_host_installer_resources(
+            type("Process", (), {"pid": 125})(),
+            contract,
+            frontend_root=Path("C:/app/frontend"),
+            initial_root_identity=original,
+        )
+
+    assert native_reads == [125]
+    assert stopped == []
+
+
+@pytest.mark.parametrize("field", ["executable", "native_command", "argv", "argv_sha256", "cwd", "creation"])
+def test_host_installer_descendant_records_rejects_changed_root_identity(monkeypatch, field):
+    contract = {"argv": ["node", "frontend", "npm", "frontend", "ci", "--ignore-scripts"]}
+    command = "node frontend npm frontend ci --ignore-scripts"
+    original = _complete_installer_root_identity(125, "1000", 1, command)
+    current = dict(original)
+    if field == "executable":
+        current[field] = "C:/Other/node.exe"
+    elif field == "native_command":
+        current[field] = "node other ci --ignore-scripts"
+        current["native_command_sha256"] = hashlib.sha256(current[field].encode()).hexdigest()
+    elif field == "argv":
+        current[field] = ["node", "other", "npm", "frontend", "ci", "--ignore-scripts"]
+        current["argv_sha256"] = hashlib.sha256("\0".join(current[field]).encode()).hexdigest()
+    elif field == "argv_sha256":
+        current[field] = "0" * 64
+    elif field == "cwd":
+        current[field] = "C:/Other/frontend"
+    else:
+        current[field] = "2000"
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [{"pid": 125, "parent_pid": 1, "command": command}],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: current)
+
+    with pytest.raises(RuntimeError, match="root identity"):
+        release._host_installer_descendant_records(125, contract, root_identity=original)
+
+
+def test_host_installer_descendant_records_accepts_stable_exact_root_and_child(monkeypatch):
+    contract = {"argv": ["node", "frontend", "npm", "frontend", "ci", "--ignore-scripts"]}
+    command = "node frontend npm frontend ci --ignore-scripts"
+    root = _complete_installer_root_identity(125, "1000", 1, command)
+    child = {
+        "pid": 126,
+        "creation": "2000",
+        "parent_pid": 125,
+        "native_command": command,
+    }
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [
+                {"pid": 125, "parent_pid": 1, "command": command},
+                {"pid": 126, "parent_pid": 125, "command": command},
+            ],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+    reads = iter((root, root, child))
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: next(reads))
+
+    records = release._host_installer_descendant_records(125, contract, root_identity=root)
+
+    assert [record["pid"] for record in records] == [126]
+    assert records[0]["installer_parent_generation"]["parent_creation"] == "1000"
+
+
+def test_host_installer_descendant_records_rejects_child_older_than_reused_parent(monkeypatch):
+    contract = {"argv": ["node", "frontend", "npm", "frontend", "ci", "--ignore-scripts"]}
+    command = "node frontend npm frontend ci --ignore-scripts"
+    root = _complete_installer_root_identity(125, "1000", 1, command)
+    child = {"pid": 126, "creation": "800", "parent_pid": 125, "native_command": command}
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [
+                {"pid": 125, "parent_pid": 1, "command": command},
+                {"pid": 126, "parent_pid": 125, "command": command},
+            ],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+    reads = iter((root, root, child))
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: next(reads))
+
+    with pytest.raises(RuntimeError, match="child predates captured parent generation"):
+        release._host_installer_descendant_records(125, contract, root_identity=root)
+
+
+def test_host_installer_descendants_rejects_selected_cycle(monkeypatch):
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [
+                {"pid": 125, "parent_pid": 126},
+                {"pid": 126, "parent_pid": 125},
+            ],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="cycle"):
+        release._host_installer_descendants(125)
 
 
 def test_host_installer_timeout_is_a_failure_and_does_not_report_completion(tmp_path, monkeypatch):
@@ -10759,9 +11978,18 @@ def test_host_installer_timeout_drains_owned_descendants_before_root_and_retains
     }
     child_identity = {
         "pid": 126,
-        "creation": "child-creation",
+        "creation": "2000",
+        "parent_pid": 124,
         "native_command": f'{node} {npm_cli} --prefix {frontend} ci --ignore-scripts',
+        "installer_parent_generation": {
+            "child_pid": 126,
+            "child_creation": "2000",
+            "parent_pid": 124,
+            "parent_creation": "1000",
+            "relation": "current parent generation of exact installer child",
+        },
     }
+    root_identity["creation"] = "1000"
 
     class FakeProcess:
         pid = 124
@@ -10788,7 +12016,11 @@ def test_host_installer_timeout_drains_owned_descendants_before_root_and_retains
 
     monkeypatch.setattr(release.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
     monkeypatch.setattr(release, "_read_fresh_native_process_identity", read_identity)
-    monkeypatch.setattr(release, "_host_installer_descendant_records", lambda _pid, _contract: next(census))
+    monkeypatch.setattr(
+        release,
+        "_host_installer_descendant_records",
+        lambda _pid, _contract, *, root_identity=None: next(census),
+    )
     monkeypatch.setattr(release, "_terminate_host_installer_process", lambda identity: stopped.append(identity["pid"]))
     monkeypatch.setattr(release, "_verify_host_installer_cleanup", lambda identities, frontend_root: {"resources": "released"})
     evidence = {}
@@ -10824,14 +12056,26 @@ def test_host_installer_rejects_early_return_with_live_descendant(tmp_path, monk
 
     child_identity = {
         "pid": 126,
-        "creation": "child-creation",
+        "creation": "2000",
+        "parent_pid": 125,
         "native_command": f'{node} {npm_cli} --prefix {frontend} ci --ignore-scripts',
+        "installer_parent_generation": {
+            "child_pid": 126,
+            "child_creation": "2000",
+            "parent_pid": 125,
+            "parent_creation": "1000",
+            "relation": "current parent generation of exact installer child",
+        },
     }
     stopped = []
     monkeypatch.setattr(release.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
     monkeypatch.setattr(release, "_host_installer_descendants", lambda _pid: [126])
     census = iter(([child_identity], []))
-    monkeypatch.setattr(release, "_host_installer_descendant_records", lambda _pid, _contract: next(census))
+    monkeypatch.setattr(
+        release,
+        "_host_installer_descendant_records",
+        lambda _pid, _contract, *, root_identity=None: next(census),
+    )
     states = iter((child_identity, release._FreshProcessAbsent("child exited")))
     def read_identity(_pid, *_args, **_kwargs):
         value = next(states)
@@ -10852,7 +12096,7 @@ def test_host_installer_cleanup_rejects_unreadable_census(tmp_path, monkeypatch)
     monkeypatch.setattr(
         release,
         "_host_installer_descendant_records",
-        lambda *_: (_ for _ in ()).throw(RuntimeError("census unreadable")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("census unreadable")),
     )
     monkeypatch.setattr(release, "_monotonic_now", lambda: 0.0)
     with pytest.raises(RuntimeError, match="census unreadable"):
