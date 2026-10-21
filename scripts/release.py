@@ -2822,10 +2822,70 @@ def _identity_is_protected(identity: dict[str, Any], product_root: str) -> bool:
         return False
     if executable not in {"python", "python.exe", "cmd", "cmd.exe", "node", "node.exe"}:
         return False
+    normalized_command = command.replace("\\", "/")
+    normalized_argv = argv.replace("\\", "/")
+    release_script_marker = "scripts/release.py" in normalized_command or "scripts/release.py" in normalized_argv
+    if release_script_marker:
+        expected_executable = _canonical_windows_path_identity(
+            SCRIPT_ROOT / ".venv" / "Scripts" / "python.exe"
+        )
+        expected_script = _canonical_windows_path_identity(Path(__file__).resolve())
+        child_argv = identity.get("argv")
+        child_creation = identity.get("creation")
+        parent_pid = identity.get("parent_pid")
+        if (
+            _canonical_windows_path_identity(identity.get("executable", "")) != expected_executable
+            or not isinstance(child_argv, list)
+            or len(child_argv) != 3
+            or _canonical_windows_path_identity(child_argv[0]) != expected_executable
+            or _canonical_windows_path_identity(child_argv[1]) != expected_script
+            or child_argv[2] not in {"prepare", "observe", "execute", "verify"}
+            or not isinstance(child_creation, str)
+            or not child_creation.isdigit()
+            or not _is_parent_pid(parent_pid)
+        ):
+            return False
+        try:
+            child_generation = int(child_creation)
+        except ValueError:
+            return False
+        for observation in identity.get("parent_observations", []):
+            if not isinstance(observation, dict):
+                continue
+            parent_argv = observation.get("argv")
+            parent_command = observation.get("native_command")
+            parent_creation = observation.get("creation")
+            if (
+                observation.get("state") != "readable_current_parent"
+                or observation.get("relation") != "current parent of exact child identity"
+                or observation.get("pid") != parent_pid
+                or not isinstance(parent_creation, str)
+                or not parent_creation.isdigit()
+                or not isinstance(observation.get("cwd"), str)
+                or not observation["cwd"]
+                or not isinstance(observation.get("executable"), str)
+                or not observation["executable"]
+                or not isinstance(parent_argv, list)
+                or not parent_argv
+                or not all(isinstance(argument, str) and argument for argument in parent_argv)
+                or not isinstance(parent_command, str)
+                or not parent_command
+                or observation.get("argv_sha256")
+                != hashlib.sha256("\0".join(parent_argv).encode("utf-8")).hexdigest()
+                or observation.get("native_command_sha256")
+                != hashlib.sha256(parent_command.encode("utf-8")).hexdigest()
+            ):
+                continue
+            try:
+                if int(parent_creation) > child_generation:
+                    continue
+            except ValueError:
+                continue
+            return True
+        return False
     protected_markers = (
         "pytest",
         "runpy",
-        "scripts/release.py",
         "scripts/verify_live.py",
         "scripts/tests/",
         "backend/tests/",

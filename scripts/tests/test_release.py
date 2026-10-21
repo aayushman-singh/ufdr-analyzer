@@ -4034,6 +4034,137 @@ def test_resource_scope_excludes_checked_protected_identity_with_product_relatio
     ) is False
 
 
+def _release_hook_scope_identity(root, *, parent_pid=25200, child_creation="200", parent_creation="100"):
+    project_python = str(Path(root) / ".venv" / "Scripts" / "python.exe")
+    script = str(Path(release.__file__).resolve())
+    parent_argv = [
+        "C:/JarvisDeploy/jarvis/.venv/Scripts/python.exe",
+        "C:/JarvisDeploy/jarvis/service/worker.py",
+    ]
+    parent_command = " ".join(parent_argv)
+    parent = {
+        "pid": parent_pid,
+        "state": "readable_current_parent",
+        "relation": "current parent of exact child identity",
+        "creation": parent_creation,
+        "parent_pid": 1,
+        "cwd": "C:/JarvisDeploy/jarvis",
+        "executable": parent_argv[0],
+        "argv": parent_argv,
+        "argv_sha256": hashlib.sha256("\0".join(parent_argv).encode()).hexdigest(),
+        "native_command": parent_command,
+        "native_command_sha256": hashlib.sha256(parent_command.encode()).hexdigest(),
+    }
+    identity = _resource_identity(
+        904,
+        cwd=root,
+        executable=project_python,
+        argv=[project_python, script, "prepare"],
+        parent_observations=[parent],
+    )
+    identity["creation"] = child_creation
+    identity["parent_pid"] = parent_pid
+    return identity
+
+
+def _scope_resources(identity):
+    return {
+        "processes": [{
+            "pid": identity["pid"],
+            "name": "python.exe",
+            "executable": identity["executable"],
+            "cwd": identity["cwd"],
+            "parent_pid": identity["parent_pid"],
+            "current_identity": identity,
+        }],
+        "holders": [],
+        "ports": [],
+        "read_errors": [],
+    }
+
+
+def test_fresh_resource_scope_accepts_the_complete_current_release_hook_contract():
+    root = str(release.ROOT.resolve())
+    identity = _release_hook_scope_identity(root)
+
+    result = release._fresh_resource_scope(
+        _scope_resources(identity),
+        root,
+        scoped_ports=set(),
+        preloaded_identities={identity["pid"]: identity},
+    )
+
+    assert result["relevant_processes"] == []
+    assert result["identities"][identity["pid"]] == identity
+
+
+@pytest.mark.parametrize("resource_kind", ["module", "port"])
+def test_fresh_resource_scope_resource_ownership_overrides_hook_protection(resource_kind, monkeypatch):
+    root = str(release.ROOT.resolve())
+    identity = _release_hook_scope_identity(root)
+    resources = _scope_resources(identity)
+    scoped_ports = set()
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
+    if resource_kind == "module":
+        native_path = str((release.SCRIPT_ROOT / release.HOST_NATIVE_MODULE).resolve())
+        resources["holders"] = [{"pid": identity["pid"], "module_paths": [native_path]}]
+    else:
+        resources["ports"] = [{"port": 4100, "pid": identity["pid"]}]
+        scoped_ports = {4100}
+
+    result = release._fresh_resource_scope(
+        resources,
+        root,
+        scoped_ports=scoped_ports,
+        preloaded_identities={identity["pid"]: identity},
+    )
+
+    assert [entry["identity"]["pid"] for entry in result["relevant_processes"]] == [identity["pid"]]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda identity: identity["parent_observations"][0].update(creation="300"),
+        lambda identity: identity.update(parent_pid=25201),
+        lambda identity: identity.update(argv=[identity["argv"][0], "-c", "print('sample')"]),
+    ],
+    ids=["changed-parent-generation", "mismatched-parent", "arbitrary-same-interpreter-command"],
+)
+def test_fresh_resource_scope_blocks_release_hook_lookalikes(tmp_path, monkeypatch, mutate):
+    root = str(release.ROOT.resolve())
+    identity = _release_hook_scope_identity(root)
+    mutate(identity)
+    identity["native_command"] = " ".join(identity["argv"])
+    identity["argv_sha256"] = hashlib.sha256("\0".join(identity["argv"]).encode()).hexdigest()
+    identity["native_command_sha256"] = hashlib.sha256(identity["native_command"].encode()).hexdigest()
+    if identity["parent_observations"][0].get("pid") != identity["parent_pid"]:
+        identity["parent_observations"][0]["pid"] = 25200
+    monkeypatch.setattr(release, "EXTERNAL_PROOF_ROOT", tmp_path)
+    with pytest.raises(RuntimeError, match="unprotected product-root process"):
+        release._fresh_resource_scope(
+            _scope_resources(identity),
+            root,
+            scoped_ports=set(),
+            preloaded_identities={identity["pid"]: identity},
+        )
+
+
+def test_fresh_resource_scope_rejects_an_incomplete_hook_identity(monkeypatch):
+    root = str(release.ROOT.resolve())
+    identity = _release_hook_scope_identity(root)
+    identity.pop("parent_observations")
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
+
+    with pytest.raises(RuntimeError, match="identity fields=.*parent_observations"):
+        release._fresh_resource_scope(
+            _scope_resources(identity),
+            root,
+            scoped_ports=set(),
+            preloaded_identities={identity["pid"]: identity},
+        )
+
+
 def test_resource_scope_rejects_raw_protection_flag_when_product_relation_is_measured():
     root = str(release.ROOT.resolve())
     identity = _resource_identity(
