@@ -65,6 +65,10 @@ CANONICAL_EVIDENCE_MANIFEST = {
 class PreflightValidationError(ValueError):
     """The verifier arguments are invalid before any external interaction."""
 
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.public_message = message
+
 
 class LiveUrlValidationError(PreflightValidationError):
     """The verifier target is outside the authorized live origin."""
@@ -84,9 +88,10 @@ def _validate_live_url(value: object) -> str:
         port = parsed.port
     except ValueError as exc:
         raise LiveUrlValidationError("--url must be the authorized CiteSpan HTTPS origin") from exc
+    if parsed.scheme != "https":
+        raise LiveUrlValidationError("--url must use HTTPS")
     if (
-        parsed.scheme != "https"
-        or parsed.netloc != "citespan.169.58.64.150.nip.io"
+        parsed.netloc != "citespan.169.58.64.150.nip.io"
         or parsed.hostname != "citespan.169.58.64.150.nip.io"
         or parsed.username is not None
         or parsed.password is not None
@@ -101,7 +106,7 @@ def _validate_live_url(value: object) -> str:
 
 def _validate_run_id(value: object) -> str:
     if not isinstance(value, str) or not value:
-        raise PreflightValidationError("--run-id must identify the canonical synthetic demo run")
+        raise PreflightValidationError("--run-id must identify the canonical synthetic demo run ID")
     if value != CANONICAL_DEMO_RUN_ID:
         raise PreflightValidationError("--run-id must equal the canonical synthetic demo run ID")
     return value
@@ -181,6 +186,42 @@ def _record_private_failure(step: str, exc: BaseException, state: dict[str, obje
         encoding="utf-8",
     )
     return path
+
+
+def _bounded_failure_response(exc: BaseException) -> dict[str, object]:
+    """Return a fixed public failure without private diagnostic content."""
+    if isinstance(exc, PreflightValidationError):
+        return {
+            "complete": False,
+            "status": "fail",
+            "failure_code": "preflight_validation_failed",
+            "error": exc.public_message,
+        }
+    return {
+        "complete": False,
+        "status": "fail",
+        "failure_code": "live_verification_failed",
+        "error": "live verification failed; see private evidence",
+    }
+
+
+def _record_failure_response(
+    step: str, exc: BaseException, state: dict[str, object]
+) -> dict[str, object]:
+    """Record private failure details and return only bounded public state."""
+    try:
+        _record_private_failure(step, exc, state)
+    except Exception:
+        return {
+            "complete": False,
+            "status": "fail",
+            "failure_code": "operation_and_private_evidence_persistence_failed",
+            "error": "live verification failed and private evidence was not recorded",
+            "private_evidence_status": "write_failed",
+        }
+    response = _bounded_failure_response(exc)
+    response["private_evidence_status"] = "write_completed"
+    return response
 
 
 def _sanitize_failure_text(value: str) -> str:
@@ -325,7 +366,7 @@ def _write_proof_artifacts(
     *,
     complete: bool = True,
 ) -> dict:
-    """Write durable proof and the draft only after browser proof passes."""
+    """Write proof and the draft only after browser proof passes."""
     if complete is not True:
         raise RuntimeError("live proof is not complete")
     _validate_cited_response(observed_response, CANONICAL_DEMO_RUN_ID)
@@ -611,19 +652,17 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except PreflightValidationError as exc:
+        print(json.dumps(_bounded_failure_response(exc), sort_keys=True))
+        raise SystemExit(1)
     except Exception as exc:
-        if isinstance(exc, PreflightValidationError):
-            print(json.dumps({"complete": False, "error": _sanitize_failure_text(str(exc))}))
-            print(f"live verification failed before external interaction: {exc}", file=sys.stderr)
-        else:
-            evidence = _record_private_failure(
-                " ".join(sys.argv[1:]) or "verify_live",
-                exc,
-                {
-                    "url": os.environ.get("CITESPAN_URL", "<not-provided>"),
-                    "run_id": os.environ.get("CITESPAN_DEMO_RUN_ID", "<not-provided>"),
-                },
-            )
-            print(json.dumps({"complete": False, "error": _sanitize_failure_text(str(exc)), "failure_evidence": str(evidence)}))
-            print(f"live verification failed; evidence={evidence}\n{traceback.format_exc()}", file=sys.stderr)
+        response = _record_failure_response(
+            " ".join(sys.argv[1:]) or "verify_live",
+            exc,
+            {
+                "url": os.environ.get("CITESPAN_URL", "<not-provided>"),
+                "run_id": os.environ.get("CITESPAN_DEMO_RUN_ID", "<not-provided>"),
+            },
+        )
+        print(json.dumps(response, sort_keys=True))
         raise SystemExit(1)

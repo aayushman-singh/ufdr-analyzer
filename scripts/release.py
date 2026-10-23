@@ -2718,30 +2718,39 @@ def _read_fresh_parent_observation(
         ) from exc
 
     required_live_fields = (
-        "parent_pid", "cwd", "executable", "argv", "argv_sha256",
-        "native_command", "native_command_sha256",
+        "parent_pid",
+        "cwd",
+        "executable",
+        "argv",
+        "argv_sha256",
+        "native_command",
+        "native_command_sha256",
+        "role",
+        "family_relation",
+        "read_errors",
+        "listening_ports",
+        "source_provenance",
+        "module_paths",
+        "files",
+        "ports",
     )
     missing = [field for field in required_live_fields if field not in second]
     if missing:
         raise _FreshProcessUnreadable(
             f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
-            f"stable live parent evidence is incomplete: fields={missing}"
+            f"incomplete fresh parent identity: fields={missing}"
         )
     if not _is_parent_pid(second["parent_pid"]):
         raise _FreshProcessUnreadable(
             f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
             f"native parent-of-parent PID is invalid: parent_pid={second['parent_pid']!r}"
         )
-    if not isinstance(second["cwd"], str) or not second["cwd"]:
-        raise _FreshProcessUnreadable(
-            f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
-            "native parent cwd is invalid"
-        )
-    if not isinstance(second["executable"], str) or not second["executable"]:
-        raise _FreshProcessUnreadable(
-            f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
-            "native parent executable is invalid"
-        )
+    for field in ("cwd", "executable", "native_command", "role", "family_relation"):
+        if not isinstance(second[field], str) or not second[field].strip():
+            raise _FreshProcessUnreadable(
+                f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
+                f"incomplete fresh parent identity: field={field}"
+            )
     if not isinstance(second["argv"], list) or not second["argv"] or not all(
         isinstance(argument, str) for argument in second["argv"]
     ):
@@ -2764,6 +2773,17 @@ def _read_fresh_parent_observation(
             f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
             "native parent command hash does not match command"
         )
+    for field in ("read_errors", "listening_ports", "module_paths", "files", "ports"):
+        if not isinstance(second[field], list) or (field == "read_errors" and second[field]):
+            raise _FreshProcessUnreadable(
+                f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
+                f"incomplete fresh parent identity: field={field}"
+            )
+    if not isinstance(second["source_provenance"], dict) or not second["source_provenance"]:
+        raise _FreshProcessUnreadable(
+            f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
+            "incomplete fresh parent identity: field=source_provenance"
+        )
     if second["parent_pid"] == child_pid:
         raise _FreshProcessUnreadable(
             f"child_pid={child_pid} parent_pid={parent_pid} read_stage=second-read "
@@ -2781,6 +2801,14 @@ def _read_fresh_parent_observation(
             "argv_sha256": second["argv_sha256"],
             "native_command": second["native_command"],
             "native_command_sha256": second["native_command_sha256"],
+            "role": second["role"],
+            "family_relation": second["family_relation"],
+            "read_errors": list(second["read_errors"]),
+            "listening_ports": list(second["listening_ports"]),
+            "source_provenance": dict(second["source_provenance"]),
+            "module_paths": list(second["module_paths"]),
+            "files": list(second["files"]),
+            "ports": list(second["ports"]),
             "relation": "current parent of exact child identity",
         }
     ]
@@ -3563,7 +3591,7 @@ def _assert_current_observer_generation(
     role: str,
     phase: str,
     expected_identity: dict[str, Any] | None = None,
-) -> None:
+) -> dict[str, Any]:
     """Recheck a caller's explicit observer role around resource classification."""
     pid = os.getpid()
     product_root = str(ROOT.resolve())
@@ -3618,6 +3646,7 @@ def _assert_current_observer_generation(
                 "release blocked: current census observer identity changed during classification: "
                 f"pid={pid} phase={phase} field={field}"
             )
+    return current
 
 
 def _fresh_process_row_needs_identity(
@@ -3682,7 +3711,7 @@ def _read_stable_protected_relation(
     if parent_pid not in protected_pids:
         return None
 
-    def read_identity(current_pid: int, *, parent: bool = False) -> dict[str, Any]:
+    def read_limited_identity(current_pid: int, *, parent: bool = False) -> dict[str, Any]:
         try:
             identity = _read_fresh_native_process_identity(
                 current_pid,
@@ -3701,8 +3730,8 @@ def _read_stable_protected_relation(
             ) from exc
         if not isinstance(identity, dict) or identity.get("pid") != current_pid:
             raise _FreshProcessUnreadable(
-                "release blocked: protected relation identity does not match: "
-                f"pid={current_pid}"
+                "release blocked: protected relation "
+                f"{'parent ' if parent else ''}identity does not match: pid={current_pid}"
             )
         creation = identity.get("creation")
         if not isinstance(creation, str) or not creation.isdigit():
@@ -3710,165 +3739,134 @@ def _read_stable_protected_relation(
                 "release blocked: protected relation identity has no comparable creation token: "
                 f"pid={current_pid} creation={creation!r}"
             )
-        return identity
+        identity_parent_pid = identity.get("parent_pid")
+        if not _is_parent_pid(identity_parent_pid):
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation identity has invalid parent evidence: "
+                f"pid={current_pid} parent_pid={identity_parent_pid!r}"
+            )
+        executable = identity.get("executable")
+        if not isinstance(executable, str) or not executable.strip():
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation native executable is unreadable: "
+                f"pid={current_pid}"
+            )
+        try:
+            metadata = _read_current_protected_process_metadata(current_pid)
+        except (RuntimeError, _FreshProcessAbsent, _FreshProcessUnreadable) as exc:
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation metadata is unreadable: "
+                f"pid={current_pid}: {exc}"
+            ) from exc
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("pid") != current_pid
+            or not _is_parent_pid(metadata.get("parent_pid"))
+            or not isinstance(metadata.get("executable"), str)
+            or not metadata["executable"].strip()
+            or not isinstance(metadata.get("command"), str)
+            or not metadata["command"].strip()
+        ):
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation metadata is incomplete or invalid: "
+                f"pid={current_pid}"
+            )
+        if metadata["parent_pid"] != identity_parent_pid:
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation parent metadata changed: "
+                f"pid={current_pid} native_parent_pid={identity_parent_pid!r} "
+                f"metadata_parent_pid={metadata['parent_pid']!r}"
+            )
+        if parent and metadata["parent_pid"] == pid:
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation parent ancestry cycle detected: "
+                f"pid={pid} parent_pid={current_pid}"
+            )
+        return {"native": identity, "metadata": metadata}
 
-    def parent_edge(identity: dict[str, Any], phase: str) -> dict[str, Any]:
+    def metadata_fingerprint(evidence: dict[str, Any]) -> tuple[str, str, str]:
+        metadata = evidence["metadata"]
+        executable = _canonical_windows_path_identity(metadata["executable"])
+        command_sha256 = hashlib.sha256(metadata["command"].encode("utf-8")).hexdigest()
+        return executable, metadata["command"], command_sha256
+
+    def bind_child(
+        evidence: dict[str, Any], parent_evidence: dict[str, Any]
+    ) -> dict[str, Any]:
+        identity = dict(evidence["native"])
+        metadata = evidence["metadata"]
+        parent_identity = parent_evidence["native"]
         if identity.get("parent_pid") != parent_pid:
             raise _FreshProcessUnreadable(
                 "release blocked: protected relation parent changed for child: "
-                f"pid={pid} phase={phase} expected_parent_pid={parent_pid} "
+                f"pid={pid} expected_parent_pid={parent_pid} "
                 f"actual_parent_pid={identity.get('parent_pid')!r}"
             )
-        observations = identity.get("parent_observations")
-        if not isinstance(observations, list) or not observations:
-            raise _FreshProcessUnreadable(
-                "release blocked: protected relation child lacks parent generation proof: "
-                f"pid={pid} phase={phase}"
-            )
-        for observation in observations:
-            if not isinstance(observation, dict):
-                continue
-            if observation.get("state") != "readable_current_parent":
-                continue
-            if observation.get("relation") != "current parent of exact child identity":
-                continue
-            if observation.get("pid") != parent_pid:
-                continue
-            creation = observation.get("creation")
-            if not isinstance(creation, str) or not creation.isdigit():
-                continue
-            argv = observation.get("argv")
-            native_command = observation.get("native_command")
-            if not isinstance(argv, list) or not argv or not all(
-                isinstance(argument, str) for argument in argv
-            ):
-                continue
-            if not isinstance(native_command, str) or not native_command:
-                continue
-            if observation.get("argv_sha256") != hashlib.sha256(
-                "\0".join(argv).encode("utf-8")
-            ).hexdigest():
-                continue
-            if observation.get("native_command_sha256") != hashlib.sha256(
-                native_command.encode("utf-8")
-            ).hexdigest():
-                continue
-            return observation
-        raise _FreshProcessUnreadable(
-            "release blocked: protected relation child has no exact readable parent edge: "
-            f"pid={pid} parent_pid={parent_pid} phase={phase}"
-        )
+        identity["command"] = metadata["command"]
+        identity["protected_metadata"] = {
+            "pid": metadata["pid"],
+            "parent_pid": metadata["parent_pid"],
+            "executable": metadata["executable"],
+            "command": metadata["command"],
+            "command_sha256": metadata_fingerprint(evidence)[2],
+        }
+        identity["parent_observations"] = [{
+            "pid": parent_pid,
+            "state": "readable_current_parent",
+            "creation": parent_identity["creation"],
+            "relation": "current parent of exact child identity",
+            "executable": parent_evidence["metadata"]["executable"],
+            "command": parent_evidence["metadata"]["command"],
+            "command_sha256": metadata_fingerprint(parent_evidence)[2],
+        }]
+        return identity
 
-    def child_command_fingerprint(identity: dict[str, Any], phase: str) -> tuple[str, str]:
-        argv = identity.get("argv")
-        native_command = identity.get("native_command")
-        if not isinstance(argv, list) or not argv or not all(
-            isinstance(argument, str) for argument in argv
-        ):
-            raise _FreshProcessUnreadable(
-                "release blocked: protected relation child argv is invalid: "
-                f"pid={pid} phase={phase}"
-            )
-        if not isinstance(native_command, str) or not native_command:
-            raise _FreshProcessUnreadable(
-                "release blocked: protected relation child command is invalid: "
-                f"pid={pid} phase={phase}"
-            )
-        argv_sha256 = hashlib.sha256("\0".join(argv).encode("utf-8")).hexdigest()
-        command_sha256 = hashlib.sha256(native_command.encode("utf-8")).hexdigest()
-        if (
-            identity.get("argv_sha256") != argv_sha256
-            or identity.get("native_command_sha256") != command_sha256
-        ):
-            raise _FreshProcessUnreadable(
-                "release blocked: protected relation child command identity is incoherent: "
-                f"pid={pid} phase={phase}"
-            )
-        return argv_sha256, command_sha256
+    first_child = read_limited_identity(pid)
+    first_parent = read_limited_identity(parent_pid, parent=True)
+    second_child = read_limited_identity(pid)
+    second_parent = read_limited_identity(parent_pid, parent=True)
 
-    first = read_identity(pid)
-    first_parent = read_identity(parent_pid, parent=True)
-    second = read_identity(pid)
-    second_parent = read_identity(parent_pid, parent=True)
-    first_edge = parent_edge(first, "before")
-    second_edge = parent_edge(second, "after")
-    first_child_hashes = child_command_fingerprint(first, "before")
-    second_child_hashes = child_command_fingerprint(second, "after")
-
-    for phase, identity in (("before", first), ("after", second)):
-        if not isinstance(identity, dict) or identity.get("pid") != pid:
-            raise _FreshProcessUnreadable(
-                "release blocked: protected relation identity does not match: "
-                f"pid={pid} phase={phase}"
-            )
-        creation = identity.get("creation")
-        if not isinstance(creation, str) or not creation:
-            raise _FreshProcessUnreadable(
-                "release blocked: protected relation identity has no creation token: "
-                f"pid={pid} phase={phase}"
-            )
+    for phase, evidence in (("before", first_child), ("after", second_child)):
+        identity = evidence["native"]
         if identity.get("parent_pid") != parent_pid:
             raise _FreshProcessUnreadable(
                 "release blocked: protected relation parent changed: "
                 f"pid={pid} phase={phase} expected_parent_pid={parent_pid} "
                 f"actual_parent_pid={identity.get('parent_pid')!r}"
             )
-        if expected_creation is not None and creation != expected_creation:
+        if expected_creation is not None and identity["creation"] != expected_creation:
             raise _FreshProcessUnreadable(
                 "release blocked: protected relation creation changed during binding: "
-                f"pid={pid} expected_creation={expected_creation!r} actual_creation={creation!r}"
+                f"pid={pid} expected_creation={expected_creation!r} actual_creation={identity['creation']!r}"
             )
-    for phase, parent_identity in (("before", first_parent), ("after", second_parent)):
-        if parent_identity.get("pid") != parent_pid:
-            raise _FreshProcessUnreadable(
-                "release blocked: protected relation parent identity does not match: "
-                f"pid={pid} phase={phase} expected_parent_pid={parent_pid} "
-                f"actual_parent_pid={parent_identity.get('pid')!r}"
-            )
-        if first.get("parent_pid") != parent_pid or second.get("parent_pid") != parent_pid:
-            raise _FreshProcessUnreadable(
-                "release blocked: protected relation parent changed: "
-                f"pid={pid} expected_parent_pid={parent_pid}"
-            )
-    if first.get("creation") != second.get("creation"):
+    if first_child["native"]["creation"] != second_child["native"]["creation"]:
         raise _FreshProcessUnreadable(
             "release blocked: protected relation creation changed during binding: "
-            f"pid={pid} before={first.get('creation')!r} after={second.get('creation')!r}"
+            f"pid={pid} before={first_child['native']['creation']!r} after={second_child['native']['creation']!r}"
         )
-    if first_child_hashes != second_child_hashes:
-        raise _FreshProcessUnreadable(
-            "release blocked: protected relation child command identity changed during binding: "
-            f"pid={pid} before={first_child_hashes!r} after={second_child_hashes!r}"
-        )
-    if first_edge.get("creation") != second_edge.get("creation"):
-        raise _FreshProcessUnreadable(
-            "release blocked: protected relation observed parent generation changed during child reads: "
-            f"pid={pid} parent_pid={parent_pid} before={first_edge.get('creation')!r} "
-            f"after={second_edge.get('creation')!r}"
-        )
-    if first_parent.get("creation") != second_parent.get("creation"):
+    if first_parent["native"]["creation"] != second_parent["native"]["creation"]:
         raise _FreshProcessUnreadable(
             "release blocked: protected relation parent generation changed during binding: "
-            f"pid={pid} parent_pid={parent_pid} before={first_parent.get('creation')!r} "
-            f"after={second_parent.get('creation')!r}"
+            f"pid={pid} parent_pid={parent_pid} before={first_parent['native']['creation']!r} "
+            f"after={second_parent['native']['creation']!r}"
         )
-    if (
-        first_edge.get("creation") != first_parent.get("creation")
-        or second_edge.get("creation") != second_parent.get("creation")
-    ):
+    if metadata_fingerprint(first_child) != metadata_fingerprint(second_child):
         raise _FreshProcessUnreadable(
-            "release blocked: protected relation edge and parent identity do not match: "
-            f"pid={pid} parent_pid={parent_pid} edge_before={first_edge.get('creation')!r} "
-            f"parent_before={first_parent.get('creation')!r} edge_after={second_edge.get('creation')!r} "
-            f"parent_after={second_parent.get('creation')!r}"
+            "release blocked: protected relation child command identity changed during binding: "
+            f"pid={pid}"
         )
-    if int(first.get("creation")) < int(first_parent.get("creation")):
+    if metadata_fingerprint(first_parent) != metadata_fingerprint(second_parent):
+        raise _FreshProcessUnreadable(
+            "release blocked: protected relation parent metadata changed during binding: "
+            f"pid={pid} parent_pid={parent_pid}"
+        )
+    if int(first_child["native"]["creation"]) < int(first_parent["native"]["creation"]):
         raise _FreshProcessUnreadable(
             "release blocked: protected relation child predates parent generation: "
-            f"pid={pid} child_creation={first.get('creation')} parent_pid={parent_pid} "
-            f"parent_creation={first_parent.get('creation')}"
+            f"pid={pid} child_creation={first_child['native']['creation']} parent_pid={parent_pid} "
+            f"parent_creation={first_parent['native']['creation']}"
         )
-    return second
+    return bind_child(second_child, second_parent)
 
 
 def _resource_port_records(value: list[Any]) -> list[tuple[int, int | None]]:
@@ -4344,6 +4342,10 @@ def _fresh_resource_scope(
         can_reuse_identity = (
             pid not in native_holder_pids
             and pid not in scoped_port_owner_pids
+            and not (
+                observer_bootstrap_identity is not None
+                and pid == observer_bootstrap_identity.get("pid")
+            )
             and _has_complete_resource_identity(identities.get(pid))
             and (row_identity is None or _has_complete_resource_identity(row_identity))
         )
@@ -4431,12 +4433,13 @@ def _fresh_resource_scope(
     if observer_identity is not None and not _has_complete_resource_identity(observer_identity):
         observer_identity = None
     if observer_identity is not None and observer_role is not None:
-        _assert_current_observer_generation(
+        observer_identity = _assert_current_observer_generation(
             observer_identity,
             role=observer_role,
             phase="before-classification",
             expected_identity=observer_bootstrap_identity,
         )
+        identities[observer_pid] = observer_identity
 
     relevant_processes = []
     for pid in sorted(candidate_pids):
@@ -5941,6 +5944,40 @@ def _record_private_failure(command: str, exc: BaseException, state: dict[str, A
         encoding="utf-8",
     )
     return evidence_path
+
+
+def _private_failure_write_failure_response(
+    command: str,
+) -> dict[str, Any]:
+    """Build the bounded hook response for a failed private evidence write."""
+    return {
+        "complete": False,
+        "status": "fail",
+        "hook": command,
+        "failure_code": "operation_and_private_evidence_persistence_failed",
+        "summary": "Dependent work stopped. The private evidence write did not complete.",
+        "private_evidence_status": "write_failed",
+    }
+
+
+_PUBLIC_SAFE_FAILURE_MESSAGES = (
+    ("literal credential", "release blocked: literal credential"),
+    ("action_key", "release blocked: action_key is required"),
+    ("DEMO_MODE", "release blocked: DEMO_MODE must be 1"),
+)
+
+
+def _public_failure_error(exc: BaseException) -> str:
+    """Return only an allowlisted contract diagnostic for provider output."""
+    if isinstance(exc, _MissingProjectPythonPreflight):
+        return "release blocked: project Python is missing"
+    if isinstance(exc, _WrongProjectPythonPreflight):
+        return "release blocked: configured project Python is invalid"
+    detail = str(exc)
+    for marker, message in _PUBLIC_SAFE_FAILURE_MESSAGES:
+        if marker in detail:
+            return message
+    return "release hook operation failed; see private evidence"
 
 
 def _record_private_ssh_timeout(
@@ -7526,15 +7563,27 @@ def _check_payload_runtime_placeholders(payload: dict[str, Any]) -> None:
     visit(payload)
 
 
+class _MissingProjectPythonPreflight(RuntimeError):
+    """Identify an absent configured project interpreter."""
+
+
+class _WrongProjectPythonPreflight(RuntimeError):
+    """Identify a configured interpreter that is not the project interpreter."""
+
+
 def _require_project_python(command: str) -> None:
+    if not PROJECT_PYTHON.is_file():
+        raise _MissingProjectPythonPreflight("release blocked: project Python is missing")
     expected = PROJECT_PYTHON.resolve()
     try:
         actual = Path(sys.executable).resolve()
     except OSError as exc:
-        raise RuntimeError(f"{command} command must use the project virtual-environment Python") from exc
+        raise _WrongProjectPythonPreflight(
+            f"{command} command must use the project virtual-environment Python"
+        ) from exc
     if actual != expected:
-        raise RuntimeError(
-            f"{command} command must use the project Python is missing or is not the project virtual-environment Python: {PROJECT_PYTHON}"
+        raise _WrongProjectPythonPreflight(
+            f"{command} command must use the configured project virtual-environment Python"
         )
 
 
@@ -9471,7 +9520,7 @@ def _verify(
             raise RuntimeError(f"verification returned non-existent {field}")
     launch_post_path = Path(result["launch_post_path"])
     if result["launch_post"] != launch_post_path.read_text(encoding="utf-8"):
-        raise RuntimeError("verification launch post does not match its durable artifact")
+        raise RuntimeError("verification launch post does not match its written artifact")
     return result
 
 
@@ -9498,14 +9547,34 @@ def main() -> int:
         print(json.dumps(_sanitize_public_success(value), sort_keys=True))
         return 0
     except Exception as exc:
-        evidence = _record_private_failure(
-            args.command,
-            exc,
-            {"root": str(ROOT), "python": _failure_python_description()},
+        try:
+            _record_private_failure(
+                args.command,
+                exc,
+                {"root": str(ROOT), "python": _failure_python_description()},
+            )
+        except Exception:
+            response = _private_failure_write_failure_response(
+                args.command,
+            )
+            print(json.dumps(response, sort_keys=True), flush=True)
+            return 1
+        print(
+            json.dumps(
+                {
+                    "complete": False,
+                    "status": "fail",
+                    "hook": args.command,
+                    "failure_code": "operation_failed_private_evidence_recorded",
+                    "summary": "Hook failed. The private failure evidence write completed.",
+                    "error": _public_failure_error(exc),
+                    "private_evidence_status": "write_completed",
+                },
+                sort_keys=True,
+            ),
+            flush=True,
         )
-        safe_error = _sanitize_failure_text(str(exc))
-        print(json.dumps({"complete": False, "error": safe_error, "python": _failure_python_description(), "failure_evidence": str(evidence)}), flush=True)
-        print(f"release {args.command} failed; evidence={evidence}\n{traceback.format_exc()}", file=sys.stderr)
+        print(f"release {args.command} failed; private failure evidence write completed", file=sys.stderr)
         return 1
 
 

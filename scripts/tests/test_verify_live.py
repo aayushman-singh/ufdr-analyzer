@@ -2017,6 +2017,49 @@ def test_live_verifier_failure_returns_one_json_object_and_private_evidence():
         _remove_owned_fixture(evidence_root, "verification fixture")
 
 
+def test_live_verifier_failure_response_keeps_private_details_out_of_public_output(monkeypatch):
+    private_path = "C:/private/evidence/failure.json"
+    exc = RuntimeError(
+        f"private-path={private_path} command=cmd.exe pid=57564 traceback=secret traceback"
+    )
+    monkeypatch.setattr(verify_live, "_record_private_failure", lambda *_args: Path(private_path))
+
+    value = verify_live._record_failure_response("query", exc, {"url": private_path})
+
+    serialized = json.dumps(value)
+    assert value["complete"] is False
+    assert value["status"] == "fail"
+    assert value["private_evidence_status"] == "write_completed"
+    assert "durab" not in serialized.lower()
+    assert private_path not in serialized
+    assert "cmd.exe" not in serialized
+    assert "57564" not in serialized
+    assert "secret traceback" not in serialized
+    assert "failure_evidence" not in value
+
+
+def test_live_verifier_private_evidence_failure_is_bounded(monkeypatch):
+    monkeypatch.setattr(
+        verify_live,
+        "_record_private_failure",
+        lambda *_args: (_ for _ in ()).throw(OSError("private evidence path is unavailable")),
+    )
+
+    value = verify_live._record_failure_response(
+        "query",
+        RuntimeError("command=cmd.exe pid=57564 traceback=private traceback"),
+        {"url": "C:/private/live-proof"},
+    )
+
+    assert value == {
+        "complete": False,
+        "status": "fail",
+        "failure_code": "operation_and_private_evidence_persistence_failed",
+        "error": "live verification failed and private evidence was not recorded",
+        "private_evidence_status": "write_failed",
+    }
+
+
 class _FakeLocator:
     def __init__(self, value=None, texts=None, actions=None, action=None):
         self.value = value
@@ -2466,6 +2509,9 @@ def test_live_verification_rejects_non_https_urls_without_proof_side_effects(tmp
     assert result.returncode != 0
     assert value["complete"] is False
     assert "HTTPS" in value["error"]
+    assert result.stderr == ""
+    assert "http://citespan.169.58.64.150.nip.io" not in result.stdout
+    assert str(tmp_path) not in result.stdout
     assert not (tmp_path / "proof").exists()
 
 
@@ -2492,6 +2538,9 @@ def test_live_verification_rejects_another_https_host_before_proof_activity(tmp_
     assert result.returncode != 0
     assert value["complete"] is False
     assert "authorized CiteSpan HTTPS origin" in value["error"]
+    assert result.stderr == ""
+    assert "https://example.com" not in result.stdout
+    assert str(tmp_path) not in result.stdout
     assert not (tmp_path / "proof").exists()
 
 
@@ -2518,6 +2567,9 @@ def test_live_verification_rejects_noncanonical_run_id_from_cli(tmp_path):
     assert result.returncode != 0
     assert value["complete"] is False
     assert "canonical synthetic demo run ID" in value["error"]
+    assert result.stderr == ""
+    assert "not-canonical" not in result.stdout
+    assert str(tmp_path) not in result.stdout
 
 
 def test_live_verification_default_output_is_script_relative():
@@ -2663,7 +2715,7 @@ def test_live_verification_validates_the_observed_query_response():
     assert "visible evidence spans do not match" in source
 
 
-def test_proof_writer_returns_exact_durable_paths_and_draft(tmp_path):
+def test_proof_writer_returns_exact_written_paths_and_draft(tmp_path):
     screenshot_names = [
         "citespan-home.png",
         "citespan-upload-disabled.png",

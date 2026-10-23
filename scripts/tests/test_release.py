@@ -17,7 +17,7 @@ import uuid
 from pathlib import Path
 from pathlib import PurePosixPath
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -3863,6 +3863,14 @@ def _controlled_parent_identity(pid=20, creation="100", parent_pid=1):
         "argv_sha256": hashlib.sha256("\0".join(argv).encode()).hexdigest(),
         "native_command": command,
         "native_command_sha256": hashlib.sha256(command.encode()).hexdigest(),
+        "role": "measured current native process",
+        "family_relation": "measured current native process identity",
+        "read_errors": [],
+        "listening_ports": [],
+        "source_provenance": {"reader": "controlled test"},
+        "module_paths": [],
+        "files": [],
+        "ports": [],
     }
 
 
@@ -3995,6 +4003,14 @@ def test_native_parent_observation_records_stable_live_parent(monkeypatch):
             "argv_sha256": hashlib.sha256(b"C:/parent.exe\0--worker").hexdigest(),
             "native_command": "C:/parent.exe --worker",
             "native_command_sha256": hashlib.sha256(b"C:/parent.exe --worker").hexdigest(),
+            "role": "measured current native process",
+            "family_relation": "measured current native process identity",
+            "read_errors": [],
+            "listening_ports": [],
+            "source_provenance": {"reader": "controlled test"},
+            "module_paths": [],
+            "files": [],
+            "ports": [],
             "relation": "current parent of exact child identity",
         }
     ]
@@ -4704,6 +4720,34 @@ def test_fresh_resource_scope_accepts_the_configured_launcher_native_child_contr
     assert result["relevant_processes"] == []
 
 
+def test_fresh_resource_scope_hydrates_the_release_hook_observer_before_classification(monkeypatch):
+    root = str(release.ROOT.resolve())
+    bootstrap = _release_hook_launcher_child_identity(root)
+    bootstrap["release_hook_requested_command"] = "prepare"
+    fresh = dict(bootstrap)
+    fresh["parent_observations"] = [dict(bootstrap["parent_observations"][0])]
+    reads = []
+
+    def read_identity(*_args, **_kwargs):
+        reads.append(True)
+        return fresh
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read_identity)
+
+    result = release._fresh_resource_scope(
+        _scope_resources(fresh),
+        root,
+        scoped_ports=set(),
+        preloaded_identities={fresh["pid"]: bootstrap},
+        observer_role="release_hook",
+        observer_bootstrap_identity=bootstrap,
+    )
+
+    assert result["relevant_processes"] == []
+    assert result["identities"][fresh["pid"]] is fresh
+    assert len(reads) == 3
+
+
 def test_release_hook_bootstrap_captures_the_requested_command(monkeypatch):
     root = str(release.ROOT.resolve())
     identity = _release_hook_launcher_child_identity(root)
@@ -5362,217 +5406,195 @@ def test_fresh_resource_scope_fails_for_inaccessible_frontend_candidate(monkeypa
         )
 
 
-def _protected_relation_child_identity(*, creation="200", parent_creation="100", parent_pid=901):
-    argv = ["C:/tools/node.exe", "server.js"]
-    native_command = "node server.js"
+def _protected_relation_parent_identity(*, creation="100", parent_pid=1):
+    return {
+        "pid": 901,
+        "creation": creation,
+        "parent_pid": parent_pid,
+        "executable": "C:/tools/python.exe",
+        "command": None,
+        "source_provenance": {"reader": "controlled limited test"},
+    }
+
+
+def _protected_relation_child_identity(*, creation="200", parent_pid=901):
     return {
         "pid": 900,
         "creation": creation,
         "executable": "C:/tools/node.exe",
         "parent_pid": parent_pid,
-        "argv": argv,
-        "argv_sha256": hashlib.sha256("\0".join(argv).encode("utf-8")).hexdigest(),
-        "native_command": native_command,
-        "native_command_sha256": hashlib.sha256(native_command.encode("utf-8")).hexdigest(),
-        "parent_observations": [
-            {
-                "pid": parent_pid,
-                "state": "readable_current_parent",
-                "creation": parent_creation,
-                "argv": ["C:/tools/python.exe", "-m", "pytest"],
-                "argv_sha256": hashlib.sha256(
-                    "\0".join(["C:/tools/python.exe", "-m", "pytest"]).encode("utf-8")
-                ).hexdigest(),
-                "native_command": "python -m pytest",
-                "native_command_sha256": hashlib.sha256(
-                    "python -m pytest".encode("utf-8")
-                ).hexdigest(),
-                "relation": "current parent of exact child identity",
-            }
-        ],
+        "command": None,
+        "source_provenance": {"reader": "controlled limited test"},
     }
 
 
-def test_fresh_resource_scope_excludes_stable_protected_ancestry_without_full_identity(monkeypatch):
-    reads = []
+def _protected_relation_metadata(pid, *, parent_pid, executable, command):
+    return {
+        "pid": pid,
+        "parent_pid": parent_pid,
+        "executable": executable,
+        "command": command,
+    }
 
-    def read(pid, read_state, *_args, **_kwargs):
-        reads.append((pid, read_state.limited_only))
-        if not read_state.limited_only:
-            raise AssertionError("protected ancestry must not receive a full identity read")
-        expected_parent_pid = 901
-        expected_parent_creation = "100"
-        if pid == 900:
-            child = _protected_relation_child_identity()
-            parent_observation = child["parent_observations"][0]
-            assert child["parent_pid"] == parent_observation["pid"] == expected_parent_pid
-            assert parent_observation["creation"] == expected_parent_creation
-            assert int(child["creation"]) >= int(parent_observation["creation"])
-            return child
-        if pid == 901:
-            parent = {
-                "pid": expected_parent_pid,
-                "creation": expected_parent_creation,
-                "executable": "C:/tools/python.exe",
-                "parent_pid": 1,
-            }
-            return parent
-        raise AssertionError(f"unexpected protected ancestry identity read: pid={pid}")
 
-    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
-    result = release._fresh_resource_scope(
-        {
-            "processes": [{"pid": 900, "name": "node.exe", "executable": "C:/tools/node.exe", "parent_pid": 901}],
-            "holders": [],
-            "ports": [],
-            "read_errors": [],
-        },
+def _protected_relation_resources():
+    return {
+        "processes": [
+            {"pid": 900, "name": "node.exe", "executable": "C:/tools/node.exe", "parent_pid": 901}
+        ],
+        "holders": [],
+        "ports": [],
+        "read_errors": [],
+    }
+
+
+def _patch_limited_protected_relation(monkeypatch, native_reads, metadata_reads):
+    native = {pid: iter(values) for pid, values in native_reads.items()}
+    metadata = {pid: iter(values) for pid, values in metadata_reads.items()}
+
+    def read_native(pid, read_state, *_args, **_kwargs):
+        assert read_state.limited_only is True
+        return next(native[pid])
+
+    def read_metadata(pid):
+        return next(metadata[pid])
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read_native)
+    monkeypatch.setattr(release, "_read_current_protected_process_metadata", read_metadata)
+
+
+def _run_limited_protected_relation(monkeypatch, child_reads=None, parent_reads=None, metadata_reads=None):
+    child_reads = child_reads or [_protected_relation_child_identity(), _protected_relation_child_identity()]
+    parent_reads = parent_reads or [_protected_relation_parent_identity(), _protected_relation_parent_identity()]
+    metadata_reads = metadata_reads or {
+        900: [
+            _protected_relation_metadata(
+                900, parent_pid=901, executable="C:/tools/node.exe", command="node server.js"
+            ),
+            _protected_relation_metadata(
+                900, parent_pid=901, executable="C:/tools/node.exe", command="node server.js"
+            ),
+        ],
+        901: [
+            _protected_relation_metadata(
+                901, parent_pid=1, executable="C:/tools/python.exe", command="python -m pytest"
+            ),
+            _protected_relation_metadata(
+                901, parent_pid=1, executable="C:/tools/python.exe", command="python -m pytest"
+            ),
+        ],
+    }
+    _patch_limited_protected_relation(
+        monkeypatch,
+        {900: child_reads, 901: parent_reads},
+        metadata_reads,
+    )
+    return release._fresh_resource_scope(
+        _protected_relation_resources(),
         str(release.ROOT.resolve()),
         scoped_ports={43123},
         protected_pids={901},
     )
 
-    assert reads == [(900, True), (901, True), (900, True), (901, True)]
-    assert result["unrelated_exclusions"] == [{"pid": 900, "reason": "verified protected ancestry"}]
+
+def test_fresh_resource_scope_accepts_limited_protected_ancestry_without_full_read(monkeypatch):
+    result = _run_limited_protected_relation(monkeypatch)
+    identity = result["identities"][900]
+    assert result["unrelated_exclusions"] == [
+        {"pid": 900, "reason": "verified protected ancestry"}
+    ]
+    assert "argv" not in identity
+    assert "native_command" not in identity
+    assert "module_paths" not in identity
+    assert "ports" not in identity
 
 
-def test_fresh_resource_scope_blocks_child_older_than_protected_parent(monkeypatch):
-    def read(pid, read_state, *_args, **_kwargs):
-        if pid == 900:
-            return _protected_relation_child_identity(creation="100", parent_creation="200")
-        return {
-            "pid": pid,
-            "creation": "200",
-            "executable": "C:/tools/python.exe",
-            "parent_pid": 1,
-        }
-
-    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
-    with pytest.raises(RuntimeError, match="child predates parent generation"):
-        release._fresh_resource_scope(
-            {
-                "processes": [{"pid": 900, "name": "node.exe", "executable": "C:/tools/node.exe", "parent_pid": 901}],
-                "holders": [],
-                "ports": [],
-                "read_errors": [],
-            },
-            str(release.ROOT.resolve()),
-            scoped_ports={43123},
-            protected_pids={901},
+@pytest.mark.parametrize("field", ["pid", "creation", "parent_pid", "executable"])
+def test_limited_protected_identity_rejects_missing_native_fields(monkeypatch, field):
+    child = _protected_relation_child_identity()
+    child.pop(field)
+    with pytest.raises(RuntimeError, match="potentially relevant process identity failed"):
+        _run_limited_protected_relation(
+            monkeypatch,
+            child_reads=[child, _protected_relation_child_identity()],
         )
 
 
-def test_fresh_resource_scope_blocks_replaced_protected_parent_generation(monkeypatch):
-    parent_reads = 0
-
-    def read(pid, read_state, *_args, **_kwargs):
-        nonlocal parent_reads
-        if pid == 901:
-            parent_reads += 1
-        if pid == 900:
-            return _protected_relation_child_identity()
-        return {
-            "pid": pid,
-            "creation": "200" if pid == 900 else ("100" if parent_reads == 1 else "101"),
-            "executable": "C:/tools/node.exe" if pid == 900 else "C:/tools/python.exe",
-            "parent_pid": 901 if pid == 900 else 1,
-        }
-
-    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
-    with pytest.raises(RuntimeError, match="parent generation changed"):
-        release._fresh_resource_scope(
-            {
-                "processes": [{"pid": 900, "name": "node.exe", "executable": "C:/tools/node.exe", "parent_pid": 901}],
-                "holders": [],
-                "ports": [],
-                "read_errors": [],
-            },
-            str(release.ROOT.resolve()),
-            scoped_ports={43123},
-            protected_pids={901},
+@pytest.mark.parametrize(
+    ("child_reads", "parent_reads", "message"),
+    [
+        (
+            [_protected_relation_child_identity(), _protected_relation_child_identity(creation="201")],
+            None,
+            "creation changed during binding",
+        ),
+        (
+            [_protected_relation_child_identity(), _protected_relation_child_identity(parent_pid=902)],
+            None,
+            "parent (changed|metadata changed)",
+        ),
+        (
+            [_protected_relation_child_identity(creation="100"), _protected_relation_child_identity(creation="100")],
+            [_protected_relation_parent_identity(creation="200"), _protected_relation_parent_identity(creation="200")],
+            "child predates parent generation",
+        ),
+        (
+            [_protected_relation_child_identity(), _protected_relation_child_identity()],
+            [_protected_relation_parent_identity(), _protected_relation_parent_identity(creation="101")],
+            "parent generation changed",
+        ),
+    ],
+)
+def test_limited_protected_identity_rejects_generation_and_edge_changes(
+    monkeypatch, child_reads, parent_reads, message
+):
+    with pytest.raises(RuntimeError, match=message):
+        _run_limited_protected_relation(
+            monkeypatch,
+            child_reads=child_reads,
+            parent_reads=parent_reads,
         )
 
 
-def test_fresh_resource_scope_blocks_edge_parent_generation_mismatch(monkeypatch):
-    def read(pid, read_state, *_args, **_kwargs):
-        if pid == 900:
-            return _protected_relation_child_identity(parent_creation="100")
-        return {
-            "pid": pid,
-            "creation": "101",
-            "executable": "C:/tools/python.exe",
-            "parent_pid": 1,
-        }
-
-    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
-    with pytest.raises(RuntimeError, match="edge and parent identity do not match"):
-        release._fresh_resource_scope(
-            {
-                "processes": [{"pid": 900, "name": "node.exe", "executable": "C:/tools/node.exe", "parent_pid": 901}],
-                "holders": [],
-                "ports": [],
-                "read_errors": [],
-            },
-            str(release.ROOT.resolve()),
-            scoped_ports={43123},
-            protected_pids={901},
-        )
+def test_limited_protected_identity_rejects_command_metadata_change(monkeypatch):
+    metadata = {
+        900: [
+            _protected_relation_metadata(
+                900, parent_pid=901, executable="C:/tools/node.exe", command="node server.js"
+            ),
+            _protected_relation_metadata(
+                900, parent_pid=901, executable="C:/tools/node.exe", command="node changed.js"
+            ),
+        ],
+        901: [
+            _protected_relation_metadata(
+                901, parent_pid=1, executable="C:/tools/python.exe", command="python -m pytest"
+            ),
+            _protected_relation_metadata(
+                901, parent_pid=1, executable="C:/tools/python.exe", command="python -m pytest"
+            ),
+        ],
+    }
+    with pytest.raises(RuntimeError, match="child command identity changed"):
+        _run_limited_protected_relation(monkeypatch, metadata_reads=metadata)
 
 
-def test_fresh_resource_scope_blocks_ambiguous_protected_ancestry(monkeypatch):
-    def read(pid, read_state, *_args, **_kwargs):
-        if pid == 900:
-            return _protected_relation_child_identity(parent_pid=902)
-        return {
-            "pid": pid,
-            "creation": "200",
-            "executable": "C:/tools/node.exe",
-            "parent_pid": 902,
-        }
-
-    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
-    with pytest.raises(RuntimeError, match="protected relation parent changed"):
-        release._fresh_resource_scope(
-            {
-                "processes": [{"pid": 900, "name": "node.exe", "executable": "C:/tools/node.exe", "parent_pid": 901}],
-                "holders": [],
-                "ports": [],
-                "read_errors": [],
-            },
-            str(release.ROOT.resolve()),
-            scoped_ports={43123},
-            protected_pids={901},
-        )
-
-
-def test_fresh_resource_scope_keeps_positive_product_relation_fail_closed(monkeypatch):
-    def read(_pid, read_state, *_args, **_kwargs):
-        if read_state.limited_only:
-            raise AssertionError("positive product relation must not use protected exclusion")
-        raise release._FreshProcessUnreadable("WinError 5")
-
-    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
-    with pytest.raises(RuntimeError, match="potentially relevant process identity failed: pid=900"):
-        release._fresh_resource_scope(
-            {
-                "processes": [
-                    {
-                        "pid": 900,
-                        "name": "node.exe",
-                        "executable": "C:/tools/node.exe",
-                        "cwd": f"{release.ROOT.resolve()}/frontend",
-                        "command": f"node {release.ROOT.resolve()}/frontend/server.js",
-                        "parent_pid": 901,
-                    }
-                ],
-                "holders": [],
-                "ports": [],
-                "read_errors": [],
-            },
-            str(release.ROOT.resolve()),
-            scoped_ports={43123},
-            protected_pids={901},
-        )
+def test_limited_protected_identity_rejects_missing_metadata(monkeypatch):
+    metadata = {
+        900: [
+            {"pid": 900, "parent_pid": 901, "executable": "C:/tools/node.exe"},
+        ],
+        901: [
+            _protected_relation_metadata(
+                901, parent_pid=1, executable="C:/tools/python.exe", command="python -m pytest"
+            ),
+            _protected_relation_metadata(
+                901, parent_pid=1, executable="C:/tools/python.exe", command="python -m pytest"
+            ),
+        ],
+    }
+    with pytest.raises(RuntimeError, match="metadata is incomplete or invalid"):
+        _run_limited_protected_relation(monkeypatch, metadata_reads=metadata)
 
 
 def test_fresh_resource_scope_records_protected_candidate_native_absence(monkeypatch, tmp_path):
@@ -6936,19 +6958,122 @@ def run_hook_in_process(monkeypatch, command: str, payload: dict, **env: str):
 
 @pytest.mark.parametrize("command", ["prepare", "observe", "execute", "verify"])
 def test_each_hook_emits_json_when_project_python_is_missing(command, capsys):
+    private_path = Path("private-failure.json")
     with patch.object(
         release,
         "_require_project_python",
-        side_effect=RuntimeError("project Python is missing"),
+        side_effect=release._MissingProjectPythonPreflight(
+            "release blocked: project Python is missing; private-path=/owner/secret command=cmd.exe pid=57564 secret=token "
+            "traceback=private traceback"
+        ),
     ) as require_python, patch.object(
-        release, "_record_private_failure", return_value=Path("private-failure.json")
+        release, "_record_private_failure", return_value=private_path
     ), patch.object(sys, "argv", ["release.py", command]):
         assert release.main() == 1
 
-    value = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    value = json.loads(captured.out)
     assert value["complete"] is False
-    assert "project Python is missing" in value["error"]
+    assert value["error"] == "release blocked: project Python is missing"
+    assert value["failure_code"] == "operation_failed_private_evidence_recorded"
+    assert value["private_evidence_status"] == "write_completed"
+    assert str(private_path) not in captured.out + captured.err
+    assert "private-path=/owner/secret" not in captured.out + captured.err
+    assert "command=cmd.exe" not in captured.out + captured.err
+    assert "pid=57564" not in captured.out + captured.err
+    assert "secret=token" not in captured.out + captured.err
+    assert "private traceback" not in captured.out + captured.err
+    assert captured.err == "release %s failed; private failure evidence write completed\n" % command
+    assert "durab" not in captured.out.lower() + captured.err.lower()
     require_python.assert_called_once_with(command)
+
+
+@pytest.mark.parametrize("command", ["prepare", "observe", "execute", "verify"])
+@pytest.mark.parametrize(
+    "evidence_failure",
+    [
+        OSError("private evidence directory creation failed"),
+        TypeError("private evidence serialization failed"),
+        PermissionError("private evidence replace failed"),
+    ],
+)
+def test_each_hook_emits_one_safe_json_object_when_private_failure_write_fails(
+    command, evidence_failure, monkeypatch, capsys
+):
+    effects = []
+    original_failure = (
+        "private-path=/owner/secret command=cmd.exe pid=57564 secret=original-token "
+        "traceback=original traceback"
+    )
+    evidence_failure.args = (
+        "private-path=/evidence/secret command=ssh pid=57564 secret=evidence-token "
+        "traceback=evidence traceback",
+    )
+    monkeypatch.setattr(
+        release,
+        "_require_project_python",
+        lambda _command: (_ for _ in ()).throw(RuntimeError(original_failure)),
+    )
+    monkeypatch.setattr(
+        release,
+        "_record_private_failure",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(evidence_failure),
+    )
+    monkeypatch.setattr(release.sys, "argv", ["release.py", command])
+    for handler_name in ("_prepare", "_observe", "_execute", "_verify"):
+        monkeypatch.setattr(
+            release,
+            handler_name,
+            lambda *_args, _handler=handler_name, **_kwargs: effects.append(_handler),
+        )
+
+    assert release.main() == 1
+    assert effects == []
+
+    captured = capsys.readouterr()
+    output = captured.out.strip().splitlines()
+    assert len(output) == 1
+    value = json.loads(output[0])
+    assert value["complete"] is False
+    assert value["status"] == "fail"
+    assert value["hook"] == command
+    assert value["failure_code"] == "operation_and_private_evidence_persistence_failed"
+    assert value["summary"] == "Dependent work stopped. The private evidence write did not complete."
+    assert value["private_evidence_status"] == "write_failed"
+    assert set(value) == {
+        "complete",
+        "failure_code",
+        "hook",
+        "private_evidence_status",
+        "status",
+        "summary",
+    }
+    assert captured.err == ""
+    assert "private-path=/owner/secret" not in captured.out + captured.err
+    assert "private-path=/evidence/secret" not in captured.out + captured.err
+    assert "command=cmd.exe" not in captured.out + captured.err
+    assert "command=ssh" not in captured.out + captured.err
+    assert "pid=57564" not in captured.out + captured.err
+    assert "secret=" not in captured.out + captured.err
+    assert "traceback=" not in captured.out + captured.err
+    assert "evidence_reference" not in value
+    assert "evidence_digest" not in value
+
+
+def test_release_private_failure_write_keeps_private_contents_after_write(tmp_path):
+    with patch.object(release, "EXTERNAL_PROOF_ROOT", tmp_path):
+        try:
+            raise RuntimeError("private command and traceback details")
+        except RuntimeError as exc:
+            evidence_path = release._record_private_failure(
+                "prepare", exc, {"private_state": "kept"}
+            )
+
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["command"] == "prepare"
+    assert evidence["error"] == "private command and traceback details"
+    assert evidence["state"] == {"private_state": "kept"}
+    assert evidence["traceback"]
 
 
 def test_prepare_returns_one_contract_object_without_secret_values(monkeypatch):
@@ -9175,7 +9300,7 @@ def test_verify_uses_provider_observation_and_live_verifier_result(tmp_path):
     assert result["deployment_commit"] == EXPECTED_COMMIT
 
 
-def test_live_verifier_uses_durable_external_directory_and_returns_draft(tmp_path):
+def test_live_verifier_uses_external_proof_directory_and_returns_draft(tmp_path):
     verifier_result = {
         "complete": True,
         "external_identity": release.AUTHORIZED_LIVE_ORIGIN,
@@ -12767,12 +12892,22 @@ def test_release_cli_accepts_the_project_virtual_environment():
         release.sys.executable = original
 
 
+def test_release_cli_rejects_wrong_project_interpreter_as_distinct_failure(monkeypatch):
+    monkeypatch.setattr(release.sys, "executable", str(ROOT / "other-python.exe"))
+
+    with pytest.raises(release._WrongProjectPythonPreflight):
+        release._require_project_python("prepare")
+
+
 @pytest.mark.parametrize("command", ("prepare", "observe", "execute", "verify"))
 def test_each_release_hook_emits_json_when_project_python_is_missing(
     command, monkeypatch, capsys
 ):
     missing_python = ROOT / ".missing-test-venv" / "Scripts" / "python.exe"
     monkeypatch.setattr(release, "PROJECT_PYTHON", missing_python)
+    private_evidence = ROOT / "private-missing-python-test.json"
+    recorder = Mock(return_value=private_evidence)
+    monkeypatch.setattr(release, "_record_private_failure", recorder)
     monkeypatch.setattr(release.sys, "argv", ["release.py", command])
     monkeypatch.setattr(release.sys, "stdin", io.StringIO("{}"))
 
@@ -12782,7 +12917,38 @@ def test_each_release_hook_emits_json_when_project_python_is_missing(
     value = json.loads(output[0])
     assert value["complete"] is False
     assert "project Python is missing" in value["error"]
-    assert value["python"] == missing_python.as_posix()
+    assert "python" not in value
+    assert value["private_evidence_status"] == "write_completed"
+    assert "durab" not in output[0].lower()
+    assert recorder.call_args.args[0] == command
+
+
+def test_unrelated_private_path_failure_does_not_populate_python(monkeypatch, capsys):
+    private_path = "C:/private/evidence/traceback.json"
+
+    def fail_preflight(command):
+        raise RuntimeError(private_path)
+
+    def fail_private_write(command, exc, state):
+        raise OSError("private write failed")
+
+    monkeypatch.setattr(
+        release,
+        "_require_project_python",
+        fail_preflight,
+    )
+    monkeypatch.setattr(release.sys, "argv", ["release.py", "prepare"])
+    monkeypatch.setattr(release.sys, "stdin", io.StringIO("{}"))
+    monkeypatch.setattr(
+        release,
+        "_record_private_failure",
+        fail_private_write,
+    )
+
+    assert release.main() == 1
+    value = json.loads(capsys.readouterr().out.strip())
+    assert "python" not in value
+    assert private_path not in json.dumps(value)
 
 
 def test_demo_seed_creates_whatsapp_aleapp_artifact_for_default_question():
