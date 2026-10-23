@@ -1966,6 +1966,263 @@ def _fresh_census_contract(count=145, states=None, approval=None):
     }
 
 
+def _toolhelp_snapshot(*pids, caller_pid=999):
+    rows = [
+        {
+            "pid": pid,
+            "parent_pid": 4,
+            "executable": f"C:/Windows/System32/process-{pid}.exe",
+            "record_size": 568,
+        }
+        for pid in pids
+    ]
+    if caller_pid not in pids:
+        rows.append(
+            {
+                "pid": caller_pid,
+                "parent_pid": 4,
+                "executable": "C:/Windows/System32/python.exe",
+                "record_size": 568,
+            }
+        )
+    return release._validate_toolhelp_process_snapshot(
+        rows,
+        caller_pid=caller_pid,
+        record_size=568,
+        expected_record_size=568,
+        termination_error=18,
+        handle_closed=True,
+    )
+
+
+def test_toolhelp_snapshot_rejects_invalid_structure():
+    base = [
+        {
+            "pid": 1,
+            "parent_pid": 4,
+            "executable": "node.exe",
+            "record_size": 568,
+        },
+        {
+            "pid": 999,
+            "parent_pid": 4,
+            "executable": "python.exe",
+            "record_size": 568,
+        },
+    ]
+    cases = [
+        ([], 999, 568, 18, True, "empty"),
+        (base, 998, 568, 18, True, "caller PID"),
+        (base + [dict(base[0])], 999, 568, 18, True, "duplicate PID"),
+        (base, 999, 567, 18, True, "record size"),
+        (base, 999, 568, 19, True, "ERROR_NO_MORE_FILES"),
+        (base, 999, 568, 18, False, "handle did not close"),
+    ]
+    for rows, caller_pid, record_size, termination_error, handle_closed, message in cases:
+        with pytest.raises(RuntimeError, match=message):
+            release._validate_toolhelp_process_snapshot(
+                rows,
+                caller_pid=caller_pid,
+                record_size=record_size,
+                expected_record_size=568,
+                termination_error=termination_error,
+                handle_closed=handle_closed,
+            )
+
+
+def test_toolhelp_snapshot_retains_valid_system_process_sentinel():
+    snapshot = release._validate_toolhelp_process_snapshot(
+        [
+            {
+                "pid": 0,
+                "parent_pid": 0,
+                "executable": "[System Process]",
+                "record_size": 568,
+            },
+            {
+                "pid": 999,
+                "parent_pid": 4,
+                "executable": "python.exe",
+                "record_size": 568,
+            },
+        ],
+        caller_pid=999,
+        record_size=568,
+        expected_record_size=568,
+        termination_error=18,
+        handle_closed=True,
+    )
+
+    assert snapshot.rows[0] == {
+        "pid": 0,
+        "parent_pid": 0,
+        "executable": "[System Process]",
+        "record_size": 568,
+    }
+    assert snapshot.caller_pid == 999
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("parent_pid", 1, "PID 0 has an invalid parent PID"),
+        ("executable", "System", "PID 0 has an invalid executable"),
+        ("record_size", 567, "invalid record size"),
+        ("pid", False, "invalid PID"),
+        ("pid", 0.0, "invalid PID"),
+        ("parent_pid", False, "invalid parent PID"),
+        ("parent_pid", 0.0, "invalid parent PID"),
+    ],
+)
+def test_toolhelp_snapshot_rejects_invalid_pid_zero_metadata(field, value, message):
+    row = {
+        "pid": 0,
+        "parent_pid": 0,
+        "executable": "[System Process]",
+        "record_size": 568,
+    }
+    row[field] = value
+
+    with pytest.raises(RuntimeError, match=message):
+        release._validate_toolhelp_process_snapshot(
+            [row, {"pid": 999, "parent_pid": 4, "executable": "python.exe", "record_size": 568}],
+            caller_pid=999,
+            record_size=568,
+            expected_record_size=568,
+            termination_error=18,
+            handle_closed=True,
+        )
+
+
+def test_toolhelp_snapshot_rejects_duplicate_pid_zero():
+    sentinel = {
+        "pid": 0,
+        "parent_pid": 0,
+        "executable": "[System Process]",
+        "record_size": 568,
+    }
+
+    with pytest.raises(RuntimeError, match="duplicate PID.*pid=0"):
+        release._validate_toolhelp_process_snapshot(
+            [sentinel, dict(sentinel), {"pid": 999, "parent_pid": 4, "executable": "python.exe", "record_size": 568}],
+            caller_pid=999,
+            record_size=568,
+            expected_record_size=568,
+            termination_error=18,
+            handle_closed=True,
+        )
+
+
+def test_fresh_census_uses_snapshot_absence_without_handle_read(monkeypatch):
+    contract = _fresh_census_contract(count=1)
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda *_args, **_kwargs: pytest.fail("snapshot absence must not open a process handle"),
+    )
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {"processes": [], "holders": [], "ports": [], "read_errors": []},
+    )
+
+    result = release._assert_fresh_host_process_census(
+        contract,
+        process_snapshot=_toolhelp_snapshot(),
+    )
+
+    assert result["states"] == {1: "absent"}
+    assert result["snapshot_absent_pids"] == [1]
+    assert result["toolhelp_snapshot"]["historical_absent_count"] == 1
+
+
+def test_fresh_census_keeps_present_snapshot_access_denied_fail_closed(monkeypatch):
+    contract = _fresh_census_contract(count=1)
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            release._FreshProcessUnreadable("access denied")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="fresh native identity census failed.*access denied"):
+        release._assert_fresh_host_process_census(
+            contract,
+            process_snapshot=_toolhelp_snapshot(1),
+        )
+
+
+def test_fresh_census_rejects_relevant_membership_change_after_resource_collection(monkeypatch):
+    contract = _fresh_census_contract(count=1, states={1: "live"}, approval={"approved_actions": ["stop exact pid 1"]})
+    contract["family_records"][0]["ports"] = []
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda pid, *_args, **_kwargs: contract["family_records"][pid - 1],
+    )
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {"processes": [], "holders": [], "ports": [], "read_errors": []},
+    )
+
+    with pytest.raises(RuntimeError, match="relevant historical PID membership changed"):
+        release._assert_fresh_host_process_census(
+            contract,
+            process_snapshot=_toolhelp_snapshot(1),
+        )
+
+
+def test_fresh_census_rejects_present_generation_change_after_resource_collection(monkeypatch):
+    contract = _fresh_census_contract(count=1, states={1: "live"}, approval={"approved_actions": ["stop exact pid 1"]})
+    contract["family_records"][0]["ports"] = []
+    reads = [contract["family_records"][0], {**contract["family_records"][0], "creation": "new-generation"}]
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda *_args, **_kwargs: reads.pop(0),
+    )
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {"processes": [{"pid": 1, "parent_pid": 4}], "holders": [], "ports": [], "read_errors": []},
+    )
+
+    with pytest.raises(RuntimeError, match="generation changed after resource collection"):
+        release._assert_fresh_host_process_census(
+            contract,
+            process_snapshot=_toolhelp_snapshot(1),
+        )
+
+
+def test_fresh_census_allows_unrelated_pid_churn_with_snapshot(monkeypatch):
+    contract = _fresh_census_contract(count=1)
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda *_args, **_kwargs: pytest.fail("absent historical PID must not be read"),
+    )
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [{"pid": 1000, "parent_pid": 4}],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+
+    result = release._assert_fresh_host_process_census(
+        contract,
+        process_snapshot=_toolhelp_snapshot(1000),
+    )
+
+    assert result["states"] == {1: "absent"}
+    assert result["snapshot_absent_pids"] == [1]
+
+
 def test_fresh_census_accepts_absent_and_reused_historical_identities(monkeypatch):
     states = {pid: "reused" for pid in (144, 145)}
     contract = _fresh_census_contract(states=states)
@@ -3134,6 +3391,11 @@ def test_fresh_census_rejects_absent_scoped_port_owner(monkeypatch):
             "read_errors": [],
         },
     )
+    monkeypatch.setattr(
+        release,
+        "_record_private_resource_scope_failure",
+        lambda **_kwargs: (Path("private-absence.json"), "absence-digest"),
+    )
 
     with pytest.raises(RuntimeError) as error:
         release._assert_fresh_host_process_census(contract)
@@ -3159,6 +3421,120 @@ def test_fresh_census_accepts_explicit_empty_resource_measurement(monkeypatch):
     assert release._assert_fresh_host_process_census(contract)["resources"] == {
         "processes": [], "holders": [], "ports": [], "read_errors": []
     }
+
+
+def test_fresh_census_excludes_historical_partial_replacement_before_native_read(monkeypatch):
+    contract = _fresh_census_contract(count=1)
+    reads = []
+
+    def read(pid, *_args, **_kwargs):
+        reads.append(pid)
+        if _args and _args[0].expected_creation == contract["family_records"][0]["creation"]:
+            raise release._FreshProcessAbsent("historical identity absent")
+        raise AssertionError(f"excluded current noncandidate must not be hydrated: pid={pid}")
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [
+                {
+                    "pid": 1,
+                    "name": "DiscoverySrv.exe",
+                    "executable": "C:/Program Files/Bitdefender Agent/DiscoverySrv.exe",
+                    "parent_pid": 4,
+                }
+            ],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+
+    result = release._assert_fresh_host_process_census(contract)
+
+    assert reads == [1]
+    assert result["historical_exclusions"] == [
+        {
+            "pid": 1,
+            "reason": "historical identity not selected by current resource evidence",
+            "saved_state": "absent",
+        }
+    ]
+
+
+@pytest.mark.parametrize("resource_kind", ["product", "holder", "port"])
+def test_fresh_census_keeps_selected_historical_identity_fail_closed(monkeypatch, resource_kind):
+    contract = _fresh_census_contract(count=1)
+    native_path = str((release.SCRIPT_ROOT / release.HOST_NATIVE_MODULE).resolve())
+    row = {
+        "pid": 1,
+        "name": "node.exe" if resource_kind == "product" else "DiscoverySrv.exe",
+        "executable": "C:/tools/node.exe",
+        "parent_pid": 4,
+    }
+    resources = {"processes": [row], "holders": [], "ports": [], "read_errors": []}
+    if resource_kind == "product":
+        row["cwd"] = str(release.ROOT.resolve() / "frontend")
+        row["command"] = f"node {release.ROOT.resolve() / 'frontend' / 'server.js'}"
+    elif resource_kind == "holder":
+        resources["holders"] = [{"pid": 1, "module_paths": [native_path]}]
+    else:
+        resources["ports"] = [{"pid": 1, "port": 4100}]
+
+    monkeypatch.setattr(release, "_enumerate_fresh_frontend_resources", lambda: resources)
+    def read(pid, state, **_kwargs):
+        if state.expected_creation == contract["family_records"][0]["creation"]:
+            raise release._FreshProcessAbsent("historical identity absent")
+        raise release._FreshProcessUnreadable("WinError 5")
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+
+    with pytest.raises(RuntimeError, match="potentially relevant process identity failed: pid=1"):
+        release._assert_fresh_host_process_census(contract)
+
+
+def test_fresh_census_records_candidate_absence_with_private_proof(monkeypatch):
+    contract = _fresh_census_contract(count=1)
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [
+                {
+                    "pid": 1,
+                    "name": "node.exe",
+                    "executable": "C:/tools/node.exe",
+                    "cwd": str(release.ROOT.resolve() / "frontend"),
+                    "command": f"node {release.ROOT.resolve() / 'frontend' / 'server.js'}",
+                    "parent_pid": 4,
+                }
+            ],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            release._FreshProcessAbsent("pid=1 is absent")
+        ),
+    )
+    monkeypatch.setattr(
+        release,
+        "_record_private_resource_scope_failure",
+        lambda **_kwargs: (Path("private-absence.json"), "absence-digest"),
+    )
+
+    result = release._assert_fresh_host_process_census(contract)
+
+    assert result["states"][1] == "absent"
+    assert result["private_diagnostics"] == [
+        {"pid": 1, "kind": "native_absence", "path": "private-absence.json", "digest": "absence-digest"}
+    ]
 
 
 def test_fresh_census_rejects_exact_live_identity_without_approval(monkeypatch):
@@ -5944,10 +6320,11 @@ def test_family_backed_live_identity_remains_for_narrow_approval_validation():
 def test_process_evidence_validation_uses_read_only_native_observation(monkeypatch):
     contract = {"root": Path("C:/evidence"), "family_records": [{}], "frontend": {}}
     monkeypatch.setattr(release, "_load_host_process_contract", lambda: contract)
+    monkeypatch.setattr(release, "_collect_toolhelp_process_snapshot", lambda: _toolhelp_snapshot())
     monkeypatch.setattr(
         release,
         "_assert_fresh_host_process_census",
-        lambda value, *, observer_bootstrap_identity=None: {"states": []},
+        lambda value, *, observer_bootstrap_identity=None, process_snapshot=None: {"states": []},
     )
     monkeypatch.setattr(
         release,

@@ -1793,6 +1793,194 @@ class _NativeReadState:
 
 
 @dataclass(frozen=True)
+class _ToolhelpProcessSnapshot:
+    """Validated one-observation Windows process membership."""
+
+    rows: dict[int, dict[str, Any]]
+    caller_pid: int
+    record_size: int
+
+
+def _validate_toolhelp_process_snapshot(
+    rows: object,
+    *,
+    caller_pid: object,
+    record_size: object,
+    expected_record_size: int,
+    termination_error: object,
+    handle_closed: object,
+) -> _ToolhelpProcessSnapshot:
+    """Validate the complete Toolhelp snapshot boundary without host access."""
+    if termination_error != 18:
+        raise RuntimeError(
+            "release blocked: Toolhelp process snapshot did not terminate with "
+            f"ERROR_NO_MORE_FILES: error={termination_error!r}"
+        )
+    if handle_closed is not True:
+        raise RuntimeError("release blocked: Toolhelp process snapshot handle did not close")
+    if type(expected_record_size) is not int or expected_record_size <= 0:
+        raise RuntimeError("release blocked: Toolhelp process snapshot record size is invalid")
+    if type(record_size) is not int or record_size != expected_record_size:
+        raise RuntimeError(
+            "release blocked: Toolhelp process snapshot record size is invalid: "
+            f"actual={record_size!r} expected={expected_record_size}"
+        )
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError("release blocked: Toolhelp process snapshot is empty")
+    if type(caller_pid) is not int or caller_pid <= 0:
+        raise RuntimeError(
+            "release blocked: Toolhelp process snapshot caller PID is invalid: "
+            f"pid={caller_pid!r}"
+        )
+    by_pid: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("release blocked: Toolhelp process snapshot row is invalid")
+        pid = row.get("pid")
+        parent_pid = row.get("parent_pid")
+        executable = row.get("executable")
+        row_record_size = row.get("record_size")
+        if type(pid) is not int or pid < 0:
+            raise RuntimeError(
+                "release blocked: Toolhelp process snapshot row has an invalid PID: "
+                f"pid={pid!r}"
+            )
+        if type(parent_pid) is not int or parent_pid < 0:
+            raise RuntimeError(
+                "release blocked: Toolhelp process snapshot row has an invalid parent PID: "
+                f"pid={pid} parent_pid={parent_pid!r}"
+            )
+        if pid == 0:
+            if parent_pid != 0:
+                raise RuntimeError(
+                    "release blocked: Toolhelp process snapshot PID 0 has an invalid parent PID: "
+                    f"parent_pid={parent_pid!r}"
+                )
+            if executable != "[System Process]":
+                raise RuntimeError(
+                    "release blocked: Toolhelp process snapshot PID 0 has an invalid executable: "
+                    f"executable={executable!r}"
+                )
+        if not isinstance(executable, str) or not executable:
+            raise RuntimeError(
+                "release blocked: Toolhelp process snapshot row has an invalid executable: "
+                f"pid={pid}"
+            )
+        if type(row_record_size) is not int or row_record_size != expected_record_size:
+            raise RuntimeError(
+                "release blocked: Toolhelp process snapshot row has an invalid record size: "
+                f"pid={pid} actual={row_record_size!r} expected={expected_record_size}"
+            )
+        if pid in by_pid:
+            raise RuntimeError(
+                "release blocked: Toolhelp process snapshot has a duplicate PID: "
+                f"pid={pid}"
+            )
+        by_pid[pid] = dict(row)
+    if caller_pid not in by_pid:
+        raise RuntimeError(
+            "release blocked: Toolhelp process snapshot does not contain the caller PID: "
+            f"pid={caller_pid}"
+        )
+    return _ToolhelpProcessSnapshot(
+        rows=by_pid,
+        caller_pid=caller_pid,
+        record_size=record_size,
+    )
+
+
+def _collect_toolhelp_process_snapshot() -> _ToolhelpProcessSnapshot:
+    """Collect and validate one complete Windows Toolhelp process snapshot."""
+    if os.name != "nt":
+        raise RuntimeError(
+            "release blocked: Toolhelp process snapshot requires Windows: "
+            f"host_os={os.name!r}"
+        )
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", ctypes.c_uint32),
+            ("cntUsage", ctypes.c_uint32),
+            ("th32ProcessID", ctypes.c_uint32),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", ctypes.c_uint32),
+            ("cntThreads", ctypes.c_uint32),
+            ("th32ParentProcessID", ctypes.c_uint32),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", ctypes.c_uint32),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessEntry32W)]
+    kernel32.Process32FirstW.restype = ctypes.c_int
+    kernel32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessEntry32W)]
+    kernel32.Process32NextW.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    invalid_handle = ctypes.c_void_p(-1).value
+    if not snapshot or snapshot == invalid_handle:
+        raise RuntimeError(
+            "release blocked: Toolhelp process snapshot creation failed: "
+            f"WinError {ctypes.get_last_error()}"
+        )
+
+    expected_record_size = ctypes.sizeof(ProcessEntry32W)
+    rows: list[dict[str, Any]] = []
+    termination_error: int | None = None
+    primary_error: BaseException | None = None
+    handle_closed = False
+    try:
+        entry = ProcessEntry32W()
+        entry.dwSize = expected_record_size
+        if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            error = ctypes.get_last_error()
+            raise RuntimeError(
+                "release blocked: Toolhelp process snapshot first record failed: "
+                f"WinError {error}"
+            )
+        while True:
+            rows.append(
+                {
+                    "pid": int(entry.th32ProcessID),
+                    "parent_pid": int(entry.th32ParentProcessID),
+                    "executable": str(entry.szExeFile),
+                    "record_size": int(entry.dwSize),
+                }
+            )
+            if kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                continue
+            termination_error = ctypes.get_last_error()
+            break
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        handle_closed = bool(kernel32.CloseHandle(snapshot))
+        if not handle_closed:
+            close_error = RuntimeError(
+                "release blocked: Toolhelp process snapshot handle close failed: "
+                f"WinError {ctypes.get_last_error()}"
+            )
+            if primary_error is None:
+                raise close_error
+            raise close_error from primary_error
+
+    return _validate_toolhelp_process_snapshot(
+        rows,
+        caller_pid=os.getpid(),
+        record_size=expected_record_size,
+        expected_record_size=expected_record_size,
+        termination_error=termination_error,
+        handle_closed=handle_closed,
+    )
+
+
+@dataclass(frozen=True)
 class _ReleaseHookBinding:
     """Capture the exact release-hook command and native identity together."""
 
@@ -4058,6 +4246,7 @@ def _fresh_resource_scope(
         identities[observer_pid] = observer_bootstrap_identity
         protected.add(observer_pid)
     terminal_exclusions = []
+    terminal_states: dict[int, dict[str, Any]] = {}
     private_diagnostics = []
     try:
         protected.update(
@@ -4221,6 +4410,7 @@ def _fresh_resource_scope(
                     f"scoped_port_owner={pid in scoped_port_owner_pids}"
                 )
             identities.pop(pid, None)
+            terminal_states[pid] = identity
             terminal_exclusions.append({"pid": pid, "reason": "authoritative native exit during census"})
             continue
         identities[pid] = identity
@@ -4325,6 +4515,7 @@ def _fresh_resource_scope(
         "protected_pids": protected,
         "unrelated_exclusions": unrelated_exclusions,
         "terminal_exclusions": terminal_exclusions,
+        "terminal_states": terminal_states,
         "private_diagnostics": private_diagnostics,
         "all_process_pids": all_process_pids,
     }
@@ -4334,8 +4525,9 @@ def _assert_fresh_host_process_census(
     contract: dict[str, Any],
     *,
     observer_bootstrap_identity: dict[str, Any] | None = None,
+    process_snapshot: _ToolhelpProcessSnapshot | None = None,
 ) -> dict[str, Any]:
-    """Recheck every historical identity and current release resource before work."""
+    """Recheck historical identities before classifying current resources."""
     family_by_pid = {record["pid"]: record for record in contract["family_records"]}
     presence = contract["presence"]
     identities = {}
@@ -4343,47 +4535,59 @@ def _assert_fresh_host_process_census(
     replacements = {}
     terminal_states = {}
     transition_diagnostics = {}
+    snapshot_absent_pids: list[int] = []
     for pid, family in family_by_pid.items():
-        saved_observation = presence[pid]
-        if saved_observation.get("expected_creation") != family["creation"]:
+        if presence[pid].get("expected_creation") != family["creation"]:
             raise RuntimeError(
-                f"release blocked: saved presence expected_creation disagrees with normalized family: pid={pid}"
+                "release blocked: saved presence expected_creation disagrees with normalized family: "
+                f"pid={pid}"
             )
-        try:
-            current = _read_fresh_native_process_identity(
-                pid, _NativeReadState(expected_creation=family["creation"])
-            )
-        except _FreshProcessAbsent:
+        if process_snapshot is not None and pid not in process_snapshot.rows:
             state = "absent"
-        except _FreshProcessUnreadable as exc:
-            raise RuntimeError(
-                f"release blocked: fresh native identity census failed: pid={pid} error={exc}"
-            ) from exc
+            snapshot_absent_pids.append(pid)
+            transition_diagnostics[pid] = {
+                "saved_state": presence[pid]["state"],
+                "fresh_state": state,
+                "terminal_classification": "absent_from_validated_toolhelp_snapshot",
+            }
         else:
-            if current.get("state") == "exited":
+            try:
+                current = _read_fresh_native_process_identity(
+                    pid, _NativeReadState(expected_creation=family["creation"])
+                )
+            except _FreshProcessAbsent:
                 state = "absent"
-                terminal_states[pid] = current
-                if current.get("creation") == family["creation"]:
-                    terminal_classification = "exited_exact_historical_object"
-                else:
-                    terminal_classification = "exited_replacement_object"
-                transition_diagnostics[pid] = {
-                    "saved_state": presence[pid]["state"],
-                    "fresh_state": state,
-                    "terminal_classification": terminal_classification,
-                    "terminal_creation": current.get("creation"),
-                    "historical_creation": family["creation"],
-                }
-            elif current["creation"] != family["creation"]:
-                state = "reused"
-                _validate_fresh_replacement_identity(current, family["creation"], pid)
-                replacements[pid] = current
+            except _FreshProcessUnreadable as exc:
+                raise RuntimeError(
+                    f"release blocked: fresh native identity census failed: pid={pid} error={exc}"
+                ) from exc
             else:
-                state = "live"
-                identities[pid] = current
-                _assert_exact_live_identity_matches_family(current, family, pid)
-        states[pid] = state
+                if current.get("state") == "exited":
+                    state = "absent"
+                    _validate_fresh_exit_identity(current, pid)
+                    terminal_states[pid] = current
+                    terminal_classification = (
+                        "exited_exact_historical_object"
+                        if current.get("creation") == family["creation"]
+                        else "exited_replacement_object"
+                    )
+                    transition_diagnostics[pid] = {
+                        "saved_state": presence[pid]["state"],
+                        "fresh_state": state,
+                        "terminal_classification": terminal_classification,
+                        "terminal_creation": current.get("creation"),
+                        "historical_creation": family["creation"],
+                    }
+                elif current["creation"] != family["creation"]:
+                    state = "reused"
+                    _validate_fresh_replacement_identity(current, family["creation"], pid)
+                    replacements[pid] = current
+                else:
+                    state = "live"
+                    identities[pid] = current
+                    _assert_exact_live_identity_matches_family(current, family, pid)
         saved_state = presence[pid]["state"]
+        states[pid] = state
         allowed_states = _FRESH_STATE_TRANSITIONS.get(saved_state)
         if allowed_states is None or state not in allowed_states:
             raise RuntimeError(
@@ -4396,16 +4600,10 @@ def _assert_fresh_host_process_census(
             raise RuntimeError(
                 f"release blocked: exact-live historical identity is unapproved: pid={pid}"
             )
+
     resources = _enumerate_fresh_frontend_resources()
     if not isinstance(resources, dict):
         raise RuntimeError("release blocked: fresh resource census returned an invalid object")
-    replacement_pids = set(replacements)
-    approved_live_pids = set(identities)
-    approved_live_ports = {
-        port
-        for pid in approved_live_pids
-        for port in family_by_pid[pid]["ports"]
-    }
     product_root = _canonical_windows_path_identity(ROOT.resolve())
     scoped_ports = _configured_product_ports() | {
         port for family in family_by_pid.values() for port in family["ports"]
@@ -4414,10 +4612,67 @@ def _assert_fresh_host_process_census(
         resources,
         product_root,
         scoped_ports=scoped_ports,
-        preloaded_identities={**replacements, **identities},
+        preloaded_identities=replacements,
         observer_role="release_hook",
         observer_bootstrap_identity=observer_bootstrap_identity,
     )
+
+    post_resource_identity_rechecks: dict[int, dict[str, Any]] = {}
+    if process_snapshot is not None:
+        resource_membership = set(resource_scope["all_process_pids"])
+        for pid in set(identities) | set(replacements):
+            if pid not in resource_membership:
+                raise RuntimeError(
+                    "release blocked: relevant historical PID membership changed after resource collection: "
+                    f"pid={pid}"
+                )
+            expected = identities.get(pid) or replacements[pid]
+            try:
+                rechecked = _read_fresh_native_process_identity(
+                    pid, _NativeReadState(expected_creation=expected["creation"])
+                )
+            except (_FreshProcessAbsent, _FreshProcessUnreadable) as exc:
+                raise RuntimeError(
+                    "release blocked: relevant historical identity could not be revalidated after "
+                    f"resource collection: pid={pid} error={exc}"
+                ) from exc
+            if rechecked.get("state") == "exited" or rechecked.get("creation") != expected["creation"]:
+                raise RuntimeError(
+                    "release blocked: relevant historical generation changed after resource collection: "
+                    f"pid={pid} expected_creation={expected['creation']!r} "
+                    f"actual_creation={rechecked.get('creation')!r}"
+                )
+            if pid in identities:
+                _assert_exact_live_identity_matches_family(rechecked, family_by_pid[pid], pid)
+            else:
+                _validate_fresh_replacement_identity(
+                    rechecked, family_by_pid[pid]["creation"], pid
+                )
+            post_resource_identity_rechecks[pid] = rechecked
+
+    historical_exclusions = []
+    resource_identity_pids = set(resource_scope["identities"])
+    relevant_resource_pids = {
+        entry["row"]["pid"]
+        for entry in resource_scope["relevant_processes"]
+        if isinstance(entry, dict)
+        and isinstance(entry.get("row"), dict)
+        and _is_positive_pid(entry["row"].get("pid"))
+    }
+    for pid, state in states.items():
+        if state != "live" and pid not in resource_identity_pids and pid not in relevant_resource_pids:
+            historical_exclusions.append(
+                {
+                    "pid": pid,
+                    "reason": "historical identity not selected by current resource evidence",
+                    "saved_state": presence[pid]["state"],
+                }
+            )
+    replacement_pids = set(replacements)
+    approved_live_pids = set(identities)
+    approved_live_ports = {
+        port for pid in approved_live_pids for port in family_by_pid[pid]["ports"]
+    }
     relevant_processes = [entry["row"] for entry in resource_scope["relevant_processes"]]
     protected_pids = resource_scope["protected_pids"]
     unrelated_exclusions = resource_scope["unrelated_exclusions"]
@@ -4473,8 +4728,24 @@ def _assert_fresh_host_process_census(
         "identities": identities,
         "replacements": replacements,
         "replacement_pids": sorted(replacement_pids),
+        "toolhelp_snapshot": (
+            {
+                "caller_pid": process_snapshot.caller_pid,
+                "record_size": process_snapshot.record_size,
+                "pid_count": len(process_snapshot.rows),
+                "historical_present_count": sum(
+                    pid in process_snapshot.rows for pid in family_by_pid
+                ),
+                "historical_absent_count": len(snapshot_absent_pids),
+            }
+            if process_snapshot is not None
+            else None
+        ),
         "terminal_states": terminal_states,
         "transition_diagnostics": transition_diagnostics,
+        "historical_exclusions": historical_exclusions,
+        "snapshot_absent_pids": sorted(snapshot_absent_pids),
+        "post_resource_identity_rechecks": post_resource_identity_rechecks,
         "terminal_exclusions": resource_scope["terminal_exclusions"],
         "private_diagnostics": resource_scope["private_diagnostics"],
         "resources": resources,
@@ -4487,9 +4758,11 @@ def _validate_host_process_evidence(
 ) -> dict[str, Any]:
     """Validate measured host evidence without changing host state."""
     contract = _load_host_process_contract()
+    process_snapshot = _collect_toolhelp_process_snapshot()
     fresh = _assert_fresh_host_process_census(
         contract,
         observer_bootstrap_identity=observer_bootstrap_identity,
+        process_snapshot=process_snapshot,
     )
     native = _observe_host_native_resource()
     return {
