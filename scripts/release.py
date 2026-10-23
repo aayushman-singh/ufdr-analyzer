@@ -240,9 +240,11 @@ def _release_hook_parent_role_mismatch(
     if _canonical_windows_path_identity(parent_executable) != expected_launcher:
         return "parent.executable"
     parent_cwd = observation.get("cwd")
-    if not isinstance(parent_cwd, str) or not parent_cwd.strip():
-        return "parent.cwd"
-    if _canonical_windows_path_identity(parent_cwd) != _canonical_windows_path_identity(product_root):
+    if (
+        not isinstance(parent_cwd, str)
+        or not parent_cwd.strip()
+        or not ntpath.isabs(parent_cwd)
+    ):
         return "parent.cwd"
     parent_command = observation.get("native_command")
     if not isinstance(parent_command, str) or not parent_command:
@@ -3057,8 +3059,7 @@ def _release_hook_identity_mismatch(
     if (
         not isinstance(cwd, str)
         or not cwd.strip()
-        or _canonical_windows_path_identity(cwd)
-        != _canonical_windows_path_identity(product_root)
+        or not ntpath.isabs(cwd)
     ):
         return "cwd"
     argv = identity.get("argv")
@@ -3143,11 +3144,7 @@ def _release_hook_identity_mismatch(
         if not isinstance(parent_executable_value, (str, Path)) or not isinstance(parent_cwd, str):
             continue
         parent_executable = _canonical_windows_path_identity(parent_executable_value)
-        if (
-            parent_executable == expected_executable
-            and _canonical_windows_path_identity(parent_cwd)
-            == _canonical_windows_path_identity(product_root)
-        ):
+        if parent_executable == expected_executable and ntpath.isabs(parent_cwd):
             if native_child:
                 launcher_mismatch = _release_hook_parent_role_mismatch(
                     observation,

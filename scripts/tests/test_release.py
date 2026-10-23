@@ -4338,6 +4338,61 @@ def test_release_hook_bootstrap_captures_the_requested_command(monkeypatch):
     assert captured["release_hook_requested_command"] == "prepare"
 
 
+@pytest.mark.parametrize("command", ["prepare", "observe", "execute", "verify"])
+def test_release_hook_accepts_an_exact_invocation_from_a_non_product_cwd(monkeypatch, command):
+    root = str(release.ROOT.resolve())
+    identity = _release_hook_launcher_child_identity(root)
+    non_product_cwd = "C:/JarvisDeploy/jarvis"
+    identity["cwd"] = non_product_cwd
+    identity["parent_observations"][0]["cwd"] = non_product_cwd
+    identity["argv"][2] = command
+    identity["native_command"] = " ".join(identity["argv"])
+    identity["argv_sha256"] = hashlib.sha256(
+        "\0".join(identity["argv"]).encode()
+    ).hexdigest()
+    identity["native_command_sha256"] = hashlib.sha256(
+        identity["native_command"].encode()
+    ).hexdigest()
+    _replace_release_hook_parent_argv(
+        identity,
+        [
+            identity["parent_observations"][0]["argv"][0],
+            identity["parent_observations"][0]["argv"][1],
+            command,
+        ],
+    )
+    monkeypatch.setattr(
+        release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity
+    )
+
+    binding = release._capture_current_release_hook_binding(command)
+
+    assert binding.command == command
+    assert binding.identity["cwd"] == non_product_cwd
+    assert binding.identity["parent_observations"][0]["cwd"] == non_product_cwd
+
+
+def test_release_hook_rejects_cwd_mutation_during_generation_revalidation(monkeypatch):
+    root = str(release.ROOT.resolve())
+    identity = _release_hook_launcher_child_identity(root)
+    current = dict(identity)
+    current["parent_observations"] = [dict(identity["parent_observations"][0])]
+    current["cwd"] = "C:/JarvisDeploy/jarvis"
+    current["parent_observations"][0]["cwd"] = "C:/JarvisDeploy/jarvis"
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda *_args, **_kwargs: current,
+    )
+
+    with pytest.raises(RuntimeError, match=r"field=cwd"):
+        release._assert_current_release_hook_generation(
+            identity,
+            phase="after-classification",
+            expected_identity=identity,
+        )
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
