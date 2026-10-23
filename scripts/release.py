@@ -3265,6 +3265,207 @@ def _fresh_process_row_needs_identity(
     return True, "measured frontend-family candidate"
 
 
+def _read_stable_protected_relation(
+    pid: int,
+    row: dict[str, Any],
+    protected_pids: set[int],
+    *,
+    expected_creation: str | None = None,
+) -> dict[str, Any] | None:
+    """Bind a protected parent relation to two stable parent generations."""
+    parent_pid = row.get("parent_pid")
+    if parent_pid not in protected_pids:
+        return None
+
+    def read_identity(current_pid: int, *, parent: bool = False) -> dict[str, Any]:
+        try:
+            identity = _read_fresh_native_process_identity(
+                current_pid,
+                _NativeReadState(
+                    expected_creation=expected_creation if current_pid == pid else None,
+                    limited_only=True,
+                ),
+                _read_parent_observation=current_pid == pid,
+            )
+        except _FreshProcessAbsent as exc:
+            if not parent:
+                raise
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation parent generation is absent: "
+                f"child_pid={pid} parent_pid={current_pid}"
+            ) from exc
+        if not isinstance(identity, dict) or identity.get("pid") != current_pid:
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation identity does not match: "
+                f"pid={current_pid}"
+            )
+        creation = identity.get("creation")
+        if not isinstance(creation, str) or not creation.isdigit():
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation identity has no comparable creation token: "
+                f"pid={current_pid} creation={creation!r}"
+            )
+        return identity
+
+    def parent_edge(identity: dict[str, Any], phase: str) -> dict[str, Any]:
+        if identity.get("parent_pid") != parent_pid:
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation parent changed for child: "
+                f"pid={pid} phase={phase} expected_parent_pid={parent_pid} "
+                f"actual_parent_pid={identity.get('parent_pid')!r}"
+            )
+        observations = identity.get("parent_observations")
+        if not isinstance(observations, list) or not observations:
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation child lacks parent generation proof: "
+                f"pid={pid} phase={phase}"
+            )
+        for observation in observations:
+            if not isinstance(observation, dict):
+                continue
+            if observation.get("state") != "readable_current_parent":
+                continue
+            if observation.get("relation") != "current parent of exact child identity":
+                continue
+            if observation.get("pid") != parent_pid:
+                continue
+            creation = observation.get("creation")
+            if not isinstance(creation, str) or not creation.isdigit():
+                continue
+            argv = observation.get("argv")
+            native_command = observation.get("native_command")
+            if not isinstance(argv, list) or not argv or not all(
+                isinstance(argument, str) for argument in argv
+            ):
+                continue
+            if not isinstance(native_command, str) or not native_command:
+                continue
+            if observation.get("argv_sha256") != hashlib.sha256(
+                "\0".join(argv).encode("utf-8")
+            ).hexdigest():
+                continue
+            if observation.get("native_command_sha256") != hashlib.sha256(
+                native_command.encode("utf-8")
+            ).hexdigest():
+                continue
+            return observation
+        raise _FreshProcessUnreadable(
+            "release blocked: protected relation child has no exact readable parent edge: "
+            f"pid={pid} parent_pid={parent_pid} phase={phase}"
+        )
+
+    def child_command_fingerprint(identity: dict[str, Any], phase: str) -> tuple[str, str]:
+        argv = identity.get("argv")
+        native_command = identity.get("native_command")
+        if not isinstance(argv, list) or not argv or not all(
+            isinstance(argument, str) for argument in argv
+        ):
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation child argv is invalid: "
+                f"pid={pid} phase={phase}"
+            )
+        if not isinstance(native_command, str) or not native_command:
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation child command is invalid: "
+                f"pid={pid} phase={phase}"
+            )
+        argv_sha256 = hashlib.sha256("\0".join(argv).encode("utf-8")).hexdigest()
+        command_sha256 = hashlib.sha256(native_command.encode("utf-8")).hexdigest()
+        if (
+            identity.get("argv_sha256") != argv_sha256
+            or identity.get("native_command_sha256") != command_sha256
+        ):
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation child command identity is incoherent: "
+                f"pid={pid} phase={phase}"
+            )
+        return argv_sha256, command_sha256
+
+    first = read_identity(pid)
+    first_parent = read_identity(parent_pid, parent=True)
+    second = read_identity(pid)
+    second_parent = read_identity(parent_pid, parent=True)
+    first_edge = parent_edge(first, "before")
+    second_edge = parent_edge(second, "after")
+    first_child_hashes = child_command_fingerprint(first, "before")
+    second_child_hashes = child_command_fingerprint(second, "after")
+
+    for phase, identity in (("before", first), ("after", second)):
+        if not isinstance(identity, dict) or identity.get("pid") != pid:
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation identity does not match: "
+                f"pid={pid} phase={phase}"
+            )
+        creation = identity.get("creation")
+        if not isinstance(creation, str) or not creation:
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation identity has no creation token: "
+                f"pid={pid} phase={phase}"
+            )
+        if identity.get("parent_pid") != parent_pid:
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation parent changed: "
+                f"pid={pid} phase={phase} expected_parent_pid={parent_pid} "
+                f"actual_parent_pid={identity.get('parent_pid')!r}"
+            )
+        if expected_creation is not None and creation != expected_creation:
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation creation changed during binding: "
+                f"pid={pid} expected_creation={expected_creation!r} actual_creation={creation!r}"
+            )
+    for phase, parent_identity in (("before", first_parent), ("after", second_parent)):
+        if parent_identity.get("pid") != parent_pid:
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation parent identity does not match: "
+                f"pid={pid} phase={phase} expected_parent_pid={parent_pid} "
+                f"actual_parent_pid={parent_identity.get('pid')!r}"
+            )
+        if first.get("parent_pid") != parent_pid or second.get("parent_pid") != parent_pid:
+            raise _FreshProcessUnreadable(
+                "release blocked: protected relation parent changed: "
+                f"pid={pid} expected_parent_pid={parent_pid}"
+            )
+    if first.get("creation") != second.get("creation"):
+        raise _FreshProcessUnreadable(
+            "release blocked: protected relation creation changed during binding: "
+            f"pid={pid} before={first.get('creation')!r} after={second.get('creation')!r}"
+        )
+    if first_child_hashes != second_child_hashes:
+        raise _FreshProcessUnreadable(
+            "release blocked: protected relation child command identity changed during binding: "
+            f"pid={pid} before={first_child_hashes!r} after={second_child_hashes!r}"
+        )
+    if first_edge.get("creation") != second_edge.get("creation"):
+        raise _FreshProcessUnreadable(
+            "release blocked: protected relation observed parent generation changed during child reads: "
+            f"pid={pid} parent_pid={parent_pid} before={first_edge.get('creation')!r} "
+            f"after={second_edge.get('creation')!r}"
+        )
+    if first_parent.get("creation") != second_parent.get("creation"):
+        raise _FreshProcessUnreadable(
+            "release blocked: protected relation parent generation changed during binding: "
+            f"pid={pid} parent_pid={parent_pid} before={first_parent.get('creation')!r} "
+            f"after={second_parent.get('creation')!r}"
+        )
+    if (
+        first_edge.get("creation") != first_parent.get("creation")
+        or second_edge.get("creation") != second_parent.get("creation")
+    ):
+        raise _FreshProcessUnreadable(
+            "release blocked: protected relation edge and parent identity do not match: "
+            f"pid={pid} parent_pid={parent_pid} edge_before={first_edge.get('creation')!r} "
+            f"parent_before={first_parent.get('creation')!r} edge_after={second_edge.get('creation')!r} "
+            f"parent_after={second_parent.get('creation')!r}"
+        )
+    if int(first.get("creation")) < int(first_parent.get("creation")):
+        raise _FreshProcessUnreadable(
+            "release blocked: protected relation child predates parent generation: "
+            f"pid={pid} child_creation={first.get('creation')} parent_pid={parent_pid} "
+            f"parent_creation={first_parent.get('creation')}"
+        )
+    return second
+
+
 def _resource_port_records(value: list[Any]) -> list[tuple[int, int | None]]:
     """Normalize scoped socket rows while preserving owner identity."""
     normalized = []
@@ -3628,6 +3829,17 @@ def _fresh_resource_scope(
             scoped_port_records_by_pid.setdefault(owner, tuple())
             scoped_port_records_by_pid[owner] += ((port, owner),)
     identities = dict(preloaded_identities or {})
+    if observer_bootstrap_identity is not None:
+        if not _has_complete_resource_identity(observer_bootstrap_identity):
+            raise RuntimeError("release blocked: observer bootstrap identity is incomplete")
+        observer_pid = observer_bootstrap_identity.get("pid")
+        if type(observer_pid) is not int or observer_pid != os.getpid():
+            raise RuntimeError(
+                "release blocked: observer bootstrap identity does not match the current process: "
+                f"pid={observer_pid!r} current_pid={os.getpid()}"
+            )
+        identities[observer_pid] = observer_bootstrap_identity
+        protected.add(observer_pid)
     terminal_exclusions = []
     private_diagnostics = []
     try:
@@ -3670,6 +3882,46 @@ def _fresh_resource_scope(
         ):
             positive_product_relation_pids.add(pid)
 
+    def record_native_absence(pid: int, exc: _FreshProcessAbsent) -> tuple[Path, str]:
+        absence = {"pid": pid, "type": type(exc).__name__, "message": str(exc)}
+        try:
+            evidence_path, evidence_digest = _record_private_resource_scope_failure(
+                item=process_rows_by_pid[pid],
+                identity=None,
+                native_holder_module_paths=native_holder_module_paths_by_pid.get(pid, ()),
+                scoped_port_records=scoped_port_records_by_pid.get(pid, ()),
+                product_root=product_root,
+                positive_product_relation=pid in positive_product_relation_pids,
+                measured_product_relation=pid in positive_product_relation_pids,
+                protected_relation={
+                    "pid": pid,
+                    "protected": pid in protected,
+                    "protected_pids": sorted(protected),
+                },
+                failed_step="_fresh_resource_scope.identity_hydration",
+                original_error=exc,
+                original_traceback=traceback.format_exc(),
+                native_absence=absence,
+            )
+        except Exception as diagnostic_error:
+            raise RuntimeError(
+                "release blocked: native process absence diagnostic failed "
+                f"for pid={pid}; diagnostic_failure={type(diagnostic_error).__name__}"
+            ) from exc
+        if pid in native_holder_pids or pid in scoped_port_owner_pids:
+            raise RuntimeError(
+                "release blocked: fresh resource owner became absent during census: "
+                f"pid={pid} native_holder={pid in native_holder_pids} "
+                f"scoped_port_owner={pid in scoped_port_owner_pids}; "
+                f"private_evidence={evidence_path}; evidence_digest={evidence_digest}"
+            ) from exc
+        identities.pop(pid, None)
+        terminal_exclusions.append({"pid": pid, "reason": "explicit native absence during census"})
+        private_diagnostics.append(
+            {"pid": pid, "kind": "native_absence", "path": str(evidence_path), "digest": evidence_digest}
+        )
+        return evidence_path, evidence_digest
+
     for pid in sorted(candidate_pids):
         if pid not in process_rows_by_pid:
             if pid in native_holder_pids:
@@ -3700,58 +3952,31 @@ def _fresh_resource_scope(
                 else None
             )
             try:
+                row = process_rows_by_pid[pid]
+                positive_product_relation = pid in positive_product_relation_pids
+                if (
+                    pid not in native_holder_pids
+                    and pid not in scoped_port_owner_pids
+                    and not positive_product_relation
+                ):
+                    protected_identity = _read_stable_protected_relation(
+                        pid,
+                        row,
+                        protected,
+                        expected_creation=expected_preloaded_creation,
+                    )
+                    if protected_identity is not None:
+                        identities[pid] = protected_identity
+                        protected.add(pid)
+                        unrelated_exclusions.append(
+                            {"pid": pid, "reason": "verified protected ancestry"}
+                        )
+                        continue
                 identity = _read_fresh_native_process_identity(
                     pid, _NativeReadState(expected_creation=expected_preloaded_creation)
                 )
             except _FreshProcessAbsent as exc:
-                absence = {
-                    "pid": pid,
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                }
-                try:
-                    evidence_path, evidence_digest = _record_private_resource_scope_failure(
-                        item=process_rows_by_pid[pid],
-                        identity=None,
-                        native_holder_module_paths=native_holder_module_paths_by_pid.get(pid, ()),
-                        scoped_port_records=scoped_port_records_by_pid.get(pid, ()),
-                        product_root=product_root,
-                        positive_product_relation=pid in positive_product_relation_pids,
-                        measured_product_relation=pid in positive_product_relation_pids,
-                        protected_relation={
-                            "pid": pid,
-                            "protected": pid in protected,
-                            "protected_pids": sorted(protected),
-                        },
-                        failed_step="_fresh_resource_scope.full_identity_hydration",
-                        original_error=exc,
-                        original_traceback=traceback.format_exc(),
-                        native_absence=absence,
-                    )
-                except Exception as diagnostic_error:
-                    raise RuntimeError(
-                        "release blocked: native process absence diagnostic failed "
-                        f"for pid={pid}; diagnostic_failure={type(diagnostic_error).__name__}"
-                    ) from exc
-                if pid in native_holder_pids or pid in scoped_port_owner_pids:
-                    raise RuntimeError(
-                        "release blocked: fresh resource owner became absent during census: "
-                        f"pid={pid} native_holder={pid in native_holder_pids} "
-                        f"scoped_port_owner={pid in scoped_port_owner_pids}; "
-                        f"private_evidence={evidence_path}; evidence_digest={evidence_digest}"
-                    ) from exc
-                identities.pop(pid, None)
-                terminal_exclusions.append(
-                    {"pid": pid, "reason": "explicit native absence during census"}
-                )
-                private_diagnostics.append(
-                    {
-                        "pid": pid,
-                        "kind": "native_absence",
-                        "path": str(evidence_path),
-                        "digest": evidence_digest,
-                    }
-                )
+                record_native_absence(pid, exc)
                 continue
             except _FreshProcessUnreadable as exc:
                 raise RuntimeError(

@@ -2904,6 +2904,118 @@ def test_fresh_census_rejects_unreadable_identity(monkeypatch):
         release._assert_fresh_host_process_census(contract)
 
 
+def test_fresh_census_rejects_access_denied_for_saved_absent_identity(monkeypatch):
+    contract = _fresh_census_contract(count=1, states={1: "absent"})
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda _pid, *_args, **_kwargs: (_ for _ in ()).throw(
+            release._FreshProcessUnreadable("pid=1 limited native identity open failed: WinError 5")
+        ),
+    )
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [
+                {
+                    "pid": 1,
+                    "name": "SystemSettings.exe",
+                    "executable": "C:/Windows/System32/SystemSettings.exe",
+                    "command": "SystemSettings.exe",
+                    "cwd": "C:/Windows",
+                    "parent_pid": 4,
+                }
+            ],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="fresh native identity census failed.*WinError 5"):
+        release._assert_fresh_host_process_census(contract)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda row, root: row.update(cwd=f"{root}/frontend"),
+        lambda row, root: row.update(command=f"SystemSettings.exe {root}/frontend/server.js"),
+        lambda row, root: row.update(parent_pid=2),
+    ],
+)
+def test_fresh_census_keeps_access_denied_ambiguous_scope_blocking(monkeypatch, mutate):
+    contract = _fresh_census_contract(count=1, states={1: "absent"})
+    root = str(release.ROOT.resolve())
+    row = {
+        "pid": 1,
+        "name": "SystemSettings.exe",
+        "executable": "C:/Windows/System32/SystemSettings.exe",
+        "command": "SystemSettings.exe",
+        "cwd": "C:/Windows",
+        "parent_pid": 4,
+    }
+    mutate(row, root)
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda _pid, *_args, **_kwargs: (_ for _ in ()).throw(
+            release._FreshProcessUnreadable("pid=1 limited native identity open failed: WinError 5")
+        ),
+    )
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {"processes": [row], "holders": [], "ports": [], "read_errors": []},
+    )
+
+    with pytest.raises(RuntimeError, match="fresh native identity census failed.*WinError 5"):
+        release._assert_fresh_host_process_census(contract)
+
+
+@pytest.mark.parametrize("resource_field", ["scoped_port", "project_module", "relevant_parent"])
+def test_fresh_census_keeps_access_denied_resource_conflicts_blocking(monkeypatch, resource_field):
+    contract = _fresh_census_contract(count=1, states={1: "absent"})
+    root = str(release.ROOT.resolve())
+    row = {
+        "pid": 1,
+        "name": "SystemSettings.exe",
+        "executable": "C:/Windows/System32/SystemSettings.exe",
+        "command": "SystemSettings.exe",
+        "cwd": "C:/Windows",
+        "parent_pid": 4,
+    }
+    resources = {"processes": [row], "holders": [], "ports": [], "read_errors": []}
+    if resource_field == "scoped_port":
+        resources["ports"] = [{"port": 4100, "pid": 1}]
+    elif resource_field == "project_module":
+        resources["holders"] = [{"pid": 1, "module_paths": [f"{root}/frontend/module.node"]}]
+    else:
+        row["parent_pid"] = 2
+        resources["processes"].append(
+            {
+                "pid": 2,
+                "name": "node.exe",
+                "executable": "C:/tools/node.exe",
+                "command": f"node {root}/frontend/server.js",
+                "cwd": f"{root}/frontend",
+                "parent_pid": 4,
+            }
+        )
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda _pid, *_args, **_kwargs: (_ for _ in ()).throw(
+            release._FreshProcessUnreadable("pid=1 limited native identity open failed: WinError 5")
+        ),
+    )
+    monkeypatch.setattr(release, "_enumerate_fresh_frontend_resources", lambda: resources)
+
+    with pytest.raises(RuntimeError, match="fresh native identity census failed.*WinError 5"):
+        release._assert_fresh_host_process_census(contract)
+
+
 def test_fresh_census_classifies_process_absence_as_terminal_exclusion(monkeypatch, tmp_path):
     reads = []
 
@@ -4644,6 +4756,245 @@ def test_fresh_resource_scope_fails_for_inaccessible_frontend_candidate(monkeypa
             str(release.ROOT.resolve()),
             scoped_ports={43123},
         )
+
+
+def _protected_relation_child_identity(*, creation="200", parent_creation="100", parent_pid=901):
+    argv = ["C:/tools/node.exe", "server.js"]
+    native_command = "node server.js"
+    return {
+        "pid": 900,
+        "creation": creation,
+        "executable": "C:/tools/node.exe",
+        "parent_pid": parent_pid,
+        "argv": argv,
+        "argv_sha256": hashlib.sha256("\0".join(argv).encode("utf-8")).hexdigest(),
+        "native_command": native_command,
+        "native_command_sha256": hashlib.sha256(native_command.encode("utf-8")).hexdigest(),
+        "parent_observations": [
+            {
+                "pid": parent_pid,
+                "state": "readable_current_parent",
+                "creation": parent_creation,
+                "argv": ["C:/tools/python.exe", "-m", "pytest"],
+                "argv_sha256": hashlib.sha256(
+                    "\0".join(["C:/tools/python.exe", "-m", "pytest"]).encode("utf-8")
+                ).hexdigest(),
+                "native_command": "python -m pytest",
+                "native_command_sha256": hashlib.sha256(
+                    "python -m pytest".encode("utf-8")
+                ).hexdigest(),
+                "relation": "current parent of exact child identity",
+            }
+        ],
+    }
+
+
+def test_fresh_resource_scope_excludes_stable_protected_ancestry_without_full_identity(monkeypatch):
+    reads = []
+
+    def read(pid, read_state, *_args, **_kwargs):
+        reads.append((pid, read_state.limited_only))
+        if not read_state.limited_only:
+            raise AssertionError("protected ancestry must not receive a full identity read")
+        expected_parent_pid = 901
+        expected_parent_creation = "100"
+        if pid == 900:
+            child = _protected_relation_child_identity()
+            parent_observation = child["parent_observations"][0]
+            assert child["parent_pid"] == parent_observation["pid"] == expected_parent_pid
+            assert parent_observation["creation"] == expected_parent_creation
+            assert int(child["creation"]) >= int(parent_observation["creation"])
+            return child
+        if pid == 901:
+            parent = {
+                "pid": expected_parent_pid,
+                "creation": expected_parent_creation,
+                "executable": "C:/tools/python.exe",
+                "parent_pid": 1,
+            }
+            return parent
+        raise AssertionError(f"unexpected protected ancestry identity read: pid={pid}")
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+    result = release._fresh_resource_scope(
+        {
+            "processes": [{"pid": 900, "name": "node.exe", "executable": "C:/tools/node.exe", "parent_pid": 901}],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+        str(release.ROOT.resolve()),
+        scoped_ports={43123},
+        protected_pids={901},
+    )
+
+    assert reads == [(900, True), (901, True), (900, True), (901, True)]
+    assert result["unrelated_exclusions"] == [{"pid": 900, "reason": "verified protected ancestry"}]
+
+
+def test_fresh_resource_scope_blocks_child_older_than_protected_parent(monkeypatch):
+    def read(pid, read_state, *_args, **_kwargs):
+        if pid == 900:
+            return _protected_relation_child_identity(creation="100", parent_creation="200")
+        return {
+            "pid": pid,
+            "creation": "200",
+            "executable": "C:/tools/python.exe",
+            "parent_pid": 1,
+        }
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+    with pytest.raises(RuntimeError, match="child predates parent generation"):
+        release._fresh_resource_scope(
+            {
+                "processes": [{"pid": 900, "name": "node.exe", "executable": "C:/tools/node.exe", "parent_pid": 901}],
+                "holders": [],
+                "ports": [],
+                "read_errors": [],
+            },
+            str(release.ROOT.resolve()),
+            scoped_ports={43123},
+            protected_pids={901},
+        )
+
+
+def test_fresh_resource_scope_blocks_replaced_protected_parent_generation(monkeypatch):
+    parent_reads = 0
+
+    def read(pid, read_state, *_args, **_kwargs):
+        nonlocal parent_reads
+        if pid == 901:
+            parent_reads += 1
+        if pid == 900:
+            return _protected_relation_child_identity()
+        return {
+            "pid": pid,
+            "creation": "200" if pid == 900 else ("100" if parent_reads == 1 else "101"),
+            "executable": "C:/tools/node.exe" if pid == 900 else "C:/tools/python.exe",
+            "parent_pid": 901 if pid == 900 else 1,
+        }
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+    with pytest.raises(RuntimeError, match="parent generation changed"):
+        release._fresh_resource_scope(
+            {
+                "processes": [{"pid": 900, "name": "node.exe", "executable": "C:/tools/node.exe", "parent_pid": 901}],
+                "holders": [],
+                "ports": [],
+                "read_errors": [],
+            },
+            str(release.ROOT.resolve()),
+            scoped_ports={43123},
+            protected_pids={901},
+        )
+
+
+def test_fresh_resource_scope_blocks_edge_parent_generation_mismatch(monkeypatch):
+    def read(pid, read_state, *_args, **_kwargs):
+        if pid == 900:
+            return _protected_relation_child_identity(parent_creation="100")
+        return {
+            "pid": pid,
+            "creation": "101",
+            "executable": "C:/tools/python.exe",
+            "parent_pid": 1,
+        }
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+    with pytest.raises(RuntimeError, match="edge and parent identity do not match"):
+        release._fresh_resource_scope(
+            {
+                "processes": [{"pid": 900, "name": "node.exe", "executable": "C:/tools/node.exe", "parent_pid": 901}],
+                "holders": [],
+                "ports": [],
+                "read_errors": [],
+            },
+            str(release.ROOT.resolve()),
+            scoped_ports={43123},
+            protected_pids={901},
+        )
+
+
+def test_fresh_resource_scope_blocks_ambiguous_protected_ancestry(monkeypatch):
+    def read(pid, read_state, *_args, **_kwargs):
+        if pid == 900:
+            return _protected_relation_child_identity(parent_pid=902)
+        return {
+            "pid": pid,
+            "creation": "200",
+            "executable": "C:/tools/node.exe",
+            "parent_pid": 902,
+        }
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+    with pytest.raises(RuntimeError, match="protected relation parent changed"):
+        release._fresh_resource_scope(
+            {
+                "processes": [{"pid": 900, "name": "node.exe", "executable": "C:/tools/node.exe", "parent_pid": 901}],
+                "holders": [],
+                "ports": [],
+                "read_errors": [],
+            },
+            str(release.ROOT.resolve()),
+            scoped_ports={43123},
+            protected_pids={901},
+        )
+
+
+def test_fresh_resource_scope_keeps_positive_product_relation_fail_closed(monkeypatch):
+    def read(_pid, read_state, *_args, **_kwargs):
+        if read_state.limited_only:
+            raise AssertionError("positive product relation must not use protected exclusion")
+        raise release._FreshProcessUnreadable("WinError 5")
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+    with pytest.raises(RuntimeError, match="potentially relevant process identity failed: pid=900"):
+        release._fresh_resource_scope(
+            {
+                "processes": [
+                    {
+                        "pid": 900,
+                        "name": "node.exe",
+                        "executable": "C:/tools/node.exe",
+                        "cwd": f"{release.ROOT.resolve()}/frontend",
+                        "command": f"node {release.ROOT.resolve()}/frontend/server.js",
+                        "parent_pid": 901,
+                    }
+                ],
+                "holders": [],
+                "ports": [],
+                "read_errors": [],
+            },
+            str(release.ROOT.resolve()),
+            scoped_ports={43123},
+            protected_pids={901},
+        )
+
+
+def test_fresh_resource_scope_records_protected_candidate_native_absence(monkeypatch, tmp_path):
+    monkeypatch.setattr(release, "EXTERNAL_PROOF_ROOT", tmp_path)
+    reads = []
+
+    def read(pid, read_state, *_args, **_kwargs):
+        reads.append((pid, read_state.limited_only))
+        raise release._FreshProcessAbsent("absent")
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read)
+    result = release._fresh_resource_scope(
+        {
+            "processes": [{"pid": 900, "name": "node.exe", "executable": "C:/tools/node.exe", "parent_pid": 901}],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+        str(release.ROOT.resolve()),
+        scoped_ports={43123},
+        protected_pids={901},
+    )
+
+    assert reads == [(900, True)]
+    assert result["terminal_exclusions"] == [{"pid": 900, "reason": "explicit native absence during census"}]
+    assert result["private_diagnostics"][0]["kind"] == "native_absence"
 
 
 def test_fresh_resource_scope_binds_protected_service_ancestry_before_classification(monkeypatch):
