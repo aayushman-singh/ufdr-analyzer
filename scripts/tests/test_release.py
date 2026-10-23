@@ -4083,6 +4083,34 @@ def _scope_resources(identity):
     }
 
 
+def _gate_test_scope_identity(root, *, executable=None):
+    project_python = executable or str(Path(root) / ".venv" / "Scripts" / "python.exe")
+    parent_argv = ["C:/Windows/System32/services.exe"]
+    parent_command = parent_argv[0]
+    parent = {
+        "pid": 25200,
+        "state": "readable_current_parent",
+        "relation": "current parent of exact child identity",
+        "creation": "100",
+        "cwd": "C:/Windows/System32",
+        "executable": parent_argv[0],
+        "argv": parent_argv,
+        "argv_sha256": hashlib.sha256("\0".join(parent_argv).encode()).hexdigest(),
+        "native_command": parent_command,
+        "native_command_sha256": hashlib.sha256(parent_command.encode()).hexdigest(),
+    }
+    identity = _resource_identity(
+        os.getpid(),
+        cwd=root,
+        executable=project_python,
+        argv=[project_python, "-m", "pytest", "scripts/tests", "-q"],
+        parent_observations=[parent],
+    )
+    identity["creation"] = "200"
+    identity["parent_pid"] = 25200
+    return identity
+
+
 def test_fresh_resource_scope_accepts_the_complete_current_release_hook_contract(monkeypatch):
     root = str(release.ROOT.resolve())
     identity = _release_hook_scope_identity(root)
@@ -4093,10 +4121,152 @@ def test_fresh_resource_scope_accepts_the_complete_current_release_hook_contract
         root,
         scoped_ports=set(),
         preloaded_identities={identity["pid"]: identity},
+        observer_role="release_hook",
     )
 
     assert result["relevant_processes"] == []
     assert result["identities"][identity["pid"]] == identity
+
+
+def test_fresh_resource_scope_accepts_the_explicit_gate_test_observer(monkeypatch):
+    root = str(release.ROOT.resolve())
+    identity = _gate_test_scope_identity(root)
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
+
+    result = release._fresh_resource_scope(
+        _scope_resources(identity),
+        root,
+        scoped_ports=set(),
+        preloaded_identities={identity["pid"]: identity},
+        observer_role="gate_test",
+        observer_bootstrap_identity=identity,
+    )
+
+    assert result["relevant_processes"] == []
+
+
+def test_fresh_resource_scope_accepts_the_captured_native_gate_executable(monkeypatch):
+    root = str(release.ROOT.resolve())
+    native_executable = "C:/Python311/python.exe"
+    identity = _gate_test_scope_identity(root, executable=native_executable)
+    identity["argv"][0] = str(Path(root) / ".venv" / "Scripts" / "python.exe")
+    identity["native_command"] = " ".join(identity["argv"])
+    identity["argv_sha256"] = hashlib.sha256("\0".join(identity["argv"]).encode()).hexdigest()
+    identity["native_command_sha256"] = hashlib.sha256(identity["native_command"].encode()).hexdigest()
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
+
+    result = release._fresh_resource_scope(
+        _scope_resources(identity),
+        root,
+        scoped_ports=set(),
+        preloaded_identities={identity["pid"]: identity},
+        observer_role="gate_test",
+        observer_bootstrap_identity=identity,
+    )
+
+    assert result["relevant_processes"] == []
+
+
+def test_fresh_resource_scope_rejects_a_copied_interpreter_without_gate_identity(monkeypatch):
+    root = str(release.ROOT.resolve())
+    bootstrap = _gate_test_scope_identity(root, executable="C:/Python311/python.exe")
+    copied = _gate_test_scope_identity(root, executable="C:/copy/python.exe")
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: copied)
+
+    with pytest.raises(RuntimeError, match=r"role=gate_test.*field=executable"):
+        release._fresh_resource_scope(
+            _scope_resources(copied),
+            root,
+            scoped_ports=set(),
+            preloaded_identities={copied["pid"]: copied},
+            observer_role="gate_test",
+            observer_bootstrap_identity=bootstrap,
+        )
+
+
+def test_fresh_resource_scope_rejects_cross_role_observer(monkeypatch):
+    root = str(release.ROOT.resolve())
+    identity = _gate_test_scope_identity(root)
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
+
+    with pytest.raises(RuntimeError, match=r"role=release_hook.*field=argv"):
+        release._fresh_resource_scope(
+            _scope_resources(identity),
+            root,
+            scoped_ports=set(),
+            preloaded_identities={identity["pid"]: identity},
+            observer_role="release_hook",
+        )
+
+
+def test_fresh_resource_scope_rejects_arbitrary_same_interpreter_gate_observer(monkeypatch):
+    root = str(release.ROOT.resolve())
+    identity = _gate_test_scope_identity(root)
+    identity["argv"] = [identity["argv"][0], "-c", "print('pytest')"]
+    identity["native_command"] = " ".join(identity["argv"])
+    identity["argv_sha256"] = hashlib.sha256("\0".join(identity["argv"]).encode()).hexdigest()
+    identity["native_command_sha256"] = hashlib.sha256(identity["native_command"].encode()).hexdigest()
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
+
+    with pytest.raises(RuntimeError, match=r"role=gate_test.*field=argv.role"):
+        release._fresh_resource_scope(
+            _scope_resources(identity),
+            root,
+            scoped_ports=set(),
+            preloaded_identities={identity["pid"]: identity},
+            observer_role="gate_test",
+        )
+
+
+def test_fresh_resource_scope_accepts_the_provider_root_relative_release_script(monkeypatch):
+    root = str(release.ROOT.resolve())
+    identity = _release_hook_scope_identity(root)
+    identity["argv"][1] = "scripts/release.py"
+    identity["native_command"] = " ".join(identity["argv"])
+    identity["argv_sha256"] = hashlib.sha256("\0".join(identity["argv"]).encode()).hexdigest()
+    identity["native_command_sha256"] = hashlib.sha256(identity["native_command"].encode()).hexdigest()
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
+
+    result = release._fresh_resource_scope(
+        _scope_resources(identity),
+        root,
+        scoped_ports=set(),
+        preloaded_identities={identity["pid"]: identity},
+        observer_role="release_hook",
+    )
+
+    assert result["relevant_processes"] == []
+
+
+@pytest.mark.parametrize(
+    ("field", "mutate"),
+    [
+        ("argv[1]", lambda identity: identity["argv"].__setitem__(1, "scripts/other.py")),
+        ("argv[2]", lambda identity: identity["argv"].__setitem__(2, "unsupported")),
+        ("executable", lambda identity: identity.__setitem__("executable", "C:/tools/python.exe")),
+        ("cwd", lambda identity: identity.__setitem__("cwd", "")),
+        (
+            "parent_observations",
+            lambda identity: identity["parent_observations"][0].__setitem__("relation", "other"),
+        ),
+        (
+            "parent_observations",
+            lambda identity: identity["parent_observations"][0].__setitem__("argv_sha256", "0" * 64),
+        ),
+        ("argv_sha256", lambda identity: identity.__setitem__("argv_sha256", "0" * 64)),
+        (
+            "native_command_sha256",
+            lambda identity: identity.__setitem__("native_command_sha256", "0" * 64),
+        ),
+    ],
+)
+def test_release_hook_rejection_reports_the_exact_mismatched_field(field, mutate):
+    root = str(release.ROOT.resolve())
+    identity = _release_hook_scope_identity(root)
+    mutate(identity)
+
+    with pytest.raises(RuntimeError, match=rf"field={re.escape(field)} context=redacted"):
+        release._assert_current_release_hook_generation(identity, phase="before-classification")
 
 
 @pytest.mark.parametrize("resource_kind", ["module", "port"])
@@ -4118,6 +4288,7 @@ def test_fresh_resource_scope_resource_ownership_overrides_hook_protection(resou
         root,
         scoped_ports=scoped_ports,
         preloaded_identities={identity["pid"]: identity},
+        observer_role="release_hook",
     )
 
     assert [entry["identity"]["pid"] for entry in result["relevant_processes"]] == [identity["pid"]]
@@ -4149,6 +4320,7 @@ def test_fresh_resource_scope_blocks_release_hook_lookalikes(tmp_path, monkeypat
             root,
             scoped_ports=set(),
             preloaded_identities={identity["pid"]: identity},
+            observer_role="release_hook",
         )
 
 
@@ -4164,6 +4336,7 @@ def test_fresh_resource_scope_rejects_an_incomplete_hook_identity(monkeypatch):
             root,
             scoped_ports=set(),
             preloaded_identities={identity["pid"]: identity},
+            observer_role="release_hook",
         )
 
 
@@ -4181,6 +4354,7 @@ def test_fresh_resource_scope_rejects_release_hook_generation_change_during_clas
             root,
             scoped_ports=set(),
             preloaded_identities={identity["pid"]: identity},
+            observer_role="release_hook",
         )
 
 

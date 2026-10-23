@@ -1361,10 +1361,13 @@ def _assert_frontend_resources_released(frontend_port, label):
     """Require the scoped frontend census to show no owned process or holder."""
     resources = release._enumerate_fresh_frontend_resources()
     product_root = str(ROOT.resolve())
+    observer_bootstrap_identity = release._capture_current_gate_test_identity()
     scope = release._fresh_resource_scope(
         resources,
         product_root,
         scoped_ports={frontend_port},
+        observer_role="gate_test",
+        observer_bootstrap_identity=observer_bootstrap_identity,
     )
     native_module = release._host_path_identity(
         (release.SCRIPT_ROOT / release.HOST_NATIVE_MODULE).resolve()

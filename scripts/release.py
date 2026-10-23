@@ -182,6 +182,20 @@ def _path_is_within(path: object, root: object) -> bool:
     return candidate == boundary or candidate.startswith(f"{boundary}/")
 
 
+def _release_hook_script_matches(value: object, product_root: str) -> bool:
+    """Match the provider's absolute or exact product-root-relative script path."""
+    if not isinstance(value, (str, Path)):
+        return False
+    expected = _canonical_windows_path_identity(Path(__file__).resolve())
+    candidate = _canonical_windows_path_identity(value)
+    if candidate == expected:
+        return True
+    relative = ntpath.normpath(str(value).replace("/", "\\"))
+    if ntpath.isabs(relative):
+        return False
+    return _canonical_windows_path_identity(ntpath.join(str(product_root), relative)) == expected
+
+
 def _command_contains_path(command: str, target: object) -> bool:
     target_identity = _canonical_windows_path_identity(target)
     for token in re.findall(r'"([^"]+)"|([^\s]+)', command):
@@ -2828,7 +2842,6 @@ def _identity_is_protected(identity: dict[str, Any], product_root: str) -> bool:
     expected_executable = _canonical_windows_path_identity(
         SCRIPT_ROOT / ".venv" / "Scripts" / "python.exe"
     )
-    expected_script = _canonical_windows_path_identity(Path(__file__).resolve())
     child_argv = identity.get("argv")
     release_hook_identity = (
         type(identity.get("pid")) is int
@@ -2839,10 +2852,12 @@ def _identity_is_protected(identity: dict[str, Any], product_root: str) -> bool:
         and isinstance(child_argv, list)
         and len(child_argv) == 3
         and _canonical_windows_path_identity(child_argv[0]) == expected_executable
-        and _canonical_windows_path_identity(child_argv[1]) == expected_script
+        and _release_hook_script_matches(child_argv[1], product_root)
         and child_argv[2] in {"prepare", "observe", "execute", "verify"}
     )
     if release_hook_identity:
+        if _release_hook_identity_mismatch(identity, product_root) != "<none>":
+            return False
         child_creation = identity.get("creation")
         parent_pid = identity.get("parent_pid")
         if (
@@ -2850,7 +2865,7 @@ def _identity_is_protected(identity: dict[str, Any], product_root: str) -> bool:
             or not isinstance(child_argv, list)
             or len(child_argv) != 3
             or _canonical_windows_path_identity(child_argv[0]) != expected_executable
-            or _canonical_windows_path_identity(child_argv[1]) != expected_script
+            or not _release_hook_script_matches(child_argv[1], product_root)
             or child_argv[2] not in {"prepare", "observe", "execute", "verify"}
             or not isinstance(child_creation, str)
             or not child_creation.isdigit()
@@ -2919,22 +2934,250 @@ def _identity_is_protected(identity: dict[str, Any], product_root: str) -> bool:
     return False
 
 
+def _release_hook_identity_mismatch(identity: dict[str, Any], product_root: str) -> str:
+    """Return the first rejected release-hook field without exposing commands."""
+    if type(identity.get("pid")) is not int or identity["pid"] != os.getpid():
+        return "pid"
+    executable = identity.get("executable")
+    expected_executable = _canonical_windows_path_identity(
+        SCRIPT_ROOT / ".venv" / "Scripts" / "python.exe"
+    )
+    if not isinstance(executable, (str, Path)):
+        return "executable"
+    if _canonical_windows_path_identity(executable) != expected_executable:
+        return "executable"
+    cwd = identity.get("cwd")
+    if not isinstance(cwd, str) or not cwd.strip():
+        return "cwd"
+    argv = identity.get("argv")
+    if not isinstance(argv, list):
+        return "argv"
+    if len(argv) != 3:
+        return "argv.length"
+    if not all(isinstance(argument, str) and argument for argument in argv):
+        return "argv"
+    if _canonical_windows_path_identity(argv[0]) != expected_executable:
+        return "argv[0]"
+    if not _release_hook_script_matches(argv[1], product_root):
+        return "argv[1]"
+    if argv[2] not in {"prepare", "observe", "execute", "verify"}:
+        return "argv[2]"
+    if not isinstance(identity.get("creation"), str) or not identity["creation"].isdigit():
+        return "creation"
+    native_command = identity.get("native_command")
+    if not isinstance(native_command, str) or not native_command:
+        return "native_command"
+    if identity.get("argv_sha256") != hashlib.sha256(
+        "\0".join(argv).encode("utf-8")
+    ).hexdigest():
+        return "argv_sha256"
+    if identity.get("native_command_sha256") != hashlib.sha256(
+        native_command.encode("utf-8")
+    ).hexdigest():
+        return "native_command_sha256"
+    if not _is_parent_pid(identity.get("parent_pid")):
+        return "parent_pid"
+    observations = identity.get("parent_observations")
+    if not isinstance(observations, list) or not observations:
+        return "parent_observations"
+    for observation in observations:
+        if not isinstance(observation, dict):
+            continue
+        if observation.get("state") != "readable_current_parent":
+            continue
+        if observation.get("relation") != "current parent of exact child identity":
+            continue
+        if observation.get("pid") != identity.get("parent_pid"):
+            continue
+        parent_creation = observation.get("creation")
+        if not isinstance(parent_creation, str) or not parent_creation.isdigit():
+            continue
+        parent_argv = observation.get("argv")
+        parent_command = observation.get("native_command")
+        if not isinstance(parent_argv, list) or not parent_argv:
+            continue
+        if not all(isinstance(argument, str) and argument for argument in parent_argv):
+            continue
+        if not isinstance(parent_command, str) or not parent_command:
+            continue
+        if observation.get("argv_sha256") != hashlib.sha256(
+            "\0".join(parent_argv).encode("utf-8")
+        ).hexdigest():
+            continue
+        if observation.get("native_command_sha256") != hashlib.sha256(
+            parent_command.encode("utf-8")
+        ).hexdigest():
+            continue
+        try:
+            if int(parent_creation) > int(identity["creation"]):
+                continue
+        except ValueError:
+            continue
+        return "<none>"
+    return "parent_observations"
+
+
 def _assert_current_release_hook_generation(
     identity: dict[str, Any],
     *,
     phase: str,
 ) -> None:
     """Recheck the running release hook before and after resource classification."""
+    _assert_current_observer_generation(identity, role="release_hook", phase=phase)
+
+
+def _gate_test_identity_mismatch(
+    identity: dict[str, Any],
+    product_root: str,
+    expected_identity: dict[str, Any] | None = None,
+) -> str:
+    """Return the first rejected field for the established gate/test observer role."""
     pid = os.getpid()
     if identity.get("pid") != pid:
+        return "pid"
+    if not isinstance(identity.get("creation"), str) or not identity["creation"].isdigit():
+        return "creation"
+    if not _path_is_within(identity.get("cwd", ""), product_root):
+        return "cwd"
+    expected_observer = expected_identity or identity
+    expected_executable = _canonical_windows_path_identity(
+        expected_observer.get("executable", "")
+    )
+    if _canonical_windows_path_identity(identity.get("executable", "")) != expected_executable:
+        return "executable"
+    argv = identity.get("argv")
+    if not isinstance(argv, list) or not all(isinstance(argument, str) and argument for argument in argv):
+        return "argv"
+    expected_argv = expected_observer.get("argv")
+    if not isinstance(expected_argv, list) or not expected_argv:
+        return "argv"
+    expected_argv_zero = _canonical_windows_path_identity(expected_argv[0])
+    if len(argv) < 3 or _canonical_windows_path_identity(argv[0]) != expected_argv_zero:
+        return "argv"
+    normalized_argv = [_canonical_windows_path_identity(argument) for argument in argv]
+    has_pytest_module = "-m" in argv and any(argument.casefold() == "pytest" for argument in argv)
+
+    def is_test_path(argument: str, relative_root: str) -> bool:
+        normalized = argument.replace("\\", "/").casefold().rstrip("/")
+        relative = relative_root.casefold().rstrip("/")
+        return normalized == relative or normalized.startswith(f"{relative}/")
+
+    has_test_path = any(
+        _path_is_within(argument, Path(product_root) / "backend" / "tests")
+        or _path_is_within(argument, Path(product_root) / "scripts" / "tests")
+        or is_test_path(argument, "backend/tests")
+        or is_test_path(argument, "scripts/tests")
+        for argument in argv[1:]
+    )
+    has_verifier = any(
+        argument == _canonical_windows_path_identity(Path(product_root) / "scripts" / "verify_live.py")
+        for argument in normalized_argv[1:]
+    )
+    if not ((has_pytest_module and has_test_path) or has_verifier):
+        return "argv.role"
+    native_command = identity.get("native_command")
+    if not isinstance(native_command, str) or not native_command:
+        return "native_command"
+    if identity.get("argv_sha256") != hashlib.sha256("\0".join(argv).encode("utf-8")).hexdigest():
+        return "argv_sha256"
+    if identity.get("native_command_sha256") != hashlib.sha256(native_command.encode("utf-8")).hexdigest():
+        return "native_command_sha256"
+    if not _is_parent_pid(identity.get("parent_pid")):
+        return "parent_pid"
+    observations = identity.get("parent_observations")
+    if not isinstance(observations, list) or not observations:
+        return "parent_observations"
+    child_creation = int(identity["creation"])
+    for observation in observations:
+        if not isinstance(observation, dict):
+            continue
+        parent_argv = observation.get("argv")
+        parent_command = observation.get("native_command")
+        parent_creation = observation.get("creation")
+        if (
+            observation.get("state") != "readable_current_parent"
+            or observation.get("relation") != "current parent of exact child identity"
+            or observation.get("pid") != identity.get("parent_pid")
+            or not isinstance(parent_creation, str)
+            or not parent_creation.isdigit()
+            or not isinstance(observation.get("cwd"), str)
+            or not observation["cwd"]
+            or not isinstance(observation.get("executable"), str)
+            or not observation["executable"]
+            or not isinstance(parent_argv, list)
+            or not parent_argv
+            or not all(isinstance(argument, str) and argument for argument in parent_argv)
+            or not isinstance(parent_command, str)
+            or not parent_command
+            or observation.get("argv_sha256")
+            != hashlib.sha256("\0".join(parent_argv).encode("utf-8")).hexdigest()
+            or observation.get("native_command_sha256")
+            != hashlib.sha256(parent_command.encode("utf-8")).hexdigest()
+        ):
+            continue
+        if int(parent_creation) <= child_creation:
+            return "<none>"
+    return "parent_observations"
+
+
+def _observer_identity_mismatch(
+    identity: dict[str, Any],
+    *,
+    role: str,
+    product_root: str,
+    expected_identity: dict[str, Any] | None = None,
+) -> str:
+    if role == "release_hook":
+        return _release_hook_identity_mismatch(identity, product_root)
+    if role == "gate_test":
+        return _gate_test_identity_mismatch(identity, product_root, expected_identity)
+    return "role"
+
+
+def _capture_current_gate_test_identity() -> dict[str, Any]:
+    """Capture the native identity of the configured gate process before classification."""
+    pid = os.getpid()
+    try:
+        identity = _read_fresh_native_process_identity(pid, _NativeReadState())
+    except (_FreshProcessAbsent, _FreshProcessUnreadable, RuntimeError) as exc:
         raise RuntimeError(
-            "release blocked: current census observer identity has a conflicting PID: "
-            f"expected_pid={pid} identity_pid={identity.get('pid')!r} phase={phase}"
+            "release blocked: configured gate observer identity could not be captured: "
+            f"pid={pid}: {exc}"
+        ) from exc
+    if not _has_complete_resource_identity(identity):
+        raise RuntimeError(
+            "release blocked: configured gate observer identity is incomplete: "
+            f"pid={pid}"
         )
-    if not _identity_is_protected(identity, str(ROOT.resolve())):
+    return identity
+
+
+def _assert_current_observer_generation(
+    identity: dict[str, Any],
+    *,
+    role: str,
+    phase: str,
+    expected_identity: dict[str, Any] | None = None,
+) -> None:
+    """Recheck a caller's explicit observer role around resource classification."""
+    pid = os.getpid()
+    product_root = str(ROOT.resolve())
+    missing_identity_fields = [field for field in _RESOURCE_IDENTITY_FIELDS if field not in identity]
+    if missing_identity_fields:
         raise RuntimeError(
-            "release blocked: current census observer identity is not the exact release hook: "
-            f"pid={pid} phase={phase}"
+            "release blocked: current census observer identity is incomplete: "
+            f"pid={pid} role={role} phase={phase} field={missing_identity_fields[0]} context=redacted"
+        )
+    mismatch = _observer_identity_mismatch(
+        identity,
+        role=role,
+        product_root=product_root,
+        expected_identity=expected_identity,
+    )
+    if mismatch != "<none>":
+        raise RuntimeError(
+            "release blocked: current census observer identity does not match its explicit role: "
+            f"pid={pid} role={role} phase={phase} field={mismatch} context=redacted"
         )
     creation = identity.get("creation")
     try:
@@ -2945,20 +3188,26 @@ def _assert_current_release_hook_generation(
     except (_FreshProcessAbsent, _FreshProcessUnreadable, RuntimeError) as exc:
         raise RuntimeError(
             "release blocked: current census observer identity could not be revalidated: "
-            f"pid={pid} phase={phase}: {exc}"
+            f"pid={pid} role={role} phase={phase}: {exc}"
         ) from exc
-    for field in (
-        "pid",
-        "creation",
-        "parent_pid",
-        "cwd",
-        "executable",
-        "native_command",
-        "argv",
-        "argv_sha256",
-        "native_command_sha256",
-        "parent_observations",
-    ):
+    missing_current_fields = [field for field in _RESOURCE_IDENTITY_FIELDS if field not in current]
+    if missing_current_fields:
+        raise RuntimeError(
+            "release blocked: current census observer identity changed during classification: "
+            f"pid={pid} role={role} phase={phase} field={missing_current_fields[0]}"
+        )
+    current_mismatch = _observer_identity_mismatch(
+        current,
+        role=role,
+        product_root=product_root,
+        expected_identity=expected_identity or identity,
+    )
+    if current_mismatch != "<none>":
+        raise RuntimeError(
+            "release blocked: current census observer identity changed during classification: "
+            f"pid={pid} role={role} phase={phase} field={current_mismatch}"
+        )
+    for field in _RESOURCE_IDENTITY_FIELDS:
         if current.get(field) != identity.get(field):
             raise RuntimeError(
                 "release blocked: current census observer identity changed during classification: "
@@ -3303,6 +3552,8 @@ def _fresh_resource_scope(
     scoped_ports: set[int],
     preloaded_identities: dict[int, dict[str, Any]] | None = None,
     protected_pids: set[int] | None = None,
+    observer_role: str | None = None,
+    observer_bootstrap_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Bind current resource rows to identities after one strict candidate pass."""
     for field in ("processes", "holders", "ports", "read_errors"):
@@ -3544,11 +3795,16 @@ def _fresh_resource_scope(
             )
 
     observer_pid = os.getpid()
-    observer_identity = identities.get(observer_pid)
+    observer_identity = observer_bootstrap_identity or identities.get(observer_pid)
     if observer_identity is not None and not _has_complete_resource_identity(observer_identity):
         observer_identity = None
-    if observer_identity is not None:
-        _assert_current_release_hook_generation(observer_identity, phase="before-classification")
+    if observer_identity is not None and observer_role is not None:
+        _assert_current_observer_generation(
+            observer_identity,
+            role=observer_role,
+            phase="before-classification",
+            expected_identity=observer_bootstrap_identity,
+        )
 
     relevant_processes = []
     for pid in sorted(candidate_pids):
@@ -3580,8 +3836,13 @@ def _fresh_resource_scope(
         ):
             relevant_processes.append({"row": item, "identity": identity})
 
-    if observer_identity is not None:
-        _assert_current_release_hook_generation(observer_identity, phase="after-classification")
+    if observer_identity is not None and observer_role is not None:
+        _assert_current_observer_generation(
+            observer_identity,
+            role=observer_role,
+            phase="after-classification",
+            expected_identity=observer_bootstrap_identity,
+        )
 
     holder_pids = set()
     for item in resources["holders"]:
@@ -3708,6 +3969,7 @@ def _assert_fresh_host_process_census(contract: dict[str, Any]) -> dict[str, Any
         product_root,
         scoped_ports=scoped_ports,
         preloaded_identities={**replacements, **identities},
+        observer_role="release_hook",
     )
     relevant_processes = [entry["row"] for entry in resource_scope["relevant_processes"]]
     protected_pids = resource_scope["protected_pids"]
