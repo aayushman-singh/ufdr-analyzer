@@ -196,6 +196,77 @@ def _release_hook_script_matches(value: object, product_root: str) -> bool:
     return _canonical_windows_path_identity(ntpath.join(str(product_root), relative)) == expected
 
 
+def _native_command_matches_argv(command: str, argv: list[str]) -> bool:
+    """Match the measured Windows command tokens to the parsed arguments."""
+    tokens = []
+    for quoted, unquoted in re.findall(r'"([^"]+)"|([^\s]+)', command):
+        tokens.append(quoted or unquoted)
+    if len(tokens) != len(argv):
+        return False
+    return all(
+        _canonical_windows_path_identity(observed)
+        == _canonical_windows_path_identity(expected)
+        for observed, expected in zip(tokens, argv)
+    )
+
+
+def _release_hook_parent_role_mismatch(
+    observation: dict[str, Any],
+    child_argv: list[str],
+    child_creation: str,
+    product_root: str,
+) -> str | None:
+    """Validate the exact configured launcher invocation for a native child."""
+    expected_launcher = _canonical_windows_path_identity(
+        SCRIPT_ROOT / ".venv" / "Scripts" / "python.exe"
+    )
+    expected_script = _canonical_windows_path_identity(Path(__file__).resolve())
+    parent_argv = observation.get("argv")
+    if not isinstance(parent_argv, list) or not parent_argv:
+        return "parent.argv"
+    if not all(isinstance(argument, str) and argument for argument in parent_argv):
+        return "parent.argv"
+    if len(parent_argv) != 3:
+        return "parent.argv.length"
+    if _canonical_windows_path_identity(parent_argv[0]) != expected_launcher:
+        return "parent.argv[0]"
+    if _canonical_windows_path_identity(parent_argv[1]) != expected_script:
+        return "parent.argv[1]"
+    if parent_argv[2] != child_argv[2]:
+        return "parent.argv[2]"
+    parent_executable = observation.get("executable")
+    if not isinstance(parent_executable, (str, Path)):
+        return "parent.executable"
+    if _canonical_windows_path_identity(parent_executable) != expected_launcher:
+        return "parent.executable"
+    parent_cwd = observation.get("cwd")
+    if not isinstance(parent_cwd, str) or not parent_cwd.strip():
+        return "parent.cwd"
+    if _canonical_windows_path_identity(parent_cwd) != _canonical_windows_path_identity(product_root):
+        return "parent.cwd"
+    parent_command = observation.get("native_command")
+    if not isinstance(parent_command, str) or not parent_command:
+        return "parent.native_command"
+    if not _native_command_matches_argv(parent_command, parent_argv):
+        return "parent.native_command.role"
+    if observation.get("argv_sha256") != hashlib.sha256(
+        "\0".join(parent_argv).encode("utf-8")
+    ).hexdigest():
+        return "parent.argv_sha256"
+    if observation.get("native_command_sha256") != hashlib.sha256(
+        parent_command.encode("utf-8")
+    ).hexdigest():
+        return "parent.native_command_sha256"
+    try:
+        if int(parent_creation := observation.get("creation")) > int(child_creation):
+            return "parent.creation"
+    except (TypeError, ValueError):
+        return "parent.creation"
+    if not _release_hook_script_matches(child_argv[1], product_root):
+        return "argv[1]"
+    return None
+
+
 def _command_contains_path(command: str, target: object) -> bool:
     target_identity = _canonical_windows_path_identity(target)
     for token in re.findall(r'"([^"]+)"|([^\s]+)', command):
@@ -1719,6 +1790,14 @@ class _NativeReadState:
     limited_only: bool = False
 
 
+@dataclass(frozen=True)
+class _ReleaseHookBinding:
+    """Capture the exact release-hook command and native identity together."""
+
+    command: str
+    identity: dict[str, Any]
+
+
 _RESOURCE_IDENTITY_FIELDS = (
     "pid",
     "creation",
@@ -2837,6 +2916,12 @@ def _identity_is_protected(identity: dict[str, Any], product_root: str) -> bool:
     command = str(identity.get("native_command") or "").casefold()
     argv = " ".join(str(value) for value in identity.get("argv", [])).casefold()
     cwd = identity.get("cwd")
+    if (
+        type(identity.get("pid")) is int
+        and identity["pid"] == os.getpid()
+        and _release_hook_identity_mismatch(identity, product_root) == "<none>"
+    ):
+        return True
     if executable not in {"python", "python.exe", "cmd", "cmd.exe", "node", "node.exe"}:
         return False
     expected_executable = _canonical_windows_path_identity(
@@ -2908,7 +2993,18 @@ def _identity_is_protected(identity: dict[str, Any], product_root: str) -> bool:
                     continue
             except ValueError:
                 continue
-            return True
+            if _canonical_windows_path_identity(identity.get("executable", "")) == expected_executable:
+                return True
+            if (
+                _release_hook_parent_role_mismatch(
+                    observation,
+                    child_argv,
+                    child_creation,
+                    product_root,
+                )
+                is None
+            ):
+                return True
         return False
     if not cwd or not _path_is_within(cwd, product_root):
         return False
@@ -2934,7 +3030,11 @@ def _identity_is_protected(identity: dict[str, Any], product_root: str) -> bool:
     return False
 
 
-def _release_hook_identity_mismatch(identity: dict[str, Any], product_root: str) -> str:
+def _release_hook_identity_mismatch(
+    identity: dict[str, Any],
+    product_root: str,
+    expected_identity: dict[str, Any] | None = None,
+) -> str:
     """Return the first rejected release-hook field without exposing commands."""
     if type(identity.get("pid")) is not int or identity["pid"] != os.getpid():
         return "pid"
@@ -2944,10 +3044,22 @@ def _release_hook_identity_mismatch(identity: dict[str, Any], product_root: str)
     )
     if not isinstance(executable, (str, Path)):
         return "executable"
-    if _canonical_windows_path_identity(executable) != expected_executable:
+    launcher_executable = _canonical_windows_path_identity(
+        SCRIPT_ROOT / ".venv" / "Scripts" / "python.exe"
+    )
+    native_executable = _canonical_windows_path_identity(
+        getattr(sys, "_base_executable", sys.executable)
+    )
+    observed_executable = _canonical_windows_path_identity(executable)
+    if observed_executable not in {launcher_executable, native_executable}:
         return "executable"
     cwd = identity.get("cwd")
-    if not isinstance(cwd, str) or not cwd.strip():
+    if (
+        not isinstance(cwd, str)
+        or not cwd.strip()
+        or _canonical_windows_path_identity(cwd)
+        != _canonical_windows_path_identity(product_root)
+    ):
         return "cwd"
     argv = identity.get("argv")
     if not isinstance(argv, list):
@@ -2956,10 +3068,15 @@ def _release_hook_identity_mismatch(identity: dict[str, Any], product_root: str)
         return "argv.length"
     if not all(isinstance(argument, str) and argument for argument in argv):
         return "argv"
-    if _canonical_windows_path_identity(argv[0]) != expected_executable:
-        return "argv[0]"
     if not _release_hook_script_matches(argv[1], product_root):
         return "argv[1]"
+    requested_command = (
+        expected_identity.get("release_hook_requested_command")
+        if isinstance(expected_identity, dict)
+        else identity.get("release_hook_requested_command")
+    )
+    if requested_command is not None and argv[2] != requested_command:
+        return "argv[2]"
     if argv[2] not in {"prepare", "observe", "execute", "verify"}:
         return "argv[2]"
     if not isinstance(identity.get("creation"), str) or not identity["creation"].isdigit():
@@ -2967,6 +3084,8 @@ def _release_hook_identity_mismatch(identity: dict[str, Any], product_root: str)
     native_command = identity.get("native_command")
     if not isinstance(native_command, str) or not native_command:
         return "native_command"
+    if not _native_command_matches_argv(native_command, argv):
+        return "native_command.role"
     if identity.get("argv_sha256") != hashlib.sha256(
         "\0".join(argv).encode("utf-8")
     ).hexdigest():
@@ -2980,6 +3099,11 @@ def _release_hook_identity_mismatch(identity: dict[str, Any], product_root: str)
     observations = identity.get("parent_observations")
     if not isinstance(observations, list) or not observations:
         return "parent_observations"
+    direct_launch = observed_executable == launcher_executable
+    native_child = observed_executable == native_executable
+    valid_parent_observation = False
+    launcher_relation = False
+    launcher_mismatch = "parent_role"
     for observation in observations:
         if not isinstance(observation, dict):
             continue
@@ -3013,17 +3137,113 @@ def _release_hook_identity_mismatch(identity: dict[str, Any], product_root: str)
                 continue
         except ValueError:
             continue
-        return "<none>"
-    return "parent_observations"
+        valid_parent_observation = True
+        parent_executable_value = observation.get("executable")
+        parent_cwd = observation.get("cwd")
+        if not isinstance(parent_executable_value, (str, Path)) or not isinstance(parent_cwd, str):
+            continue
+        parent_executable = _canonical_windows_path_identity(parent_executable_value)
+        if (
+            parent_executable == expected_executable
+            and _canonical_windows_path_identity(parent_cwd)
+            == _canonical_windows_path_identity(product_root)
+        ):
+            if native_child:
+                launcher_mismatch = _release_hook_parent_role_mismatch(
+                    observation,
+                    argv,
+                    identity["creation"],
+                    product_root,
+                ) or "<none>"
+                launcher_relation = launcher_mismatch == "<none>"
+            else:
+                launcher_relation = True
+    if not valid_parent_observation:
+        return "parent_observations"
+    if direct_launch:
+        if _canonical_windows_path_identity(argv[0]) != launcher_executable:
+            return "argv[0]"
+    elif not native_child or _canonical_windows_path_identity(argv[0]) != native_executable:
+        return "argv[0]"
+    elif not launcher_relation:
+        return launcher_mismatch
+    return "<none>"
+
+
+def _capture_current_release_hook_identity(command: str) -> dict[str, Any]:
+    """Capture the exact release-hook identity before host resource classification."""
+    if command not in {"prepare", "observe", "execute", "verify"}:
+        raise RuntimeError(f"release blocked: unsupported release-hook command={command!r}")
+    pid = os.getpid()
+    try:
+        identity = _read_fresh_native_process_identity(pid, _NativeReadState())
+    except (_FreshProcessAbsent, _FreshProcessUnreadable, RuntimeError) as exc:
+        raise RuntimeError(
+            "release blocked: current release-hook identity could not be captured: "
+            f"pid={pid} command={command}: {exc}"
+        ) from exc
+    if not _has_complete_resource_identity(identity):
+        raise RuntimeError(
+            "release blocked: current release-hook identity is incomplete: "
+            f"pid={pid} command={command}"
+        )
+    identity = dict(identity)
+    identity["release_hook_requested_command"] = command
+    mismatch = _release_hook_identity_mismatch(
+        identity,
+        str(ROOT.resolve()),
+        expected_identity=identity,
+    )
+    if mismatch != "<none>":
+        raise RuntimeError(
+            "release blocked: current release-hook identity does not match its invocation: "
+            f"pid={pid} command={command} field={mismatch}"
+        )
+    return identity
+
+
+def _capture_current_release_hook_binding(command: str) -> _ReleaseHookBinding:
+    """Capture one immutable command-bound identity for the public hook path."""
+    return _ReleaseHookBinding(
+        command=command,
+        identity=_capture_current_release_hook_identity(command),
+    )
+
+
+def _revalidate_release_hook_binding(
+    binding: _ReleaseHookBinding,
+    *,
+    phase: str,
+) -> None:
+    """Reject a missing or changed command-bound identity before handler effects."""
+    if binding.command not in {"prepare", "observe", "execute", "verify"}:
+        raise RuntimeError(
+            f"release blocked: unsupported release-hook binding command={binding.command!r}"
+        )
+    if binding.identity.get("release_hook_requested_command") != binding.command:
+        raise RuntimeError(
+            "release blocked: release-hook identity command binding is missing or changed"
+        )
+    _assert_current_release_hook_generation(
+        binding.identity,
+        phase=phase,
+        expected_identity=binding.identity,
+    )
 
 
 def _assert_current_release_hook_generation(
     identity: dict[str, Any],
     *,
     phase: str,
+    expected_identity: dict[str, Any] | None = None,
 ) -> None:
     """Recheck the running release hook before and after resource classification."""
-    _assert_current_observer_generation(identity, role="release_hook", phase=phase)
+    _assert_current_observer_generation(
+        identity,
+        role="release_hook",
+        phase=phase,
+        expected_identity=expected_identity or identity,
+    )
 
 
 def _gate_test_identity_mismatch(
@@ -3128,7 +3348,7 @@ def _observer_identity_mismatch(
     expected_identity: dict[str, Any] | None = None,
 ) -> str:
     if role == "release_hook":
-        return _release_hook_identity_mismatch(identity, product_root)
+        return _release_hook_identity_mismatch(identity, product_root, expected_identity)
     if role == "gate_test":
         return _gate_test_identity_mismatch(identity, product_root, expected_identity)
     return "role"
@@ -4113,7 +4333,11 @@ def _fresh_resource_scope(
     }
 
 
-def _assert_fresh_host_process_census(contract: dict[str, Any]) -> dict[str, Any]:
+def _assert_fresh_host_process_census(
+    contract: dict[str, Any],
+    *,
+    observer_bootstrap_identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Recheck every historical identity and current release resource before work."""
     family_by_pid = {record["pid"]: record for record in contract["family_records"]}
     presence = contract["presence"]
@@ -4195,6 +4419,7 @@ def _assert_fresh_host_process_census(contract: dict[str, Any]) -> dict[str, Any
         scoped_ports=scoped_ports,
         preloaded_identities={**replacements, **identities},
         observer_role="release_hook",
+        observer_bootstrap_identity=observer_bootstrap_identity,
     )
     relevant_processes = [entry["row"] for entry in resource_scope["relevant_processes"]]
     protected_pids = resource_scope["protected_pids"]
@@ -4260,10 +4485,15 @@ def _assert_fresh_host_process_census(contract: dict[str, Any]) -> dict[str, Any
         "unrelated_exclusions": unrelated_exclusions,
     }
 
-def _validate_host_process_evidence() -> dict[str, Any]:
+def _validate_host_process_evidence(
+    observer_bootstrap_identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Validate measured host evidence without changing host state."""
     contract = _load_host_process_contract()
-    fresh = _assert_fresh_host_process_census(contract)
+    fresh = _assert_fresh_host_process_census(
+        contract,
+        observer_bootstrap_identity=observer_bootstrap_identity,
+    )
     native = _observe_host_native_resource()
     return {
         "root": str(contract["root"]),
@@ -6453,13 +6683,17 @@ def _record_private_dependency_install_failure(
     return evidence_path
 
 
-def _prepare_host(frontend_root: Path | None = None) -> dict[str, Any]:
+def _prepare_host(
+    frontend_root: Path | None = None,
+    *,
+    observer_bootstrap_identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Prepare the host in the only permitted order before browser startup."""
-    process_before = _validate_host_process_evidence()
+    process_before = _validate_host_process_evidence(observer_bootstrap_identity)
     native = _prove_host_native_release()
     dependencies = _prepare_frontend_dependencies(frontend_root)
     _provision_live_verifier()
-    process_after = _validate_host_process_evidence()
+    process_after = _validate_host_process_evidence(observer_bootstrap_identity)
     readiness = _validate_browser_dependency_readiness(frontend_root, process=process_after)
     return _summarize_host_preparation({
         "process_before": process_before,
@@ -8597,8 +8831,16 @@ def _observation_command() -> str:
 
 
 def _prepare(
-    payload: dict[str, Any], *, validate_process_evidence: bool = True
+    payload: dict[str, Any],
+    *,
+    validate_process_evidence: bool = True,
+    observer_command: str | None = None,
+    release_hook_binding: _ReleaseHookBinding | None = None,
 ) -> dict[str, Any]:
+    if release_hook_binding is None and observer_command is not None:
+        release_hook_binding = _capture_current_release_hook_binding(observer_command)
+    if release_hook_binding is not None and release_hook_binding.command == "prepare":
+        _revalidate_release_hook_binding(release_hook_binding, phase="prepare-handler")
     _validate_raw_input(payload)
     action = _action(payload)
     demo_mode = _enforce_hosted_demo_mode(payload)
@@ -8623,7 +8865,10 @@ def _prepare(
     release_ready = not dependency_findings and not branding_findings
     host_preparation = None
     if validate_process_evidence and release_ready:
-        host_preparation = _prepare_host()
+        observer_identity = (
+            release_hook_binding.identity if release_hook_binding is not None else None
+        )
+        host_preparation = _prepare_host(observer_bootstrap_identity=observer_identity)
     return {
         "action_key": action,
         "complete": release_ready,
@@ -8730,7 +8975,13 @@ def _run_live_verifier(payload: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
-def _observe(payload: dict[str, Any]) -> dict[str, Any]:
+def _observe(
+    payload: dict[str, Any],
+    *,
+    release_hook_binding: _ReleaseHookBinding | None = None,
+) -> dict[str, Any]:
+    if release_hook_binding is not None:
+        _revalidate_release_hook_binding(release_hook_binding, phase="observe-handler")
     action = _provider_payload(payload)
     _check_payload_secrets(payload)
     output = _ssh(_observation_command())
@@ -8806,8 +9057,17 @@ def _observe(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _execute(payload: dict[str, Any]) -> dict[str, Any]:
-    prepared = _prepare(payload)
+def _execute(
+    payload: dict[str, Any],
+    *,
+    observer_command: str | None = None,
+    release_hook_binding: _ReleaseHookBinding | None = None,
+) -> dict[str, Any]:
+    if release_hook_binding is None and observer_command is not None:
+        release_hook_binding = _capture_current_release_hook_binding(observer_command)
+    if release_hook_binding is not None:
+        _revalidate_release_hook_binding(release_hook_binding, phase="execute-handler")
+    prepared = _prepare(payload, release_hook_binding=release_hook_binding)
     if prepared.get("release_ready") is not True:
         findings = "; ".join(
             prepared.get("critical_dependency_findings", [])
@@ -8817,7 +9077,7 @@ def _execute(payload: dict[str, Any]) -> dict[str, Any]:
             "execute blocked: critical frontend dependency scope is unresolved: " + findings
         )
     _ssh(_deployment_command(payload))
-    observation = _observe(payload)
+    observation = _observe(payload, release_hook_binding=release_hook_binding)
     expected_commit = _expected_commit(payload)
     if (
         not isinstance(observation, dict)
@@ -8841,7 +9101,13 @@ def _execute(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _verify(payload: dict[str, Any]) -> dict[str, Any]:
+def _verify(
+    payload: dict[str, Any],
+    *,
+    release_hook_binding: _ReleaseHookBinding | None = None,
+) -> dict[str, Any]:
+    if release_hook_binding is not None:
+        _revalidate_release_hook_binding(release_hook_binding, phase="verify-handler")
     _provider_payload(payload)
     _check_payload_secrets(payload)
     observation = payload.get("observation")
@@ -8946,7 +9212,19 @@ def main() -> int:
     try:
         _require_project_python(args.command)
         payload = _read_input()
-        value = {"prepare": _prepare, "observe": _observe, "execute": _execute, "verify": _verify}[args.command](payload)
+        release_hook_binding = _capture_current_release_hook_binding(args.command)
+        _revalidate_release_hook_binding(
+            release_hook_binding,
+            phase="main-dispatch",
+        )
+        if args.command == "prepare":
+            value = _prepare(payload, release_hook_binding=release_hook_binding)
+        elif args.command == "observe":
+            value = _observe(payload, release_hook_binding=release_hook_binding)
+        elif args.command == "execute":
+            value = _execute(payload, release_hook_binding=release_hook_binding)
+        else:
+            value = _verify(payload, release_hook_binding=release_hook_binding)
         print(json.dumps(_sanitize_public_success(value), sort_keys=True))
         return 0
     except Exception as exc:

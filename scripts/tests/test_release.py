@@ -53,6 +53,15 @@ class PidSubclass(int):
     """A non-canonical integer value used to test strict PID boundaries."""
 
 
+def _mutate_release_hook_argv_zero(identity):
+    identity["argv"][0] = "C:/tools/python.exe"
+    identity["native_command"] = " ".join(identity["argv"])
+    identity["argv_sha256"] = hashlib.sha256("\0".join(identity["argv"]).encode()).hexdigest()
+    identity["native_command_sha256"] = hashlib.sha256(
+        identity["native_command"].encode()
+    ).hexdigest()
+
+
 @pytest.mark.parametrize(
     "origin",
     [
@@ -4169,7 +4178,7 @@ def _release_hook_scope_identity(root, *, parent_pid=25200, child_creation="200"
     }
     identity = _resource_identity(
         os.getpid(),
-        cwd="C:/JarvisDeploy/jarvis",
+        cwd=root,
         executable=project_python,
         argv=[project_python, script, "prepare"],
         parent_observations=[parent],
@@ -4177,6 +4186,67 @@ def _release_hook_scope_identity(root, *, parent_pid=25200, child_creation="200"
     identity["creation"] = child_creation
     identity["parent_pid"] = parent_pid
     return identity
+
+
+def _release_hook_launcher_child_identity(root):
+    identity = _release_hook_scope_identity(root)
+    launcher = str(Path(root) / ".venv" / "Scripts" / "python.exe")
+    script = str(Path(release.__file__).resolve())
+    native_child = "C:/Users/Aayushman/AppData/Local/Programs/Python/Python311/python.exe"
+    identity["executable"] = native_child
+    identity["argv"][0] = native_child
+    identity["native_command"] = " ".join(identity["argv"])
+    identity["argv_sha256"] = hashlib.sha256("\0".join(identity["argv"]).encode()).hexdigest()
+    identity["native_command_sha256"] = hashlib.sha256(identity["native_command"].encode()).hexdigest()
+    parent = identity["parent_observations"][0]
+    parent["cwd"] = root
+    parent["executable"] = launcher
+    parent["argv"] = [launcher, script, "prepare"]
+    parent["native_command"] = " ".join(parent["argv"])
+    parent["argv_sha256"] = hashlib.sha256("\0".join(parent["argv"]).encode()).hexdigest()
+    parent["native_command_sha256"] = hashlib.sha256(parent["native_command"].encode()).hexdigest()
+    return identity
+
+
+def _replace_release_hook_parent_argv(identity, argv):
+    parent = identity["parent_observations"][0]
+    parent["argv"] = argv
+    parent["native_command"] = " ".join(argv)
+    parent["argv_sha256"] = hashlib.sha256("\0".join(argv).encode()).hexdigest()
+    parent["native_command_sha256"] = hashlib.sha256(parent["native_command"].encode()).hexdigest()
+
+
+def _install_controlled_release_hook_binding(monkeypatch, command):
+    identity = _release_hook_launcher_child_identity(str(release.ROOT.resolve()))
+    identity["argv"][2] = command
+    identity["native_command"] = " ".join(identity["argv"])
+    identity["argv_sha256"] = hashlib.sha256(
+        "\0".join(identity["argv"]).encode()
+    ).hexdigest()
+    identity["native_command_sha256"] = hashlib.sha256(
+        identity["native_command"].encode()
+    ).hexdigest()
+    _replace_release_hook_parent_argv(
+        identity,
+        [
+            identity["parent_observations"][0]["argv"][0],
+            identity["parent_observations"][0]["argv"][1],
+            command,
+        ],
+    )
+    identity["release_hook_requested_command"] = command
+    binding = release._ReleaseHookBinding(command=command, identity=identity)
+    monkeypatch.setattr(
+        release,
+        "_capture_current_release_hook_binding",
+        lambda _command: binding,
+    )
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda *_args, **_kwargs: identity,
+    )
+    return binding
 
 
 def _scope_resources(identity):
@@ -4238,6 +4308,108 @@ def test_fresh_resource_scope_accepts_the_complete_current_release_hook_contract
 
     assert result["relevant_processes"] == []
     assert result["identities"][identity["pid"]] == identity
+
+
+def test_fresh_resource_scope_accepts_the_configured_launcher_native_child_contract(monkeypatch):
+    root = str(release.ROOT.resolve())
+    identity = _release_hook_launcher_child_identity(root)
+    identity["release_hook_requested_command"] = "prepare"
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
+
+    result = release._fresh_resource_scope(
+        _scope_resources(identity),
+        root,
+        scoped_ports=set(),
+        preloaded_identities={identity["pid"]: identity},
+        observer_role="release_hook",
+        observer_bootstrap_identity=identity,
+    )
+
+    assert result["relevant_processes"] == []
+
+
+def test_release_hook_bootstrap_captures_the_requested_command(monkeypatch):
+    root = str(release.ROOT.resolve())
+    identity = _release_hook_launcher_child_identity(root)
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
+
+    captured = release._capture_current_release_hook_identity("prepare")
+
+    assert captured["release_hook_requested_command"] == "prepare"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda identity: identity["parent_observations"][0].__setitem__(
+            "executable", "C:/copy/python.exe"
+        ),
+        lambda identity: identity["parent_observations"][0].__setitem__("creation", "300"),
+        lambda identity: identity["argv"].__setitem__(2, "verify"),
+        lambda identity: identity.__setitem__("argv_sha256", "0" * 64),
+    ],
+    ids=["copied-launcher", "parent-generation-reuse", "wrong-subcommand", "incoherent-argv-hash"],
+)
+def test_release_hook_bootstrap_rejects_invalid_launcher_child_contract(monkeypatch, mutate):
+    root = str(release.ROOT.resolve())
+    identity = _release_hook_launcher_child_identity(root)
+    mutate(identity)
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
+
+    with pytest.raises(RuntimeError, match="current release-hook identity"):
+        release._capture_current_release_hook_identity("prepare")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda identity: _replace_release_hook_parent_argv(
+            identity, [identity["parent_observations"][0]["argv"][0], "-m", "pytest"]
+        ),
+        lambda identity: _replace_release_hook_parent_argv(
+            identity, [identity["parent_observations"][0]["argv"][0], str(Path(release.ROOT) / "scripts" / "other.py"), "prepare"]
+        ),
+        lambda identity: _replace_release_hook_parent_argv(
+            identity, [identity["parent_observations"][0]["argv"][0], identity["parent_observations"][0]["argv"][1], "verify"]
+        ),
+        lambda identity: identity["parent_observations"][0].__setitem__("native_command", "unrelated"),
+        lambda identity: identity["parent_observations"][0].__setitem__("native_command", None),
+    ],
+    ids=[
+        "unrelated-parent-command",
+        "parent-script",
+        "parent-subcommand",
+        "parent-command-hash",
+        "missing-parent-command",
+    ],
+)
+def test_release_hook_bootstrap_rejects_unrelated_or_incoherent_launcher_parent(monkeypatch, mutate):
+    root = str(release.ROOT.resolve())
+    identity = _release_hook_launcher_child_identity(root)
+    mutate(identity)
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
+
+    with pytest.raises(RuntimeError, match="current release-hook identity"):
+        release._capture_current_release_hook_identity("prepare")
+
+
+def test_release_hook_rejects_mismatched_parent_subcommand(monkeypatch):
+    root = str(release.ROOT.resolve())
+    identity = _release_hook_launcher_child_identity(root)
+    _replace_release_hook_parent_argv(
+        identity,
+        [
+            identity["parent_observations"][0]["argv"][0],
+            identity["parent_observations"][0]["argv"][1],
+            "verify",
+        ],
+    )
+    monkeypatch.setattr(
+        release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity
+    )
+
+    with pytest.raises(RuntimeError, match=r"field=parent\.argv\[2\]"):
+        release._capture_current_release_hook_identity("prepare")
 
 
 def test_fresh_resource_scope_accepts_the_explicit_gate_test_observer(monkeypatch):
@@ -4356,6 +4528,7 @@ def test_fresh_resource_scope_accepts_the_provider_root_relative_release_script(
         ("argv[1]", lambda identity: identity["argv"].__setitem__(1, "scripts/other.py")),
         ("argv[2]", lambda identity: identity["argv"].__setitem__(2, "unsupported")),
         ("executable", lambda identity: identity.__setitem__("executable", "C:/tools/python.exe")),
+        ("argv[0]", _mutate_release_hook_argv_zero),
         ("cwd", lambda identity: identity.__setitem__("cwd", "")),
         (
             "parent_observations",
@@ -5529,7 +5702,9 @@ def test_prepare_validates_host_process_evidence_before_release_side_effects(mon
     monkeypatch.setattr(
         release,
         "_validate_host_process_evidence",
-        lambda: (_ for _ in ()).throw(RuntimeError("host process evidence is missing")),
+        lambda _observer_bootstrap_identity=None: (_ for _ in ()).throw(
+            RuntimeError("host process evidence is missing")
+        ),
     )
     monkeypatch.setattr(release, "_provider_payload", lambda _payload: events.append("payload"))
 
@@ -5544,7 +5719,8 @@ def test_host_preparation_uses_one_ordered_production_pipeline(monkeypatch):
     monkeypatch.setattr(
         release,
         "_validate_host_process_evidence",
-        lambda: events.append("guard") or _validated_empty_host_process_evidence(),
+        lambda _observer_bootstrap_identity=None: events.append("guard")
+        or _validated_empty_host_process_evidence(),
     )
     monkeypatch.setattr(
         release,
@@ -5592,7 +5768,9 @@ def test_host_preparation_success_serialization_bounds_private_process_proof(mon
             },
         },
     }
-    monkeypatch.setattr(release, "_validate_host_process_evidence", lambda: process)
+    monkeypatch.setattr(
+        release, "_validate_host_process_evidence", lambda _observer_bootstrap_identity=None: process
+    )
     monkeypatch.setattr(
         release, "_prove_host_native_release", lambda: {"state": "restored"}
     )
@@ -5624,13 +5802,14 @@ def test_host_preparation_success_serialization_bounds_private_process_proof(mon
 
 def test_main_redacts_nested_success_values_at_stdout_boundary(monkeypatch, capsys):
     sentinel = "fake-runtime-credential"
+    _install_controlled_release_hook_binding(monkeypatch, "prepare")
     monkeypatch.setattr(release.sys, "argv", ["release.py", "prepare"])
     monkeypatch.setattr(release.sys, "stdin", io.StringIO("{}"))
     monkeypatch.setattr(release, "_require_project_python", lambda _command: None)
     monkeypatch.setattr(
         release,
         "_prepare",
-        lambda _payload: {
+        lambda _payload, *, observer_command=None, release_hook_binding=None: {
             "complete": True,
             "readiness": {"password": sentinel},
             "processes": [{"argv": [sentinel]}],
@@ -5650,7 +5829,9 @@ def test_host_preparation_stops_before_dependent_work_when_guard_fails(monkeypat
     monkeypatch.setattr(
         release,
         "_validate_host_process_evidence",
-        lambda: (_ for _ in ()).throw(RuntimeError("guard failed")),
+        lambda _observer_bootstrap_identity=None: (_ for _ in ()).throw(
+            RuntimeError("guard failed")
+        ),
     )
     for name in (
         "_prove_host_native_release",
@@ -5669,7 +5850,8 @@ def test_host_preparation_stops_before_dependency_work_when_native_proof_fails(m
     monkeypatch.setattr(
         release,
         "_validate_host_process_evidence",
-        lambda: events.append("guard") or {"native_resource": "present"},
+        lambda _observer_bootstrap_identity=None: events.append("guard")
+        or {"native_resource": "present"},
     )
     monkeypatch.setattr(
         release,
@@ -5707,7 +5889,11 @@ def test_family_backed_live_identity_remains_for_narrow_approval_validation():
 def test_process_evidence_validation_uses_read_only_native_observation(monkeypatch):
     contract = {"root": Path("C:/evidence"), "family_records": [{}], "frontend": {}}
     monkeypatch.setattr(release, "_load_host_process_contract", lambda: contract)
-    monkeypatch.setattr(release, "_assert_fresh_host_process_census", lambda value: {"states": []})
+    monkeypatch.setattr(
+        release,
+        "_assert_fresh_host_process_census",
+        lambda value, *, observer_bootstrap_identity=None: {"states": []},
+    )
     monkeypatch.setattr(
         release,
         "_observe_host_native_resource",
@@ -5731,7 +5917,9 @@ def test_execute_validates_host_process_evidence_before_deployment_side_effects(
     monkeypatch.setattr(
         release,
         "_validate_host_process_evidence",
-        lambda: (_ for _ in ()).throw(RuntimeError("host process evidence is missing")),
+        lambda _observer_bootstrap_identity=None: (_ for _ in ()).throw(
+            RuntimeError("host process evidence is missing")
+        ),
     )
     monkeypatch.setattr(release, "_provider_payload", lambda _payload: events.append("payload"))
     monkeypatch.setattr(release, "_ssh", lambda _command: events.append("ssh"))
@@ -6276,6 +6464,17 @@ def run_hook(command: str, payload: dict, **env: str) -> subprocess.CompletedPro
 def run_hook_in_process(monkeypatch, command: str, payload: dict, **env: str):
     stdout = io.StringIO()
     stderr = io.StringIO()
+    observer_identity = _release_hook_scope_identity(str(release.ROOT.resolve()))
+    observer_identity["argv"] = [observer_identity["argv"][0], observer_identity["argv"][1], command]
+    observer_identity["native_command"] = " ".join(observer_identity["argv"])
+    observer_identity["argv_sha256"] = hashlib.sha256(
+        "\0".join(observer_identity["argv"]).encode()
+    ).hexdigest()
+    observer_identity["native_command_sha256"] = hashlib.sha256(
+        observer_identity["native_command"].encode()
+    ).hexdigest()
+    expected_observer_identity = dict(observer_identity)
+    expected_observer_identity["release_hook_requested_command"] = command
     merged = os.environ.copy()
     merged.pop("OPENROUTER_API_KEY", None)
     merged.pop("OPENAI_API_KEY", None)
@@ -6285,7 +6484,18 @@ def run_hook_in_process(monkeypatch, command: str, payload: dict, **env: str):
     monkeypatch.setattr(release.sys, "stdout", stdout)
     monkeypatch.setattr(release.sys, "stderr", stderr)
     monkeypatch.setattr(release, "_require_project_python", lambda _command: None)
-    monkeypatch.setattr(release, "_prepare_host", lambda: {"state": "completed"})
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda _pid, _state, *_args, **_kwargs: observer_identity,
+    )
+
+    def prepare_host(*_args, observer_bootstrap_identity=None, **_kwargs):
+        if command in {"prepare", "execute"}:
+            assert observer_bootstrap_identity == expected_observer_identity
+        return {"state": "completed"}
+
+    monkeypatch.setattr(release, "_prepare_host", prepare_host)
     with patch.dict(os.environ, merged, clear=True):
         return subprocess.CompletedProcess(
             ["release.py", command], release.main(), stdout.getvalue(), stderr.getvalue()
@@ -6317,6 +6527,108 @@ def test_prepare_returns_one_contract_object_without_secret_values(monkeypatch):
     assert value["complete"] is True
     assert value["product_name"] == "CiteSpan"
     assert "api_key" not in result.stdout.lower()
+
+
+@pytest.mark.parametrize("command", ["prepare", "observe", "execute", "verify"])
+def test_main_binds_every_release_hook_before_handler_effects(monkeypatch, command):
+    identity = _release_hook_scope_identity(str(release.ROOT.resolve()))
+    identity["argv"][2] = command
+    identity["native_command"] = " ".join(identity["argv"])
+    identity["argv_sha256"] = hashlib.sha256(
+        "\0".join(identity["argv"]).encode()
+    ).hexdigest()
+    identity["native_command_sha256"] = hashlib.sha256(
+        identity["native_command"].encode()
+    ).hexdigest()
+    identity["release_hook_requested_command"] = command
+    binding = release._ReleaseHookBinding(command=command, identity=identity)
+    calls = []
+
+    monkeypatch.setattr(release, "_require_project_python", lambda _command: None)
+    monkeypatch.setattr(release, "_read_input", lambda: valid_payload())
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda *_args, **_kwargs: identity,
+    )
+    monkeypatch.setattr(
+        release, "_capture_current_release_hook_binding", lambda value: binding
+    )
+
+    def handler(_payload, *, release_hook_binding):
+        calls.append(release_hook_binding)
+        return {"complete": True}
+
+    monkeypatch.setattr(release, "_prepare", handler)
+    monkeypatch.setattr(release, "_observe", handler)
+    monkeypatch.setattr(release, "_execute", handler)
+    monkeypatch.setattr(release, "_verify", handler)
+    monkeypatch.setattr(release.sys, "argv", ["release.py", command])
+
+    assert release.main() == 0
+    assert calls == [binding]
+
+
+def test_main_stops_before_handler_when_release_hook_identity_is_missing(monkeypatch):
+    effects = []
+    monkeypatch.setattr(release, "_require_project_python", lambda _command: None)
+    monkeypatch.setattr(release, "_read_input", lambda: valid_payload())
+    monkeypatch.setattr(
+        release,
+        "_capture_current_release_hook_binding",
+        lambda _command: (_ for _ in ()).throw(RuntimeError("identity missing")),
+    )
+    monkeypatch.setattr(
+        release, "_observe", lambda *_args, **_kwargs: effects.append("observe")
+    )
+    monkeypatch.setattr(
+        release, "_run_live_verifier", lambda *_args, **_kwargs: effects.append("verify")
+    )
+    monkeypatch.setattr(release.sys, "argv", ["release.py", "observe"])
+    monkeypatch.setattr(
+        release, "_record_private_failure", lambda *_args, **_kwargs: Path("failure.json")
+    )
+
+    assert release.main() == 1
+    assert effects == []
+
+
+def test_observe_rejects_wrong_release_hook_binding_before_ssh(monkeypatch):
+    identity = _release_hook_scope_identity(str(release.ROOT.resolve()))
+    identity["release_hook_requested_command"] = "prepare"
+    binding = release._ReleaseHookBinding(command="observe", identity=identity)
+    ssh_calls = []
+    monkeypatch.setattr(release, "_ssh", lambda *_args, **_kwargs: ssh_calls.append(True))
+
+    with pytest.raises(RuntimeError, match="command binding"):
+        release._observe(valid_payload(), release_hook_binding=binding)
+
+    assert ssh_calls == []
+
+
+def test_verify_rejects_changed_release_hook_generation_before_live_verification(monkeypatch):
+    identity = _release_hook_scope_identity(str(release.ROOT.resolve()))
+    identity["release_hook_requested_command"] = "verify"
+    binding = release._ReleaseHookBinding(command="verify", identity=identity)
+    changed = dict(identity)
+    changed["creation"] = "changed-generation"
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda *_args, **_kwargs: changed,
+    )
+    verifier_calls = []
+    monkeypatch.setattr(
+        release, "_run_live_verifier", lambda *_args, **_kwargs: verifier_calls.append(True)
+    )
+
+    with pytest.raises(RuntimeError, match="changed during classification|does not match"):
+        release._verify(
+            {**valid_payload(), "observation": {"deployment_id": "citespan-test"}},
+            release_hook_binding=binding,
+        )
+
+    assert verifier_calls == []
 
 
 def test_credential_scan_ignores_inert_scanner_source_but_checks_runtime_config():
@@ -6840,6 +7152,7 @@ def test_prepare_rejects_explicit_disabled_demo_mode_without_leaking_values(
     monkeypatch,
     capsys,
 ):
+    _install_controlled_release_hook_binding(monkeypatch, "prepare")
     monkeypatch.setenv("DEMO_MODE", "1")
     monkeypatch.setattr(sys, "argv", ["release.py", "prepare"])
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({**valid_payload(), "DEMO_MODE": disabled})))
@@ -8096,12 +8409,16 @@ def test_execute_allows_valid_existing_host_state_then_deploys_once():
         },
     ],
 )
-def test_execute_fails_after_attempt_when_post_deployment_proof_is_invalid(observation):
+def test_execute_fails_after_attempt_when_post_deployment_proof_is_invalid(
+    observation, monkeypatch
+):
     payload = valid_payload()
     call_order = []
+    binding = _install_controlled_release_hook_binding(monkeypatch, "execute")
 
-    def observe_after_deploy(_payload):
+    def observe_after_deploy(_payload, *, release_hook_binding):
         call_order.append("observe")
+        assert release_hook_binding is binding
         return observation
 
     def deploy_once(command):
@@ -8120,7 +8437,7 @@ def test_execute_fails_after_attempt_when_post_deployment_proof_is_invalid(obser
     ), patch.object(release, "_ssh", side_effect=deploy_once) as ssh, pytest.raises(
         RuntimeError, match="strict remote commit evidence"
     ):
-        release._execute(payload)
+        release._execute(payload, release_hook_binding=binding)
 
     assert call_order == ["ssh", "observe"]
     ssh.assert_called_once_with("deploy")
