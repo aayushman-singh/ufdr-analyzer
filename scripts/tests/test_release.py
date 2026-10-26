@@ -31,6 +31,9 @@ _PLATFORM = SimpleNamespace(name=os.name)
 _BASH_FIXTURE_ROOT = None
 _NATIVE_FIXTURE_ROOT = None
 _FIXTURE_ROOT_IDENTITY = None
+_BASH_CAPABILITY_IDENTITY = None
+_BASH_CAPABILITY_PATH = None
+_BASH_CAPABILITY_ROOT = None
 EXPECTED_COMMIT = release._git("rev-parse", "HEAD")
 SYNTHETIC_OPENROUTER_TOKEN = "sk-or-v1-" + ("1" * 20)
 SYNTHETIC_OPENROUTER_SUFFIX = "1" * 20
@@ -155,6 +158,21 @@ def _git_bash_executable() -> Path:
             "supported Git Bash executable failed capability check: "
             f"Git executable={git_path} Bash={candidate} returncode={probe.returncode} "
             f"stdout={probe.stdout[-2000:]} stderr={probe.stderr[-2000:]}"
+        )
+    return candidate
+
+
+def _git_bash_path() -> Path:
+    """Resolve the selected Git Bash path without launching a process."""
+    git_value = shutil.which("git.exe") or shutil.which("git")
+    if not git_value:
+        raise RuntimeError("supported Git Bash executable is not available: Git executable is not installed")
+    git_path = Path(git_value).resolve()
+    candidate = git_path.parent.parent / "usr" / "bin" / "bash.exe"
+    if not candidate.is_file():
+        raise RuntimeError(
+            "supported Git Bash executable is not available: "
+            f"Git executable={git_path} expected Bash={candidate}"
         )
     return candidate
 
@@ -1231,10 +1249,12 @@ def _fixture_root_identity(path: Path):
 
 
 def _assert_fixture_root_access(native_root: Path, bash_root: str) -> None:
+    global _BASH_CAPABILITY_IDENTITY, _BASH_CAPABILITY_PATH, _BASH_CAPABILITY_ROOT
+
     identity = _fixture_root_identity(native_root)
     if identity[0] != native_root.resolve():
         raise RuntimeError(f"fixture root resolved to a different path: {native_root}")
-    probe = native_root / ".citespan-python-write-probe"
+    probe = native_root / f".citespan-python-write-probe-{uuid.uuid4().hex}"
     try:
         probe.write_text("probe", encoding="utf-8")
         if probe.read_text(encoding="utf-8") != "probe":
@@ -1243,14 +1263,84 @@ def _assert_fixture_root_access(native_root: Path, bash_root: str) -> None:
         raise RuntimeError(f"Python fixture root is not writable: path={native_root} error={exc}") from exc
     finally:
         probe.unlink(missing_ok=True)
-    bash = _git_bash_executable()
-    subprocess.run(
-        [str(bash), "-c", 'set -Eeuo pipefail; test -d "$1"; test -w "$1"; probe="$1/.citespan-bash-write-probe"; touch "$probe"; test -r "$probe"; rm "$probe"', "bash", bash_root],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=5,
+    current_bash = _git_bash_path().resolve()
+    if (
+        _BASH_CAPABILITY_IDENTITY == identity
+        and _BASH_CAPABILITY_PATH == current_bash
+        and _BASH_CAPABILITY_ROOT == bash_root
+    ):
+        return
+    cached_root_path = (
+        _BASH_CAPABILITY_IDENTITY[0]
+        if _BASH_CAPABILITY_IDENTITY is not None
+        else None
     )
+    if cached_root_path == identity[0] and any(
+        value is not None
+        for value in (
+            _BASH_CAPABILITY_IDENTITY,
+            _BASH_CAPABILITY_PATH,
+            _BASH_CAPABILITY_ROOT,
+        )
+    ):
+        raise RuntimeError(
+            "Git Bash fixture root capability cache is no longer valid: "
+            f"path={native_root} expected_identity={_BASH_CAPABILITY_IDENTITY} "
+            f"observed_identity={identity} expected_bash={_BASH_CAPABILITY_PATH} "
+            f"observed_bash={current_bash} expected_bash_root={_BASH_CAPABILITY_ROOT} "
+            f"observed_bash_root={bash_root} ownership_context=session fixture root"
+        )
+
+    bash = _git_bash_executable()
+    if bash.resolve() != current_bash:
+        raise RuntimeError(
+            "Git Bash fixture root capability check failed: "
+            f"step=executable path={native_root} expected_bash={current_bash} "
+            f"observed_bash={bash} ownership_context=session fixture root"
+        )
+    probe_name = f".citespan-bash-write-probe-{uuid.uuid4().hex}"
+    probe_path = native_root / probe_name
+    try:
+        subprocess.run(
+            [
+                str(bash),
+                "-c",
+                'set -Eeuo pipefail; test -d "$1"; test -w "$1"; probe="$1/$2"; touch "$probe"; test -r "$probe"; rm "$probe"',
+                "bash",
+                bash_root,
+                probe_name,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        try:
+            probe_path.unlink(missing_ok=True)
+        except OSError as cleanup_exc:
+            raise RuntimeError(
+                "Git Bash fixture root capability check failed: "
+                f"step=access path={native_root} expected_identity={identity} "
+                f"bash={bash} bash_root={bash_root} probe={probe_name} "
+                f"error={exc} cleanup_error={cleanup_exc}"
+            ) from exc
+        raise RuntimeError(
+            "Git Bash fixture root capability check failed: "
+            f"step=access path={native_root} expected_identity={identity} "
+            f"bash={bash} bash_root={bash_root} probe={probe_name} error={exc}"
+        ) from exc
+    try:
+        probe_path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "Git Bash fixture root capability cleanup failed: "
+            f"step=access path={native_root} expected_identity={identity} "
+            f"bash={bash} bash_root={bash_root} probe={probe_name} error={exc}"
+        ) from exc
+    _BASH_CAPABILITY_IDENTITY = identity
+    _BASH_CAPABILITY_PATH = bash.resolve()
+    _BASH_CAPABILITY_ROOT = bash_root
 
 
 def test_setup_bash_probes_use_non_login_shell_and_keep_failure_boundaries(tmp_path, monkeypatch):
@@ -1406,8 +1496,14 @@ def _fixture_session():
         yield
     finally:
         root = _NATIVE_FIXTURE_ROOT
-        if root is not None:
-            _remove_fixture_path(root, "session fixture root", allow_root=True)
+        try:
+            if root is not None:
+                _remove_fixture_path(root, "session fixture root", allow_root=True)
+        finally:
+            global _BASH_CAPABILITY_IDENTITY, _BASH_CAPABILITY_PATH, _BASH_CAPABILITY_ROOT
+            _BASH_CAPABILITY_IDENTITY = None
+            _BASH_CAPABILITY_PATH = None
+            _BASH_CAPABILITY_ROOT = None
 
 
 @pytest.fixture
@@ -1476,6 +1572,41 @@ def test_fixture_root_identity_replacement_fails_without_switching(monkeypatch):
 def test_individual_fixture_cleanup_preserves_shared_root(bash_tmp_path):
     root = _bash_writable_temp_root()
     assert root.is_dir()
+
+
+def test_fixture_root_access_caches_bash_capability_only_for_same_identity_and_mapping(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    bash = tmp_path / "bash.exe"
+    bash.write_bytes(b"")
+    calls = []
+
+    monkeypatch.setattr(sys.modules[__name__], "_git_bash_path", lambda: bash)
+    monkeypatch.setattr(sys.modules[__name__], "_git_bash_executable", lambda: bash)
+
+    def successful_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", successful_run)
+    _assert_fixture_root_access(root, "/tmp/citespan-release-test-fixtures")
+    _assert_fixture_root_access(root, "/tmp/citespan-release-test-fixtures")
+    assert len(calls) == 1
+
+    shutil.rmtree(root)
+    root.mkdir()
+    with pytest.raises(RuntimeError, match="cache is no longer valid"):
+        _assert_fixture_root_access(root, "/tmp/citespan-release-test-fixtures")
+    assert len(calls) == 1
+
+    replacement_bash = tmp_path / "replacement-bash.exe"
+    replacement_bash.write_bytes(b"")
+    monkeypatch.setattr(sys.modules[__name__], "_git_bash_path", lambda: replacement_bash)
+    with pytest.raises(RuntimeError, match="cache is no longer valid"):
+        _assert_fixture_root_access(root, "/tmp/citespan-release-test-fixtures")
+    assert len(calls) == 1
 
 
 def test_fixture_root_rejects_symlink_substitution(tmp_path, monkeypatch):
@@ -2736,9 +2867,7 @@ def test_fresh_resource_scope_classifies_complete_unknown_product_root_holder(mo
         argv=["mystery.exe", "worker.bin"],
     )
     identity["module_paths"] = [native]
-    monkeypatch.setattr(
-        release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity
-    )
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
 
     result = release._fresh_resource_scope(
         {
@@ -4600,6 +4729,41 @@ def _release_hook_launcher_child_identity(root):
     return identity
 
 
+def _release_hook_launcher_identity(root, hook):
+    launcher = str(Path(root) / ".venv" / "Scripts" / "python.exe")
+    script = str(Path(release.__file__).resolve())
+    worker_argv = ["C:/JarvisDeploy/jarvis/.venv/Scripts/python.exe", "C:/JarvisDeploy/jarvis/service/worker.py"]
+    worker_command = " ".join(worker_argv)
+    worker = {
+        "pid": 24000,
+        "state": "readable_current_parent",
+        "relation": "current parent of exact child identity",
+        "creation": "50",
+        "parent_pid": 1,
+        "cwd": "C:/JarvisDeploy/jarvis",
+        "executable": worker_argv[0],
+        "argv": worker_argv,
+        "argv_sha256": hashlib.sha256("\0".join(worker_argv).encode()).hexdigest(),
+        "native_command": worker_command,
+        "native_command_sha256": hashlib.sha256(worker_command.encode()).hexdigest(),
+    }
+    argv = [launcher, script, hook["argv"][2]]
+    command = " ".join(argv)
+    return _resource_identity(
+        hook["parent_pid"],
+        cwd=root,
+        executable=launcher,
+        argv=argv,
+        parent_observations=[worker],
+    ) | {
+        "creation": hook["parent_observations"][0]["creation"],
+        "parent_pid": worker["pid"],
+        "native_command": command,
+        "argv_sha256": hashlib.sha256("\0".join(argv).encode()).hexdigest(),
+        "native_command_sha256": hashlib.sha256(command.encode()).hexdigest(),
+    }
+
+
 def _replace_release_hook_parent_argv(identity, argv):
     parent = identity["parent_observations"][0]
     parent["argv"] = argv
@@ -4751,11 +4915,79 @@ def test_fresh_resource_scope_hydrates_the_release_hook_observer_before_classifi
 def test_release_hook_bootstrap_captures_the_requested_command(monkeypatch):
     root = str(release.ROOT.resolve())
     identity = _release_hook_launcher_child_identity(root)
-    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
+    launcher = _release_hook_launcher_identity(root, identity)
+    reads = iter((identity, launcher))
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: next(reads))
 
     captured = release._capture_current_release_hook_identity("prepare")
 
     assert captured["release_hook_requested_command"] == "prepare"
+    assert captured["release_hook_launcher_identity"] == launcher
+
+
+def test_release_hook_bootstrap_rejects_missing_launcher_evidence(monkeypatch):
+    root = str(release.ROOT.resolve())
+    identity = _release_hook_launcher_child_identity(root)
+    identity["parent_observations"] = []
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
+
+    with pytest.raises(RuntimeError, match="field=parent_observations"):
+        release._capture_current_release_hook_identity("prepare")
+
+
+def test_release_hook_launcher_generation_is_protected_only_when_bound(monkeypatch):
+    root = str(release.ROOT.resolve())
+    hook = _release_hook_launcher_child_identity(root)
+    hook["release_hook_requested_command"] = "prepare"
+    launcher = _release_hook_launcher_identity(root, hook)
+    hook["release_hook_launcher_identity"] = launcher
+    resources = _scope_resources(launcher)
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda pid, *_args, **_kwargs: hook if pid == os.getpid() else launcher,
+    )
+
+    result = release._fresh_resource_scope(
+        resources,
+        root,
+        scoped_ports=set(),
+        preloaded_identities={launcher["pid"]: launcher, hook["pid"]: hook},
+        observer_role="release_hook",
+        observer_bootstrap_identity=hook,
+    )
+
+    assert result["relevant_processes"] == []
+    assert any(
+        entry["reason"] == "verified exact release-hook launcher generation"
+        for entry in result["unrelated_exclusions"]
+    )
+
+
+def test_release_hook_launcher_resource_owner_overrides_launcher_protection(monkeypatch):
+    root = str(release.ROOT.resolve())
+    hook = _release_hook_launcher_child_identity(root)
+    hook["release_hook_requested_command"] = "prepare"
+    launcher = _release_hook_launcher_identity(root, hook)
+    hook["release_hook_launcher_identity"] = launcher
+    resources = _scope_resources(launcher)
+    resources["ports"] = [{"port": 4100, "pid": launcher["pid"]}]
+    monkeypatch.setattr(
+        release,
+        "_read_fresh_native_process_identity",
+        lambda pid, *_args, **_kwargs: hook if pid == os.getpid() else launcher,
+    )
+
+    result = release._fresh_resource_scope(
+        resources,
+        root,
+        scoped_ports={4100},
+        preloaded_identities={launcher["pid"]: launcher, hook["pid"]: hook},
+        observer_role="release_hook",
+        observer_bootstrap_identity=hook,
+    )
+
+    assert [entry["identity"]["pid"] for entry in result["relevant_processes"]] == [launcher["pid"]]
 
 
 @pytest.mark.parametrize("command", ["prepare", "observe", "execute", "verify"])
@@ -4781,8 +5013,11 @@ def test_release_hook_accepts_an_exact_invocation_from_a_non_product_cwd(monkeyp
             command,
         ],
     )
+    launcher = _release_hook_launcher_identity(root, identity)
     monkeypatch.setattr(
-        release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity
+        release,
+        "_read_fresh_native_process_identity",
+        lambda pid, *_args, **_kwargs: identity if pid == os.getpid() else launcher,
     )
 
     binding = release._capture_current_release_hook_binding(command)

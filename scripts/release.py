@@ -1986,6 +1986,7 @@ class _ReleaseHookBinding:
 
     command: str
     identity: dict[str, Any]
+    launcher_identity: dict[str, Any] | None = None
 
 
 _RESOURCE_IDENTITY_FIELDS = (
@@ -3248,6 +3249,117 @@ def _identity_is_protected(identity: dict[str, Any], product_root: str) -> bool:
     return False
 
 
+def _release_hook_launcher_identity_mismatch(
+    launcher: dict[str, Any],
+    hook: dict[str, Any],
+    command: str,
+    product_root: str,
+) -> str:
+    """Validate the complete launcher generation bound to one release hook."""
+    if not _has_complete_resource_identity(launcher):
+        return "launcher.identity"
+    launcher_pid = launcher.get("pid")
+    if launcher_pid != hook.get("parent_pid"):
+        return "launcher.pid"
+    launcher_creation = launcher.get("creation")
+    if not isinstance(launcher_creation, str) or not launcher_creation.isdigit():
+        return "launcher.creation"
+    hook_creation = hook.get("creation")
+    if not isinstance(hook_creation, str) or not hook_creation.isdigit():
+        return "hook.creation"
+    if int(launcher_creation) > int(hook_creation):
+        return "launcher.generation"
+    expected_executable = _canonical_windows_path_identity(
+        SCRIPT_ROOT / ".venv" / "Scripts" / "python.exe"
+    )
+    if _canonical_windows_path_identity(launcher.get("executable", "")) != expected_executable:
+        return "launcher.executable"
+    cwd = launcher.get("cwd")
+    if not isinstance(cwd, str) or not cwd.strip() or not ntpath.isabs(cwd):
+        return "launcher.cwd"
+    argv = launcher.get("argv")
+    if not isinstance(argv, list) or len(argv) != 3 or not all(
+        isinstance(value, str) and value for value in argv
+    ):
+        return "launcher.argv"
+    if _canonical_windows_path_identity(argv[0]) != expected_executable:
+        return "launcher.argv[0]"
+    if not _release_hook_script_matches(argv[1], product_root):
+        return "launcher.argv[1]"
+    if argv[2] != command or argv[2] not in {"prepare", "observe", "execute", "verify"}:
+        return "launcher.argv[2]"
+    native_command = launcher.get("native_command")
+    if not isinstance(native_command, str) or not native_command:
+        return "launcher.native_command"
+    if not _native_command_matches_argv(native_command, argv):
+        return "launcher.native_command.role"
+    if launcher.get("argv_sha256") != hashlib.sha256("\0".join(argv).encode("utf-8")).hexdigest():
+        return "launcher.argv_sha256"
+    if launcher.get("native_command_sha256") != hashlib.sha256(native_command.encode("utf-8")).hexdigest():
+        return "launcher.native_command_sha256"
+    if not _is_parent_pid(launcher.get("parent_pid")):
+        return "launcher.parent_pid"
+    observations = launcher.get("parent_observations")
+    if not isinstance(observations, list) or not observations:
+        return "launcher.parent_observations"
+    valid_parent = False
+    for observation in observations:
+        if not isinstance(observation, dict):
+            continue
+        if (
+            observation.get("state") != "readable_current_parent"
+            or observation.get("relation") != "current parent of exact child identity"
+            or observation.get("pid") != launcher.get("parent_pid")
+            or not isinstance(observation.get("creation"), str)
+            or not observation["creation"].isdigit()
+        ):
+            continue
+        if int(observation["creation"]) > int(launcher_creation):
+            continue
+        parent_argv = observation.get("argv")
+        parent_command = observation.get("native_command")
+        if not isinstance(parent_argv, list) or not parent_argv or not all(
+            isinstance(value, str) and value for value in parent_argv
+        ):
+            continue
+        if not isinstance(parent_command, str) or not parent_command:
+            continue
+        if observation.get("argv_sha256") != hashlib.sha256(
+            "\0".join(parent_argv).encode("utf-8")
+        ).hexdigest():
+            continue
+        if observation.get("native_command_sha256") != hashlib.sha256(
+            parent_command.encode("utf-8")
+        ).hexdigest():
+            continue
+        valid_parent = True
+        break
+    if not valid_parent:
+        return "launcher.parent_observations"
+    if hook.get("parent_pid") != launcher_pid:
+        return "hook.parent_pid"
+    hook_observations = hook.get("parent_observations")
+    if not isinstance(hook_observations, list) or not any(
+        isinstance(observation, dict)
+        and observation.get("state") == "readable_current_parent"
+        and observation.get("relation") == "current parent of exact child identity"
+        and observation.get("pid") == launcher_pid
+        and observation.get("creation") == launcher_creation
+        for observation in hook_observations
+    ):
+        return "hook.launcher_relation"
+    return "<none>"
+
+
+def _release_hook_launcher_matches(
+    identity: dict[str, Any], hook: dict[str, Any]
+) -> bool:
+    launcher = hook.get("release_hook_launcher_identity")
+    if not isinstance(launcher, dict):
+        return False
+    return all(identity.get(field) == launcher.get(field) for field in _RESOURCE_IDENTITY_FIELDS)
+
+
 def _release_hook_identity_mismatch(
     identity: dict[str, Any],
     product_root: str,
@@ -3412,14 +3524,71 @@ def _capture_current_release_hook_identity(command: str) -> dict[str, Any]:
             "release blocked: current release-hook identity does not match its invocation: "
             f"pid={pid} command={command} field={mismatch}"
         )
+    observed_executable = _canonical_windows_path_identity(identity.get("executable", ""))
+    launcher_executable = _canonical_windows_path_identity(
+        SCRIPT_ROOT / ".venv" / "Scripts" / "python.exe"
+    )
+    if observed_executable != launcher_executable:
+        launcher = _capture_current_release_hook_launcher(identity, command)
+        identity["release_hook_launcher_identity"] = launcher
     return identity
+
+
+def _capture_current_release_hook_launcher(
+    hook: dict[str, Any], command: str
+) -> dict[str, Any]:
+    """Read and validate the separate launcher generation for a native hook child."""
+    parent_pid = hook.get("parent_pid")
+    observations = hook.get("parent_observations")
+    launcher_observation = next(
+        (
+            observation
+            for observation in observations or []
+            if isinstance(observation, dict)
+            and observation.get("state") == "readable_current_parent"
+            and observation.get("relation") == "current parent of exact child identity"
+            and observation.get("pid") == parent_pid
+        ),
+        None,
+    )
+    if not isinstance(launcher_observation, dict):
+        raise RuntimeError(
+            "release blocked: release-hook launcher bootstrap evidence is missing"
+        )
+    expected_creation = launcher_observation.get("creation")
+    if not isinstance(expected_creation, str) or not expected_creation.isdigit():
+        raise RuntimeError(
+            "release blocked: release-hook launcher bootstrap creation is invalid"
+        )
+    try:
+        launcher = _read_fresh_native_process_identity(
+            parent_pid,
+            _NativeReadState(expected_creation=expected_creation),
+            _read_parent_observation=True,
+        )
+    except (_FreshProcessAbsent, _FreshProcessUnreadable, RuntimeError) as exc:
+        raise RuntimeError(
+            "release blocked: release-hook launcher bootstrap identity could not be captured: "
+            f"pid={parent_pid}: {exc}"
+        ) from exc
+    mismatch = _release_hook_launcher_identity_mismatch(
+        launcher, hook, command, str(ROOT.resolve())
+    )
+    if mismatch != "<none>":
+        raise RuntimeError(
+            "release blocked: release-hook launcher bootstrap does not match its invocation: "
+            f"pid={parent_pid} field={mismatch}"
+        )
+    return launcher
 
 
 def _capture_current_release_hook_binding(command: str) -> _ReleaseHookBinding:
     """Capture one immutable command-bound identity for the public hook path."""
+    identity = _capture_current_release_hook_identity(command)
     return _ReleaseHookBinding(
         command=command,
-        identity=_capture_current_release_hook_identity(command),
+        identity=identity,
+        launcher_identity=identity.get("release_hook_launcher_identity"),
     )
 
 
@@ -3451,12 +3620,62 @@ def _assert_current_release_hook_generation(
     expected_identity: dict[str, Any] | None = None,
 ) -> None:
     """Recheck the running release hook before and after resource classification."""
-    _assert_current_observer_generation(
+    current = _assert_current_observer_generation(
         identity,
         role="release_hook",
         phase=phase,
         expected_identity=expected_identity or identity,
     )
+    launcher = identity.get("release_hook_launcher_identity")
+    if isinstance(launcher, dict):
+        _assert_current_release_hook_launcher_generation(
+            launcher,
+            identity,
+            phase=phase,
+        )
+        current = dict(current)
+        current["release_hook_launcher_identity"] = launcher
+    return current
+
+
+def _assert_current_release_hook_launcher_generation(
+    expected_launcher: dict[str, Any],
+    hook: dict[str, Any],
+    *,
+    phase: str,
+) -> dict[str, Any]:
+    """Recheck the exact launcher generation and its relation to the hook."""
+    pid = expected_launcher.get("pid")
+    creation = expected_launcher.get("creation")
+    try:
+        current = _read_fresh_native_process_identity(
+            pid,
+            _NativeReadState(expected_creation=creation),
+            _read_parent_observation=True,
+        )
+    except (_FreshProcessAbsent, _FreshProcessUnreadable, RuntimeError) as exc:
+        raise RuntimeError(
+            "release blocked: release-hook launcher identity could not be revalidated: "
+            f"pid={pid} phase={phase}: {exc}"
+        ) from exc
+    mismatch = _release_hook_launcher_identity_mismatch(
+        current,
+        hook,
+        hook.get("release_hook_requested_command"),
+        str(ROOT.resolve()),
+    )
+    if mismatch != "<none>":
+        raise RuntimeError(
+            "release blocked: release-hook launcher identity changed during classification: "
+            f"pid={pid} phase={phase} field={mismatch}"
+        )
+    for field in _RESOURCE_IDENTITY_FIELDS:
+        if current.get(field) != expected_launcher.get(field):
+            raise RuntimeError(
+                "release blocked: release-hook launcher identity changed during classification: "
+                f"pid={pid} phase={phase} field={field}"
+            )
+    return current
 
 
 def _gate_test_identity_mismatch(
@@ -4433,12 +4652,19 @@ def _fresh_resource_scope(
     if observer_identity is not None and not _has_complete_resource_identity(observer_identity):
         observer_identity = None
     if observer_identity is not None and observer_role is not None:
-        observer_identity = _assert_current_observer_generation(
-            observer_identity,
-            role=observer_role,
-            phase="before-classification",
-            expected_identity=observer_bootstrap_identity,
-        )
+        if observer_role == "release_hook":
+            observer_identity = _assert_current_release_hook_generation(
+                observer_identity,
+                phase="before-classification",
+                expected_identity=observer_bootstrap_identity,
+            )
+        else:
+            observer_identity = _assert_current_observer_generation(
+                observer_identity,
+                role=observer_role,
+                phase="before-classification",
+                expected_identity=observer_bootstrap_identity,
+            )
         identities[observer_pid] = observer_identity
 
     relevant_processes = []
@@ -4456,6 +4682,17 @@ def _fresh_resource_scope(
         ):
             protected.add(pid)
             continue
+        if (
+            observer_role == "release_hook"
+            and observer_bootstrap_identity is not None
+            and _release_hook_launcher_matches(identity, observer_bootstrap_identity)
+            and pid not in (native_holder_pids | scoped_port_owner_pids)
+        ):
+            protected.add(pid)
+            unrelated_exclusions.append(
+                {"pid": pid, "reason": "verified exact release-hook launcher generation"}
+            )
+            continue
         if _resource_process_is_relevant(
             item,
             product_root,
@@ -4472,12 +4709,19 @@ def _fresh_resource_scope(
             relevant_processes.append({"row": item, "identity": identity})
 
     if observer_identity is not None and observer_role is not None:
-        _assert_current_observer_generation(
-            observer_identity,
-            role=observer_role,
-            phase="after-classification",
-            expected_identity=observer_bootstrap_identity,
-        )
+        if observer_role == "release_hook":
+            _assert_current_release_hook_generation(
+                observer_identity,
+                phase="after-classification",
+                expected_identity=observer_bootstrap_identity,
+            )
+        else:
+            _assert_current_observer_generation(
+                observer_identity,
+                role=observer_role,
+                phase="after-classification",
+                expected_identity=observer_bootstrap_identity,
+            )
 
     holder_pids = set()
     for item in resources["holders"]:
