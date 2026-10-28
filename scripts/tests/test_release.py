@@ -4706,6 +4706,7 @@ def _release_hook_scope_identity(root, *, parent_pid=25200, child_creation="200"
     )
     identity["creation"] = child_creation
     identity["parent_pid"] = parent_pid
+    identity["release_hook_requested_command"] = "prepare"
     return identity
 
 
@@ -4889,6 +4890,7 @@ def test_fresh_resource_scope_hydrates_the_release_hook_observer_before_classifi
     bootstrap = _release_hook_launcher_child_identity(root)
     bootstrap["release_hook_requested_command"] = "prepare"
     fresh = dict(bootstrap)
+    fresh.pop("release_hook_requested_command")
     fresh["parent_observations"] = [dict(bootstrap["parent_observations"][0])]
     reads = []
 
@@ -4908,8 +4910,41 @@ def test_fresh_resource_scope_hydrates_the_release_hook_observer_before_classifi
     )
 
     assert result["relevant_processes"] == []
-    assert result["identities"][fresh["pid"]] is fresh
+    assert result["identities"][fresh["pid"]]["release_hook_requested_command"] == "prepare"
     assert len(reads) == 3
+
+
+def test_release_hook_revalidation_preserves_command_across_two_generations(monkeypatch):
+    root = str(release.ROOT.resolve())
+    bootstrap = _release_hook_launcher_child_identity(root)
+    bootstrap["release_hook_requested_command"] = "prepare"
+    launcher = _release_hook_launcher_identity(root, bootstrap)
+    bootstrap["release_hook_launcher_identity"] = launcher
+    fresh_hook = dict(bootstrap)
+    fresh_hook.pop("release_hook_requested_command")
+    fresh_hook["parent_observations"] = [dict(bootstrap["parent_observations"][0])]
+    reads = []
+
+    def read_identity(pid, *_args, **_kwargs):
+        reads.append(pid)
+        return fresh_hook if pid == os.getpid() else launcher
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read_identity)
+
+    first = release._assert_current_release_hook_generation(
+        bootstrap,
+        phase="before-classification",
+        expected_identity=bootstrap,
+    )
+    second = release._assert_current_release_hook_generation(
+        first,
+        phase="after-classification",
+        expected_identity=bootstrap,
+    )
+
+    assert first["release_hook_requested_command"] == "prepare"
+    assert second["release_hook_requested_command"] == "prepare"
+    assert reads == [os.getpid(), launcher["pid"], os.getpid(), launcher["pid"]]
 
 
 def test_release_hook_bootstrap_captures_the_requested_command(monkeypatch):
@@ -5181,6 +5216,7 @@ def test_fresh_resource_scope_rejects_a_copied_interpreter_without_gate_identity
 def test_fresh_resource_scope_rejects_cross_role_observer(monkeypatch):
     root = str(release.ROOT.resolve())
     identity = _gate_test_scope_identity(root)
+    identity["release_hook_requested_command"] = "prepare"
     monkeypatch.setattr(release, "_read_fresh_native_process_identity", lambda *_args, **_kwargs: identity)
 
     with pytest.raises(RuntimeError, match=r"role=release_hook.*field=argv"):
@@ -5235,6 +5271,7 @@ def test_fresh_resource_scope_accepts_the_provider_root_relative_release_script(
 @pytest.mark.parametrize(
     ("field", "mutate"),
     [
+        ("release_hook_requested_command", lambda identity: identity.pop("release_hook_requested_command")),
         ("argv[1]", lambda identity: identity["argv"].__setitem__(1, "scripts/other.py")),
         ("argv[2]", lambda identity: identity["argv"].__setitem__(2, "unsupported")),
         ("executable", lambda identity: identity.__setitem__("executable", "C:/tools/python.exe")),
@@ -6417,7 +6454,7 @@ def test_host_preparation_uses_one_ordered_production_pipeline(monkeypatch):
     )
     monkeypatch.setattr(
         release,
-        "_prepare_frontend_dependencies",
+        "_prepare_frontend_dependencies_if_needed",
         lambda _root=None: events.append("frontend") or {"dependency_findings": []},
     )
     monkeypatch.setattr(release, "_provision_live_verifier", lambda: events.append("python-browser"))
@@ -6464,7 +6501,7 @@ def test_host_preparation_success_serialization_bounds_private_process_proof(mon
     )
     monkeypatch.setattr(
         release,
-        "_prepare_frontend_dependencies",
+        "_prepare_frontend_dependencies_if_needed",
         lambda _root=None: {"dependency_findings": []},
     )
     monkeypatch.setattr(release, "_provision_live_verifier", lambda: None)
@@ -6523,7 +6560,7 @@ def test_host_preparation_stops_before_dependent_work_when_guard_fails(monkeypat
     )
     for name in (
         "_prove_host_native_release",
-        "_prepare_frontend_dependencies",
+        "_prepare_frontend_dependencies_if_needed",
         "_provision_live_verifier",
     ):
         monkeypatch.setattr(release, name, lambda *args, _name=name, **kwargs: events.append(_name))
@@ -6548,7 +6585,7 @@ def test_host_preparation_stops_before_dependency_work_when_native_proof_fails(m
     )
     monkeypatch.setattr(
         release,
-        "_prepare_frontend_dependencies",
+        "_prepare_frontend_dependencies_if_needed",
         lambda *args, **kwargs: events.append("frontend"),
     )
 
@@ -7309,6 +7346,95 @@ def test_release_private_failure_write_keeps_private_contents_after_write(tmp_pa
     assert evidence["error"] == "private command and traceback details"
     assert evidence["state"] == {"private_state": "kept"}
     assert evidence["traceback"]
+
+
+def test_private_failure_record_is_verified_and_correlatable(tmp_path):
+    correlation = {
+        "hook": "prepare",
+        "command_id": "command-1908",
+        "checkpoint_commit": "a" * 40,
+        "artifact_digest": "artifact-digest",
+    }
+    with patch.object(release, "EXTERNAL_PROOF_ROOT", tmp_path):
+        try:
+            raise RuntimeError("private failure detail")
+        except RuntimeError as exc:
+            evidence_path = release._record_private_failure(
+                "prepare", exc, {"private_state": "kept"}, correlation
+            )
+
+        located = release._locate_private_failure(correlation)
+        index = json.loads(
+            (tmp_path / release._PRIVATE_FAILURE_INDEX_NAME).read_text(encoding="utf-8")
+        )
+
+    assert located == evidence_path
+    assert len(index) == 1
+    assert index[0]["record_digest"] == hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    record = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert record["correlation"]["command_id"] == "command-1908"
+    assert record["correlation"]["failed_step"] == "prepare"
+    assert record["traceback"]
+
+
+def test_private_failure_records_are_unique_for_rapid_failures(tmp_path):
+    correlation = {"hook": "prepare", "command_id": "command-rapid"}
+    with patch.object(release, "EXTERNAL_PROOF_ROOT", tmp_path):
+        paths = []
+        for detail in ("first", "second"):
+            try:
+                raise RuntimeError(detail)
+            except RuntimeError as exc:
+                paths.append(
+                    release._record_private_failure("prepare", exc, correlation=correlation)
+                )
+        index = json.loads(
+            (tmp_path / release._PRIVATE_FAILURE_INDEX_NAME).read_text(encoding="utf-8")
+        )
+
+    assert len(paths) == 2
+    assert paths[0] != paths[1]
+    assert len({entry["record_digest"] for entry in index}) == 2
+    with pytest.raises(LookupError, match="ambiguous"):
+        with patch.object(release, "EXTERNAL_PROOF_ROOT", tmp_path):
+            release._locate_private_failure(correlation)
+
+
+def test_private_failure_index_write_failure_is_not_reported_as_completion(tmp_path, monkeypatch):
+    original_writer = release._write_verified_private_bytes
+
+    def fail_index(path, data, *, allow_replace=False):
+        if path.name == release._PRIVATE_FAILURE_INDEX_NAME:
+            raise OSError("index write failed")
+        return original_writer(path, data, allow_replace=allow_replace)
+
+    monkeypatch.setattr(release, "_write_verified_private_bytes", fail_index)
+    with patch.object(release, "EXTERNAL_PROOF_ROOT", tmp_path):
+        with pytest.raises(OSError, match="index write failed"):
+            try:
+                raise RuntimeError("primary failure")
+            except RuntimeError as exc:
+                release._record_private_failure("prepare", exc)
+
+
+def test_main_claims_private_write_completion_only_after_verified_record(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        release,
+        "_require_project_python",
+        lambda _command: (_ for _ in ()).throw(RuntimeError("primary private failure")),
+    )
+    monkeypatch.setattr(release.sys, "argv", ["release.py", "prepare"])
+    monkeypatch.setattr(release, "EXTERNAL_PROOF_ROOT", tmp_path)
+    monkeypatch.setattr(release, "_read_input", lambda: {"action_key": "action-1908"})
+
+    assert release.main() == 1
+    captured = capsys.readouterr()
+    value = json.loads(captured.out)
+    assert value["private_evidence_status"] == "write_completed"
+    assert "private failure evidence write completed" in captured.err
+    assert "failure-correlation-index.json" not in captured.out + captured.err
+    assert len(list(tmp_path.glob("release-failure-*/failure.json"))) == 1
+    assert (tmp_path / release._PRIVATE_FAILURE_INDEX_NAME).is_file()
 
 
 def test_prepare_returns_one_contract_object_without_secret_values(monkeypatch):
@@ -8308,7 +8434,12 @@ def test_rollback_sanitizes_failed_cleanup_diagnostics_with_closed_output_pipes(
     script_path = tmp_path / "closed-pipes-cleanup-failure.sh"
     script_path.write_text(
         f"#!/usr/bin/env bash\nset -Eeuo pipefail\nset -a\n. {_bash_path(deploy_root / '.citespan-runtime.env')}\nset +a\nPOSTGRES_PASSWORD={sentinel}\nexport POSTGRES_PASSWORD\n"
-        f"{fixture}\n{function}\ntrap rollback EXIT\ndocker run -d --name candidate-static nginx:1.29-alpine\nsleep 1\nfalse\n",
+        f"{fixture}\n{function}\ntrap rollback EXIT\ndocker run -d --name candidate-static nginx:1.29-alpine\nsleep 1\n"
+        "exec 1>&- 2>&-\n"
+        "if printf x >&1; then exit 91; fi\n"
+        "if printf x >&2; then exit 92; fi\n"
+        "printf 'stdout=closed\\nstderr=closed\\n' > \"$DESCRIPTORS_CLOSED\"\n"
+        "false\n",
         encoding="utf-8",
     )
     process = subprocess.Popen(
@@ -8319,12 +8450,16 @@ def test_rollback_sanitizes_failed_cleanup_diagnostics_with_closed_output_pipes(
             "PATH": f"{_bash_path(bin_root)}:{os.environ['PATH']}",
             "CALL_LOG": _bash_path(call_log),
             "CANDIDATE_REMOVED": _bash_path(tmp_path / "candidate-removed"),
+            "DESCRIPTORS_CLOSED": _bash_path(tmp_path / "descriptors-closed"),
         },
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
-    process.stdout.close()
-    process.stderr.close()
+    descriptors_closed = tmp_path / "descriptors-closed"
+    deadline = time.monotonic() + 20
+    while not descriptors_closed.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert descriptors_closed.read_text(encoding="utf-8") == "stdout=closed\nstderr=closed\n"
     result_code = process.wait(timeout=20)
 
     assert result_code == 70

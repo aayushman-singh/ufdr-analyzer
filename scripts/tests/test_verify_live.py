@@ -5241,10 +5241,78 @@ def test_frontend_dependency_preparation_fails_before_browser_launch_when_instal
         release._validate_browser_dependency_readiness(frontend_root)
 
 
+def test_frontend_dependency_coordinator_prepares_absent_install_before_readiness(
+    tmp_path, monkeypatch
+):
+    frontend_root = tmp_path / "frontend"
+    _write_browser_dependency_fixture(frontend_root)
+    shutil.rmtree(frontend_root / "node_modules")
+    events = []
+
+    monkeypatch.setattr(
+        release,
+        "_prepare_frontend_dependencies",
+        lambda root: events.append(("prepare", root))
+        or {"state": "completed", "dependency_findings": []},
+    )
+
+    result = release._prepare_frontend_dependencies_if_needed(frontend_root)
+
+    assert result["state"] == "completed"
+    assert events == [("prepare", frontend_root)]
+
+
+def test_frontend_dependency_coordinator_does_not_mutate_valid_install(tmp_path, monkeypatch):
+    frontend_root = tmp_path / "frontend"
+    _write_browser_dependency_fixture(frontend_root)
+    monkeypatch.setattr(
+        release,
+        "_prepare_frontend_dependencies",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("valid browser dependencies must not be reinstalled")
+        ),
+    )
+
+    result = release._prepare_frontend_dependencies_if_needed(frontend_root)
+
+    assert result == {
+        "state": "already_valid",
+        "package_manager": "npm",
+        "lockfile": "frontend/package-lock.json",
+        "dependency_findings": [],
+    }
+
+
+def test_frontend_dependency_preparation_failure_stops_before_browser_readiness(
+    tmp_path, monkeypatch
+):
+    frontend_root = tmp_path / "frontend"
+    _write_browser_dependency_fixture(frontend_root)
+    shutil.rmtree(frontend_root / "node_modules")
+    events = []
+
+    def fail_prepare(root):
+        events.append(("prepare", root))
+        raise RuntimeError("locked frontend dependency preparation failed: bounded context")
+
+    monkeypatch.setattr(release, "_prepare_frontend_dependencies", fail_prepare)
+    monkeypatch.setattr(
+        release,
+        "_validate_browser_dependency_readiness",
+        lambda *_args, **_kwargs: events.append("readiness"),
+    )
+
+    with pytest.raises(RuntimeError, match="locked frontend dependency preparation failed"):
+        release._prepare_frontend_dependencies_if_needed(frontend_root)
+
+    assert events == [("prepare", frontend_root)]
+
+
 _BROWSER_FRONTEND_REQUIRED_PACKAGES = ("next", "react", "react-dom", "@playwright/test")
 
 
 def _ensure_frontend_dependencies_for_browser():
+    release._prepare_frontend_dependencies_if_needed(ROOT / "frontend")
     return release._validate_browser_dependency_readiness(
         ROOT / "frontend", process={"state": "contract_fixture"}
     )
@@ -5254,16 +5322,15 @@ def test_browser_fixture_uses_completed_dependencies_without_running_an_installe
     calls = []
     monkeypatch.setattr(
         release,
-        "_validate_browser_dependency_readiness",
-        lambda frontend_root, *, process: calls.append((frontend_root, process))
-        or {"dependency_findings": []},
+        "_prepare_frontend_dependencies_if_needed",
+        lambda frontend_root: calls.append(("prepare", frontend_root))
+        or {"state": "already_valid", "dependency_findings": []},
     )
     monkeypatch.setattr(
         release,
-        "_prepare_host",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("browser fixture must not prepare or install dependencies")
-        ),
+        "_validate_browser_dependency_readiness",
+        lambda frontend_root, *, process: calls.append(("readiness", frontend_root, process))
+        or {"dependency_findings": []},
     )
     monkeypatch.setattr(
         subprocess,
@@ -5276,7 +5343,34 @@ def test_browser_fixture_uses_completed_dependencies_without_running_an_installe
     result = _ensure_frontend_dependencies_for_browser()
 
     assert result == {"dependency_findings": []}
-    assert calls == [(ROOT / "frontend", {"state": "contract_fixture"})]
+    assert calls == [
+        ("prepare", ROOT / "frontend"),
+        ("readiness", ROOT / "frontend", {"state": "contract_fixture"}),
+    ]
+
+
+def test_browser_fixture_keeps_post_preparation_readiness_failure_blocking(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        release,
+        "_prepare_frontend_dependencies_if_needed",
+        lambda frontend_root: events.append(("prepare", frontend_root))
+        or {"state": "completed", "dependency_findings": []},
+    )
+
+    def fail_readiness(frontend_root, *, process):
+        events.append(("readiness", frontend_root, process))
+        raise RuntimeError("browser dependency readiness failed: bounded context")
+
+    monkeypatch.setattr(release, "_validate_browser_dependency_readiness", fail_readiness)
+
+    with pytest.raises(RuntimeError, match="browser dependency readiness failed"):
+        _ensure_frontend_dependencies_for_browser()
+
+    assert events == [
+        ("prepare", ROOT / "frontend"),
+        ("readiness", ROOT / "frontend", {"state": "contract_fixture"}),
+    ]
 
 
 def test_upload_validation_real_browser_is_fail_closed_and_file_scoped():

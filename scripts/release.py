@@ -25,6 +25,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import threading
 import time
 import traceback
 import uuid
@@ -86,6 +87,9 @@ AUTHORIZED_LIVE_ORIGIN = f"https://{DEPLOY_DOMAIN}"
 DEPLOYMENT_METADATA = f"{DEPLOY_PATH}/.citespan-deployment.json"
 DEMO_MARKER = f"{DEPLOY_PATH}/.citespan-demo-marker.json"
 EXTERNAL_PROOF_ROOT = Path.home() / ".citespan" / "release-proof"
+_PRIVATE_FAILURE_INDEX_NAME = "failure-correlation-index.json"
+_PRIVATE_FAILURE_INDEX_DIGEST_NAME = "failure-correlation-index.sha256"
+_PRIVATE_FAILURE_LOCK = threading.RLock()
 HOST_PROCESS_EVIDENCE_ROOT = Path.home() / ".citespan" / "host-process-evidence"
 HOST_PROCESS_EVIDENCE_FILES = (
     "recorded-node-identities-942.json",
@@ -3618,22 +3622,30 @@ def _assert_current_release_hook_generation(
     *,
     phase: str,
     expected_identity: dict[str, Any] | None = None,
-) -> None:
+) -> dict[str, Any]:
     """Recheck the running release hook before and after resource classification."""
+    requested_command = identity.get("release_hook_requested_command")
+    if requested_command not in {"prepare", "observe", "execute", "verify"}:
+        raise RuntimeError(
+            "release blocked: current census observer identity does not match its explicit role: "
+            f"pid={os.getpid()} role=release_hook phase={phase} "
+            "field=release_hook_requested_command context=redacted"
+        )
     current = _assert_current_observer_generation(
         identity,
         role="release_hook",
         phase=phase,
         expected_identity=expected_identity or identity,
     )
+    current = dict(current)
+    current["release_hook_requested_command"] = requested_command
     launcher = identity.get("release_hook_launcher_identity")
     if isinstance(launcher, dict):
         _assert_current_release_hook_launcher_generation(
             launcher,
-            identity,
+            current,
             phase=phase,
         )
-        current = dict(current)
         current["release_hook_launcher_identity"] = launcher
     return current
 
@@ -4710,7 +4722,7 @@ def _fresh_resource_scope(
 
     if observer_identity is not None and observer_role is not None:
         if observer_role == "release_hook":
-            _assert_current_release_hook_generation(
+            observer_identity = _assert_current_release_hook_generation(
                 observer_identity,
                 phase="after-classification",
                 expected_identity=observer_bootstrap_identity,
@@ -6166,28 +6178,165 @@ def _record_private_subprocess_timeout(
     return evidence_path
 
 
-def _record_private_failure(command: str, exc: BaseException, state: dict[str, Any] | None = None) -> Path:
-    """Write full failure context outside the provider JSON response."""
+def _private_failure_identifier(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"private failure correlation field is invalid: {field}")
+    return value.strip()
+
+
+def _private_failure_correlation(command: str, payload: dict[str, Any] | None = None) -> dict[str, str]:
+    """Build only correlation data that the hook actually received."""
+    payload = payload or {}
+    intent = payload.get("intent") if isinstance(payload.get("intent"), dict) else {}
+    environment_fields = {
+        "goal_id": os.environ.get("CITESPAN_GOAL_ID"),
+        "owner_job_id": os.environ.get("CITESPAN_OWNER_JOB_ID"),
+        "command_id": os.environ.get("CITESPAN_COMMAND_ID"),
+        "request_id": os.environ.get("CITESPAN_REQUEST_ID"),
+        "checkpoint_commit": os.environ.get("CITESPAN_CHECKPOINT_COMMIT"),
+        "artifact_digest": os.environ.get("CITESPAN_ARTIFACT_DIGEST"),
+    }
+    checkpoint = intent.get("checkpoint") if isinstance(intent.get("checkpoint"), dict) else {}
+    values = {
+        "hook": command,
+        "action_key": payload.get("action_key"),
+        "goal_id": payload.get("goal_id") or intent.get("goal_id") or environment_fields["goal_id"],
+        "owner_job_id": payload.get("owner_job_id") or intent.get("owner_job_id") or environment_fields["owner_job_id"],
+        "command_id": payload.get("command_id") or intent.get("command_id") or environment_fields["command_id"],
+        "request_id": payload.get("request_id") or intent.get("request_id") or environment_fields["request_id"],
+        "checkpoint_commit": payload.get("checkpoint_commit") or intent.get("checkpoint_commit") or checkpoint.get("commit") or environment_fields["checkpoint_commit"],
+        "artifact_digest": payload.get("artifact_digest") or intent.get("artifact_digest") or environment_fields["artifact_digest"],
+    }
+    correlation = {field: value for field, value in values.items() if value is not None}
+    return {
+        field: _private_failure_identifier(value, field) or ""
+        for field, value in correlation.items()
+    }
+
+
+def _private_failure_index_key(correlation: dict[str, str]) -> str:
+    transient = {"record_nonce", "observed_at", "source_path", "source_digest"}
+    identity = {key: correlation[key] for key in sorted(correlation) if key not in transient}
+    return hashlib.sha256(_canonical_json(identity)).hexdigest()
+
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def _write_verified_private_bytes(path: Path, data: bytes, *, allow_replace: bool = False) -> str:
+    if path.exists() and not allow_replace:
+        raise FileExistsError(f"private failure record collision: {path.name}")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        reopened = path.read_bytes()
+        if reopened != data:
+            raise OSError("private failure record changed during verification")
+        return hashlib.sha256(reopened).hexdigest()
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_private_failure_index(index_path: Path) -> list[dict[str, Any]]:
+    if not index_path.exists():
+        return []
+    data = index_path.read_bytes()
+    digest_path = index_path.with_name(_PRIVATE_FAILURE_INDEX_DIGEST_NAME)
+    if not digest_path.is_file() or digest_path.read_text(encoding="ascii").strip() != hashlib.sha256(data).hexdigest():
+        raise OSError("private failure correlation index digest mismatch")
+    value = json.loads(data)
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ValueError("private failure correlation index is malformed")
+    return value
+
+
+def _record_private_failure(
+    command: str,
+    exc: BaseException,
+    state: dict[str, Any] | None = None,
+    correlation: dict[str, str] | None = None,
+) -> Path:
+    """Persist and verify full failure context outside the provider response."""
     EXTERNAL_PROOF_ROOT.mkdir(parents=True, exist_ok=True)
-    evidence_dir = Path(tempfile.mkdtemp(prefix="release-failure-", dir=EXTERNAL_PROOF_ROOT))
-    detail = traceback.format_exc()
-    detail = _sanitize_failure_text(detail)
-    safe_error = _sanitize_failure_text(str(exc))
-    evidence_path = evidence_dir / "failure.json"
-    evidence_path.write_text(
-        json.dumps(
-            {
-                "command": command,
-                "failed_step": command,
-                "error": safe_error,
-                "traceback": detail,
-                "state": state or {},
-            },
-            sort_keys=True,
-        ),
-        encoding="utf-8",
+    correlation = dict(correlation or {"hook": command})
+    correlation.update(
+        {
+            "hook": command,
+            "failed_step": command,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "record_nonce": uuid.uuid4().hex,
+            "source_path": str(Path(__file__).resolve()),
+            "source_digest": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        }
     )
+    evidence = {
+        "record_type": "citespan.private_failure.v1",
+        "correlation": correlation,
+        "command": command,
+        "failed_step": command,
+        "error": _sanitize_failure_text(str(exc)),
+        "traceback": _sanitize_failure_text(traceback.format_exc()),
+        "state": state or {},
+    }
+    data = _canonical_json(evidence)
+    with _PRIVATE_FAILURE_LOCK:
+        evidence_dir = Path(tempfile.mkdtemp(prefix="release-failure-", dir=EXTERNAL_PROOF_ROOT))
+        evidence_path = evidence_dir / "failure.json"
+        digest = _write_verified_private_bytes(evidence_path, data)
+        verified = json.loads(evidence_path.read_bytes())
+        if verified != evidence:
+            raise OSError("private failure record parse verification failed")
+        index_path = EXTERNAL_PROOF_ROOT / _PRIVATE_FAILURE_INDEX_NAME
+        entries = _read_private_failure_index(index_path)
+        index_key = _private_failure_index_key(correlation)
+        entry = {
+            "correlation_key": index_key,
+            "correlation": correlation,
+            "record_path": str(evidence_path),
+            "record_digest": digest,
+        }
+        if any(item.get("record_path") == entry["record_path"] for item in entries):
+            raise OSError("private failure correlation index collision")
+        entries.append(entry)
+        index_data = _canonical_json(entries)
+        index_digest = _write_verified_private_bytes(index_path, index_data, allow_replace=True)
+        _write_verified_private_bytes(
+            index_path.with_name(_PRIVATE_FAILURE_INDEX_DIGEST_NAME),
+            f"{index_digest}\n".encode("ascii"),
+            allow_replace=True,
+        )
+        indexed = _read_private_failure_index(index_path)
+        if entry not in indexed:
+            raise OSError("private failure correlation index verification failed")
     return evidence_path
+
+
+def _locate_private_failure(correlation: dict[str, str]) -> Path:
+    """Locate one verified record through the canonical correlation index."""
+    index_path = EXTERNAL_PROOF_ROOT / _PRIVATE_FAILURE_INDEX_NAME
+    entries = _read_private_failure_index(index_path)
+    matches = []
+    for entry in entries:
+        stored = entry.get("correlation")
+        if not isinstance(stored, dict) or any(stored.get(key) != value for key, value in correlation.items()):
+            continue
+        path = Path(entry.get("record_path", ""))
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != entry.get("record_digest"):
+            raise OSError("private failure record is missing or changed")
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if record.get("correlation") != stored:
+            raise OSError("private failure correlation does not match record")
+        matches.append(path)
+    if len(matches) != 1:
+        raise LookupError("private failure correlation is missing or ambiguous")
+    return matches[0]
 
 
 def _private_failure_write_failure_response(
@@ -7210,6 +7359,38 @@ def _prepare_frontend_dependencies(frontend_root: Path | None = None) -> dict[st
         "lockfile": "frontend/package-lock.json",
         "dependency_findings": findings,
     }
+
+
+def _frontend_dependency_installation_is_missing(frontend_root: Path) -> bool:
+    """Return whether the required project-scoped browser install is absent."""
+    for name in _BROWSER_FRONTEND_REQUIRED_PACKAGES:
+        if not (frontend_root / "node_modules" / Path(name) / "package.json").is_file():
+            return True
+    next_executable = frontend_root / "node_modules" / ".bin" / (
+        "next.cmd" if os.name == "nt" else "next"
+    )
+    return not next_executable.is_file()
+
+
+def _prepare_frontend_dependencies_if_needed(
+    frontend_root: Path | None = None,
+) -> dict[str, Any]:
+    """Prepare absent project dependencies and reject every invalid installed state."""
+    frontend_root = (ROOT / "frontend") if frontend_root is None else Path(frontend_root)
+    if _frontend_dependency_installation_is_missing(frontend_root):
+        return _prepare_frontend_dependencies(frontend_root)
+    findings = _browser_dependency_findings(frontend_root)
+    if findings:
+        raise RuntimeError(
+            "release blocked: browser dependency readiness failed before startup: "
+            f"findings={findings}"
+        )
+    return {
+        "state": "already_valid",
+        "package_manager": "npm",
+        "lockfile": "frontend/package-lock.json",
+        "dependency_findings": findings,
+    }
 def _record_private_dependency_install_failure(
     *, frontend_root: Path, command: list[str], result: subprocess.CompletedProcess[str]
 ) -> Path:
@@ -7242,7 +7423,7 @@ def _prepare_host(
     """Prepare the host in the only permitted order before browser startup."""
     process_before = _validate_host_process_evidence(observer_bootstrap_identity)
     native = _prove_host_native_release()
-    dependencies = _prepare_frontend_dependencies(frontend_root)
+    dependencies = _prepare_frontend_dependencies_if_needed(frontend_root)
     _provision_live_verifier()
     process_after = _validate_host_process_evidence(observer_bootstrap_identity)
     readiness = _validate_browser_dependency_readiness(frontend_root, process=process_after)
@@ -9772,6 +9953,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("prepare", "observe", "execute", "verify"))
     args = parser.parse_args()
+    payload: dict[str, Any] | None = None
     try:
         _require_project_python(args.command)
         payload = _read_input()
@@ -9796,6 +9978,7 @@ def main() -> int:
                 args.command,
                 exc,
                 {"root": str(ROOT), "python": _failure_python_description()},
+                _private_failure_correlation(args.command, payload),
             )
         except Exception:
             response = _private_failure_write_failure_response(
