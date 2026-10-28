@@ -2327,6 +2327,66 @@ def test_fresh_census_rejects_present_generation_change_after_resource_collectio
         )
 
 
+def test_fresh_census_rejects_post_resource_identity_access_denied(monkeypatch):
+    contract = _fresh_census_contract(
+        count=1,
+        states={1: "live"},
+        approval={
+            "schema": "citespan.node-current-approval.v1",
+            "ownership_approved": True,
+            "cleanup_approved": True,
+            "actor_id": release._OWNER_ACTOR,
+            "goal_id": release._OWNER_GOAL,
+            "product_worktree": str(release.SCRIPT_ROOT),
+            "observed_identity_pids": [1],
+            "approved_actions": ["stop exact pid 1"],
+            "observations": [
+                {
+                    **_full_current_identity(1),
+                    "script_role": "none",
+                    "script_paths": [],
+                    "approval": True,
+                    "protected_or_unrelated_state": "owned_descendant",
+                }
+            ],
+            "protected_processes": [],
+            "unrelated_exclusions": [],
+        },
+    )
+    contract["family_records"][0]["ports"] = []
+    reads = [
+        contract["family_records"][0],
+        release._FreshProcessUnreadable("pid=1 full native identity open failed: WinError 5"),
+    ]
+
+    def read_identity(*_args, **_kwargs):
+        value = reads.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(release, "_read_fresh_native_process_identity", read_identity)
+    monkeypatch.setattr(
+        release,
+        "_enumerate_fresh_frontend_resources",
+        lambda: {
+            "processes": [{"pid": 1, "parent_pid": 4}],
+            "holders": [],
+            "ports": [],
+            "read_errors": [],
+        },
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="relevant historical identity could not be revalidated after resource collection.*WinError 5",
+    ):
+        release._assert_fresh_host_process_census(
+            contract,
+            process_snapshot=_toolhelp_snapshot(1),
+        )
+
+
 def test_fresh_census_allows_unrelated_pid_churn_with_snapshot(monkeypatch):
     contract = _fresh_census_contract(count=1)
     monkeypatch.setattr(
